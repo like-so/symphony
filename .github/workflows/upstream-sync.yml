@@ -1,0 +1,88 @@
+name: upstream-sync
+
+on:
+  schedule:
+    - cron: "23 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Fetch and merge-check without pushing"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: upstream-sync-main
+  cancel-in-progress: false
+
+jobs:
+  sync-upstream-main:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork main
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Configure Git user
+        run: |
+          git config user.name "gyunt-bot"
+          git config user.email "gyunt-bot@users.noreply.github.com"
+
+      - name: Fetch origin and upstream main
+        env:
+          SYNC_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN || github.token }}
+        run: |
+          set -euo pipefail
+          git remote add upstream https://github.com/openai/symphony.git
+          git fetch "https://x-access-token:${SYNC_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" main
+          git fetch upstream main
+
+      - name: Merge upstream main
+        id: merge
+        run: |
+          set -euo pipefail
+          origin_sha=$(git rev-parse origin/main)
+          upstream_sha=$(git rev-parse upstream/main)
+
+          echo "origin_sha=$origin_sha" >> "$GITHUB_OUTPUT"
+          echo "upstream_sha=$upstream_sha" >> "$GITHUB_OUTPUT"
+          echo "origin/main: $origin_sha"
+          echo "upstream/main: $upstream_sha"
+
+          if git merge-base --is-ancestor "$upstream_sha" "$origin_sha"; then
+            echo "origin/main already contains upstream/main"
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          git checkout main
+          git reset --hard origin/main
+          git merge --no-ff upstream/main -m "merge: sync upstream main"
+          echo "has_changes=true" >> "$GITHUB_OUTPUT"
+
+      - name: Verify merge ancestry
+        if: steps.merge.outputs.has_changes == 'true'
+        run: |
+          set -euo pipefail
+          git merge-base --is-ancestor "${{ steps.merge.outputs.origin_sha }}" HEAD
+          git merge-base --is-ancestor "${{ steps.merge.outputs.upstream_sha }}" HEAD
+
+      - name: Push synced main
+        if: steps.merge.outputs.has_changes == 'true' && inputs.dry_run != true
+        env:
+          SYNC_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN || github.token }}
+        run: |
+          set -euo pipefail
+          git push "https://x-access-token:${SYNC_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" HEAD:main
+
+      - name: Dry-run summary
+        if: steps.merge.outputs.has_changes == 'true' && inputs.dry_run == true
+        run: |
+          echo "Dry run requested; merge commit was created locally but not pushed."
+          git log --oneline --graph -5
