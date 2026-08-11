@@ -1226,6 +1226,63 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
            }
   end
 
+  test "schema applies plane provider defaults and resolves api token env references" do
+    api_key_env_var = "SYMPHONY_PLANE_TOKEN_#{System.unique_integer([:positive])}"
+    previous_api_key = System.get_env(api_key_env_var)
+    api_key = "plane-api-token"
+    System.put_env(api_key_env_var, api_key)
+
+    on_exit(fn -> restore_env(api_key_env_var, previous_api_key) end)
+
+    assert {:ok, settings} =
+             Schema.parse(%{
+               tracker: %{
+                 kind: "plane",
+                 provider: %{
+                   base_url: "http://plane.local/",
+                   api_key: "$#{api_key_env_var}",
+                   workspace_slug: "plane",
+                   project_identifier: "NAUTILUS",
+                   claim_state: "In Progress"
+                 }
+               }
+             })
+
+    assert settings.tracker.kind == "plane"
+    assert settings.tracker.api_key == api_key
+    assert settings.tracker.active_states == ["Todo", "In Progress"]
+    assert settings.tracker.terminal_states == ["Done", "Cancelled", "Canceled"]
+    assert settings.tracker.secret_environment_names == ["PLANE_API_KEY", api_key_env_var]
+
+    assert settings.tracker.provider == %{
+             "base_url" => "http://plane.local/",
+             "api_key" => "$#{api_key_env_var}",
+             "workspace_slug" => "plane",
+             "project_identifier" => "NAUTILUS",
+             "claim_state" => "In Progress"
+           }
+  end
+
+  test "schema preserves explicit plane active and terminal states" do
+    assert {:ok, settings} =
+             Schema.parse(%{
+               tracker: %{
+                 kind: "plane",
+                 active_states: ["Ready", "Doing"],
+                 terminal_states: ["Shipped"],
+                 provider: %{
+                   base_url: "http://plane.local",
+                   api_key: "plane-token",
+                   workspace_slug: "plane",
+                   project_identifier: "NAUTILUS"
+                 }
+               }
+             })
+
+    assert settings.tracker.active_states == ["Ready", "Doing"]
+    assert settings.tracker.terminal_states == ["Shipped"]
+  end
+
   test "linear adapter rejects invalid provider values without crashing config parsing" do
     assert {:ok, invalid_secret_settings} =
              Schema.parse(%{

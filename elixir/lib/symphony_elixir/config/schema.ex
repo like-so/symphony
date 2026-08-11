@@ -11,6 +11,8 @@ defmodule SymphonyElixir.Config.Schema do
   @linear_endpoint "https://api.linear.app/graphql"
   @linear_active_states ["Todo", "In Progress"]
   @linear_terminal_states ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"]
+  @plane_active_states ["Todo", "In Progress"]
+  @plane_terminal_states ["Done", "Cancelled", "Canceled"]
 
   @type t :: %__MODULE__{}
 
@@ -398,44 +400,8 @@ defmodule SymphonyElixir.Config.Schema do
   defp finalize_settings(settings) do
     provider = normalize_optional_map(settings.tracker.provider) || %{}
 
-    {api_key, assignee, provider, secret_environment_names} =
-      case settings.tracker.kind do
-        "linear" ->
-          linear_provider =
-            provider
-            |> Map.put_new("endpoint", settings.tracker.endpoint || @linear_endpoint)
-            |> Map.put_new("api_key", settings.tracker.api_key)
-            |> Map.put_new("project_slug", settings.tracker.project_slug)
-            |> Map.put_new("assignee", settings.tracker.assignee)
-
-          resolved_api_key =
-            resolve_secret_setting(linear_provider["api_key"], System.get_env("LINEAR_API_KEY"))
-
-          resolved_assignee =
-            resolve_secret_setting(linear_provider["assignee"], System.get_env("LINEAR_ASSIGNEE"))
-
-          {
-            resolved_api_key,
-            resolved_assignee,
-            linear_provider,
-            ["LINEAR_API_KEY" | env_reference_names([linear_provider["api_key"]])]
-          }
-
-        _ ->
-          {settings.tracker.api_key, settings.tracker.assignee, provider, []}
-      end
-
-    {active_states, terminal_states} =
-      case settings.tracker.kind do
-        kind when kind in ["linear", "memory"] ->
-          {
-            settings.tracker.active_states || @linear_active_states,
-            settings.tracker.terminal_states || @linear_terminal_states
-          }
-
-        _ ->
-          {settings.tracker.active_states, settings.tracker.terminal_states}
-      end
+    {api_key, assignee, provider, secret_environment_names} = tracker_auth_settings(settings, provider)
+    {active_states, terminal_states} = tracker_state_settings(settings)
 
     tracker = %{
       settings.tracker
@@ -461,6 +427,59 @@ defmodule SymphonyElixir.Config.Schema do
     }
 
     %{settings | tracker: tracker, workspace: workspace, codex: codex}
+  end
+
+  defp tracker_auth_settings(%{tracker: %{kind: "linear"} = tracker}, provider) do
+    linear_provider =
+      provider
+      |> Map.put_new("endpoint", tracker.endpoint || @linear_endpoint)
+      |> Map.put_new("api_key", tracker.api_key)
+      |> Map.put_new("project_slug", tracker.project_slug)
+      |> Map.put_new("assignee", tracker.assignee)
+
+    resolved_api_key = resolve_secret_setting(linear_provider["api_key"], System.get_env("LINEAR_API_KEY"))
+    resolved_assignee = resolve_secret_setting(linear_provider["assignee"], System.get_env("LINEAR_ASSIGNEE"))
+
+    {
+      resolved_api_key,
+      resolved_assignee,
+      linear_provider,
+      ["LINEAR_API_KEY" | env_reference_names([linear_provider["api_key"]])]
+    }
+  end
+
+  defp tracker_auth_settings(%{tracker: %{kind: "plane"} = tracker}, provider) do
+    plane_provider = Map.put_new(provider, "api_key", tracker.api_key)
+    resolved_api_key = resolve_secret_setting(plane_provider["api_key"], System.get_env("PLANE_API_KEY"))
+
+    {
+      resolved_api_key,
+      tracker.assignee,
+      plane_provider,
+      ["PLANE_API_KEY" | env_reference_names([plane_provider["api_key"]])]
+    }
+  end
+
+  defp tracker_auth_settings(%{tracker: tracker}, provider) do
+    {tracker.api_key, tracker.assignee, provider, []}
+  end
+
+  defp tracker_state_settings(%{tracker: %{kind: kind} = tracker}) when kind in ["linear", "memory"] do
+    {
+      tracker.active_states || @linear_active_states,
+      tracker.terminal_states || @linear_terminal_states
+    }
+  end
+
+  defp tracker_state_settings(%{tracker: %{kind: "plane"} = tracker}) do
+    {
+      tracker.active_states || @plane_active_states,
+      tracker.terminal_states || @plane_terminal_states
+    }
+  end
+
+  defp tracker_state_settings(%{tracker: tracker}) do
+    {tracker.active_states, tracker.terminal_states}
   end
 
   defp normalize_keys(value) when is_map(value) do
