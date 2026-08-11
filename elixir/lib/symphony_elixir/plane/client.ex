@@ -340,14 +340,16 @@ defmodule SymphonyElixir.Plane.Client do
   defp build_settings(tracker_settings, provider) do
     %{
       base_url: normalize_base_url(provider["base_url"] || provider["url"]),
-      api_key: resolve_setting(provider["api_key"], tracker_settings[:api_key] || System.get_env("PLANE_API_KEY")),
+      api_key: resolve_setting(provider["api_key"], tracker_value(tracker_settings, :api_key) || System.get_env("PLANE_API_KEY")),
       workspace_slug: resolve_setting(provider["workspace_slug"], nil),
       project_id: resolve_setting(provider["project_id"], nil),
       project_identifier: resolve_setting(provider["project_identifier"], nil),
       claim_state: resolve_setting(provider["claim_state"], "In Progress"),
-      terminal_states: tracker_settings[:terminal_states] || []
+      terminal_states: tracker_value(tracker_settings, :terminal_states) || []
     }
   end
+
+  defp tracker_value(tracker_settings, key) when is_map(tracker_settings), do: Map.get(tracker_settings, key)
 
   defp validate_plane_settings(settings) do
     cond do

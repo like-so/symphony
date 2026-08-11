@@ -1,6 +1,7 @@
 defmodule SymphonyElixir.Plane.AdapterTest do
   use SymphonyElixir.TestSupport
 
+  alias SymphonyElixir.Config.Schema
   alias SymphonyElixir.Plane.Adapter, as: PlaneAdapter
   alias SymphonyElixir.Plane.AgentTool, as: PlaneAgentTool
   alias SymphonyElixir.Plane.Client, as: PlaneClient
@@ -157,6 +158,21 @@ defmodule SymphonyElixir.Plane.AdapterTest do
 
   test "client validates provider settings and declares token environments" do
     assert :ok = PlaneClient.validate_settings(tracker_settings())
+
+    assert {:ok, parsed_settings} =
+             Schema.parse(%{
+               tracker: %{
+                 kind: "plane",
+                 provider: %{
+                   base_url: "http://plane.local",
+                   api_key: "plane-token",
+                   workspace_slug: "plane",
+                   project_identifier: "NAUTILUS"
+                 }
+               }
+             })
+
+    assert :ok = PlaneClient.validate_settings(parsed_settings.tracker)
 
     assert {:error, :missing_plane_base_url} =
              PlaneClient.validate_settings(tracker_settings(%{"base_url" => 123}))
