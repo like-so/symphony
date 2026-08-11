@@ -14,7 +14,7 @@ This directory contains the current Elixir/OTP implementation of Symphony, based
 ## How it works
 
 1. Polls the configured tracker for candidate work (included adapters: Linear, GitHub Issues, Jira
-   Cloud, Asana, GitLab, and Plane)
+   Cloud, Asana, and GitLab)
 2. Creates a workspace per issue
 3. Launches Codex in [App Server mode](https://developers.openai.com/codex/app-server/) inside the
    workspace
@@ -23,10 +23,9 @@ This directory contains the current Elixir/OTP implementation of Symphony, based
 
 During app-server sessions, the selected tracker adapter may advertise provider-native tools. The
 Linear serves `linear_graphql`, GitHub Issues serves `github_api`, Jira Cloud serves
-`jira_rest`, Asana serves `asana_api`, GitLab serves `gitlab_api`, and Plane serves
-`plane_api`. Symphony executes those tools with configured host-side auth and removes declared
-tracker-token environment variables from the Codex child, so the agent does not need a second
-tracker login.
+`jira_rest`, Asana serves `asana_api`, and GitLab serves `gitlab_api`. Symphony executes those
+tools with configured host-side auth and removes declared tracker-token environment variables from
+the Codex child, so the agent does not need a second tracker login.
 
 If a claimed issue moves to a terminal state (`Done`, `Closed`, `Cancelled`, or `Duplicate`),
 Symphony stops the active agent for that issue and cleans up matching workspaces.
@@ -287,22 +286,6 @@ codex:
 - Symphony reads project issues by IID and exposes route-safe `GL-<iid>` identifiers.
 - `gitlab_api` forwards raw GitLab REST requests with host-side auth and keeps GitLab token env vars
   out of the Codex child.
-
-### Plane adapter
-
-- Configure `tracker.kind: plane` with `tracker.provider.base_url`, optional `api_key` (default
-  `PLANE_API_KEY` and accepts `$VAR`), required `workspace_slug`, and either `project_id` or
-  `project_identifier`. `project_id` is the Plane project UUID; `project_identifier` is the short
-  key used in work item identifiers such as `NAUTILUS-1`. `claim_state` defaults to `In Progress`.
-- If omitted, `active_states` defaults to `Todo` and `In Progress`, while `terminal_states`
-  defaults to `Done`, `Cancelled`, and `Canceled`. Before dispatching a Plane work item, Symphony
-  claims it by PATCHing the configured `claim_state` through Plane's REST API.
-- Symphony polls `/api/v1` within one Plane workspace/project. `issue.id` is the Plane work item
-  UUID and `issue.identifier` is `<project_identifier>-<sequence_id>`. Empty state/ID reads return
-  `{:ok, []}` without a Plane request, and `404` work items are omitted during ID refresh.
-- `plane_api` accepts a relative Plane REST path plus optional query params and JSON body. Symphony
-  executes it host-side with `X-Api-Key` auth and strips `PLANE_API_KEY` plus configured `$VAR`
-  token names from the Codex child.
 
 ## Web dashboard
 
