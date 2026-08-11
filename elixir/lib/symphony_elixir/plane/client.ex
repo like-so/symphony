@@ -339,7 +339,7 @@ defmodule SymphonyElixir.Plane.Client do
 
   defp build_settings(tracker_settings, provider) do
     %{
-      base_url: normalize_base_url(provider["base_url"] || provider["url"]),
+      base_url: resolve_setting(provider["base_url"] || provider["url"], nil),
       api_key: resolve_setting(provider["api_key"], tracker_value(tracker_settings, :api_key) || System.get_env("PLANE_API_KEY")),
       workspace_slug: resolve_setting(provider["workspace_slug"], nil),
       project_id: resolve_setting(provider["project_id"], nil),
@@ -376,9 +376,6 @@ defmodule SymphonyElixir.Plane.Client do
 
   defp provider_settings(%{provider: provider}) when is_map(provider), do: provider
   defp provider_settings(_tracker_settings), do: %{}
-
-  defp normalize_base_url(value) when is_binary(value), do: String.trim(value)
-  defp normalize_base_url(_value), do: nil
 
   defp resolve_setting(nil, fallback), do: normalize_string(fallback)
 
