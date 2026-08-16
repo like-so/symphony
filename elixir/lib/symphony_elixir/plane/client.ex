@@ -127,7 +127,7 @@ defmodule SymphonyElixir.Plane.Client do
              request_fun,
              false
            ) do
-      case normalize_issue(payload, plane_settings, project, states_by_id) do
+      case normalize_issue_with_comments(payload, plane_settings, project, states_by_id, request_fun) do
         %Issue{} = issue -> {:ok, issue}
         nil -> {:error, :plane_unknown_payload}
       end
@@ -199,7 +199,7 @@ defmodule SymphonyElixir.Plane.Client do
              false
            ),
          {:ok, results} <- results_list(payload) do
-      issues = normalize_work_item_page(results, settings, project, states_by_id)
+      issues = normalize_work_item_page(results, settings, project, states_by_id, request_fun)
       updated_acc = [issues | acc]
 
       if payload_next_page?(payload) do
@@ -232,7 +232,7 @@ defmodule SymphonyElixir.Plane.Client do
   end
 
   defp continue_fetch_issue_ids(%{} = raw_issue, rest, settings, project, states_by_id, request_fun, acc) do
-    case normalize_issue(raw_issue, settings, project, states_by_id) do
+    case normalize_issue_with_comments(raw_issue, settings, project, states_by_id, request_fun) do
       %Issue{} = issue -> fetch_issue_ids(rest, settings, project, states_by_id, request_fun, [issue | acc])
       nil -> {:error, :plane_unknown_payload}
     end
@@ -242,8 +242,8 @@ defmodule SymphonyElixir.Plane.Client do
     {:error, :plane_unknown_payload}
   end
 
-  defp normalize_work_item_page(results, settings, project, states_by_id) do
-    issues = Enum.map(results, &normalize_issue(&1, settings, project, states_by_id))
+  defp normalize_work_item_page(results, settings, project, states_by_id, request_fun) do
+    issues = Enum.map(results, &normalize_issue_with_comments(&1, settings, project, states_by_id, request_fun))
     malformed_count = Enum.count(issues, &is_nil/1)
 
     if malformed_count > 0 do
@@ -251,6 +251,27 @@ defmodule SymphonyElixir.Plane.Client do
     end
 
     Enum.reject(issues, &is_nil/1)
+  end
+
+  defp normalize_issue_with_comments(raw_issue, settings, project, states_by_id, request_fun) do
+    case normalize_issue(raw_issue, settings, project, states_by_id) do
+      %Issue{} = issue -> hydrate_comments(issue, settings, project.id, request_fun)
+      nil -> nil
+    end
+  end
+
+  defp hydrate_comments(%Issue{id: issue_id} = issue, settings, project_id, request_fun) do
+    case fetch_comments(settings, project_id, issue_id, request_fun) do
+      {:ok, []} ->
+        issue
+
+      {:ok, comments} ->
+        %{issue | comments: comments, description: append_comments(issue.description, comments)}
+
+      {:error, reason} ->
+        Logger.warning("Plane comment fetch failed issue_id=#{issue_id} reason=#{inspect(reason)}")
+        issue
+    end
   end
 
   defp normalize_issue(issue, settings, project, states_by_id) when is_map(issue) do
@@ -278,6 +299,7 @@ defmodule SymphonyElixir.Plane.Client do
         state: state_name,
         url: issue_url(settings, project_identifier, sequence_id),
         assignee_id: assignee_id(issue),
+        comments: [],
         labels: extract_labels(issue),
         blocked_by: [],
         dispatchable: not terminal_state?(state_name, settings),
@@ -288,6 +310,73 @@ defmodule SymphonyElixir.Plane.Client do
   end
 
   defp normalize_issue(_issue, _settings, _project, _states_by_id), do: nil
+
+  defp fetch_comments(settings, project_id, issue_id, request_fun) do
+    with {:ok, payload} <-
+           request_with_settings(
+             "GET",
+             project_work_item_comments_path(settings, project_id, issue_id),
+             %{"per_page" => @page_size},
+             nil,
+             settings,
+             request_fun,
+             true
+           ) do
+      case payload do
+        :not_found -> {:ok, []}
+        payload -> payload |> results_list() |> normalize_comments()
+      end
+    end
+  end
+
+  defp normalize_comments({:ok, comments}) do
+    {:ok,
+     comments
+     |> Enum.map(&normalize_comment/1)
+     |> Enum.reject(&is_nil/1)}
+  end
+
+  defp normalize_comments({:error, reason}), do: {:error, reason}
+
+  defp normalize_comment(comment) when is_map(comment) do
+    body = comment["comment_html"] || comment["comment_stripped"] || comment["comment"] || comment["body"]
+
+    if present_string?(body) do
+      %{
+        "body" => body,
+        "created_at" => normalize_string(comment["created_at"]),
+        "id" => normalize_string(comment["id"])
+      }
+      |> Enum.reject(fn {_key, value} -> is_nil(value) end)
+      |> Map.new()
+    end
+  end
+
+  defp normalize_comment(_comment), do: nil
+
+  defp append_comments(description, comments) do
+    comment_text =
+      comments
+      |> Enum.map(fn comment ->
+        created_at = Map.get(comment, "created_at", "unknown time")
+        body = Map.get(comment, "body", "")
+        "- #{created_at}: #{body}"
+      end)
+      |> Enum.join("\n")
+
+    [blank_to_nil(description), "Tracker comments:\n" <> comment_text]
+    |> Enum.reject(&is_nil/1)
+    |> Enum.join("\n\n")
+  end
+
+  defp blank_to_nil(value) when is_binary(value) do
+    case String.trim(value) do
+      "" -> nil
+      trimmed -> trimmed
+    end
+  end
+
+  defp blank_to_nil(_value), do: nil
 
   defp request_with_settings(method, path, params, body, settings, request_fun, allow_not_found) do
     case request_fun.(method, path, params, body, settings) do
@@ -444,6 +533,9 @@ defmodule SymphonyElixir.Plane.Client do
 
   defp project_work_item_path(settings, project_id, issue_id),
     do: "/api/v1/workspaces/#{encoded(settings.workspace_slug)}/projects/#{project_id}/work-items/#{issue_id}/"
+
+  defp project_work_item_comments_path(settings, project_id, issue_id),
+    do: "/api/v1/workspaces/#{encoded(settings.workspace_slug)}/projects/#{project_id}/work-items/#{issue_id}/comments/"
 
   defp results_list(%{"results" => results}) when is_list(results), do: {:ok, results}
   defp results_list(results) when is_list(results), do: {:ok, results}

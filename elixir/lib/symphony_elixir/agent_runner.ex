@@ -141,15 +141,20 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp build_turn_prompt(issue, opts, 1, _max_turns), do: PromptBuilder.build_prompt(issue, opts)
 
-  defp build_turn_prompt(_issue, _opts, turn_number, max_turns) do
+  defp build_turn_prompt(issue, opts, turn_number, max_turns) do
     """
     Continuation guidance:
 
     - The previous Codex turn completed normally, but the tracker work item is still in an active state.
     - This is continuation turn ##{turn_number} of #{max_turns} for the current agent run.
     - Resume from the current workspace and workpad state instead of restarting from scratch.
-    - The original task instructions and prior turn context are already present in this thread, so do not restate them before acting.
+    - The original task instructions and prior turn context are already present in this thread, so do not restart.
+    - The tracker context below is freshly fetched and may include comments or edits added after the prior turn.
     - Focus on the remaining ticket work and do not end the turn while the issue stays active unless you are truly blocked.
+
+    Current tracker context:
+
+    #{PromptBuilder.build_prompt(issue, opts)}
     """
   end
 

@@ -245,6 +245,8 @@ defmodule SymphonyElixir.Plane.AdapterTest do
   test "client resolves project states, pages work item reads, and normalizes issues" do
     states_path = "/api/v1/workspaces/plane/projects/#{project_id()}/states/"
     work_items_path = "/api/v1/workspaces/plane/projects/#{project_id()}/work-items/"
+    issue_1_comments_path = "/api/v1/workspaces/plane/projects/#{project_id()}/work-items/#{issue_id(1)}/comments/"
+    issue_2_comments_path = "/api/v1/workspaces/plane/projects/#{project_id()}/work-items/#{issue_id(2)}/comments/"
 
     request_fun = fn method, path, params, body, settings ->
       send(self(), {:plane_call, method, path, params, body, settings})
@@ -261,6 +263,12 @@ defmodule SymphonyElixir.Plane.AdapterTest do
 
         {"GET", ^work_items_path, _params} ->
           {:ok, %{status: 200, body: paged([raw_issue(1, todo_state_id()), Map.put(raw_issue(3, todo_state_id()), "name", " ")], true)}}
+
+        {"GET", ^issue_1_comments_path, _params} ->
+          {:ok, %{status: 200, body: paged([raw_comment("comment-1", "Use the latest requirement")])}}
+
+        {"GET", ^issue_2_comments_path, _params} ->
+          {:ok, %{status: 200, body: paged([])}}
       end
     end
 
@@ -285,7 +293,18 @@ defmodule SymphonyElixir.Plane.AdapterTest do
                }
 
         assert issue.title == "Work item 1"
-        assert issue.description == "<p>Body 1</p>"
+        assert issue.description =~ "<p>Body 1</p>"
+        assert issue.description =~ "Tracker comments:"
+        assert issue.description =~ "Use the latest requirement"
+
+        assert issue.comments == [
+                 %{
+                   "body" => "Use the latest requirement",
+                   "created_at" => "2026-08-16T12:12:57.306499Z",
+                   "id" => "comment-1"
+                 }
+               ]
+
         assert issue.state == "Todo"
         assert issue.labels == ["bug", "platform"]
         assert issue.url == "http://plane.local/plane/browse/NAUTILUS-1"
@@ -300,13 +319,16 @@ defmodule SymphonyElixir.Plane.AdapterTest do
     assert_receive {:plane_call, "GET", ^states_path, %{"per_page" => 100}, nil, _settings}
     assert_receive {:plane_call, "GET", ^work_items_path, %{"per_page" => 100}, nil, _settings}
     assert_receive {:plane_call, "GET", ^work_items_path, %{"cursor" => "1000:1:1", "per_page" => 100}, nil, _settings}
+    assert_receive {:plane_call, "GET", ^issue_1_comments_path, %{"per_page" => 100}, nil, _settings}
+    assert_receive {:plane_call, "GET", ^issue_2_comments_path, %{"per_page" => 100}, nil, _settings}
   end
 
   test "client refreshes Plane UUIDs in order, omits 404s, and rejects malformed records" do
     issue_2_path = "/api/v1/workspaces/plane/projects/#{project_id()}/work-items/#{issue_id(2)}/"
     issue_1_path = "/api/v1/workspaces/plane/projects/#{project_id()}/work-items/#{issue_id(1)}/"
     issue_4_path = "/api/v1/workspaces/plane/projects/#{project_id()}/work-items/#{issue_id(4)}/"
-
+    issue_1_comments_path = "/api/v1/workspaces/plane/projects/#{project_id()}/work-items/#{issue_id(1)}/comments/"
+    issue_2_comments_path = "/api/v1/workspaces/plane/projects/#{project_id()}/work-items/#{issue_id(2)}/comments/"
     states_path = "/api/v1/workspaces/plane/projects/#{project_id()}/states/"
 
     request_fun = fn "GET", path, params, nil, _settings ->
@@ -324,6 +346,12 @@ defmodule SymphonyElixir.Plane.AdapterTest do
 
         {^issue_4_path, %{}} ->
           {:ok, %{status: 404, body: %{"error" => "not found"}}}
+
+        {^issue_1_comments_path, %{"per_page" => 100}} ->
+          {:ok, %{status: 200, body: paged([raw_comment("comment-1", "Comment for 1")])}}
+
+        {^issue_2_comments_path, %{"per_page" => 100}} ->
+          {:ok, %{status: 200, body: paged([raw_comment("comment-2", "Comment for 2")])}}
       end
     end
 
@@ -337,9 +365,12 @@ defmodule SymphonyElixir.Plane.AdapterTest do
              )
 
     assert Enum.map(issues, & &1.id) == [issue_id(2), issue_id(1)]
+    assert Enum.map(issues, &List.first(&1.comments)["body"]) == ["Comment for 2", "Comment for 1"]
     assert_receive {:plane_id_path, ^issue_2_path}
     assert_receive {:plane_id_path, ^issue_1_path}
     assert_receive {:plane_id_path, ^issue_4_path}
+    assert_receive {:plane_id_path, ^issue_2_comments_path}
+    assert_receive {:plane_id_path, ^issue_1_comments_path}
     refute_receive {:plane_id_path, ^issue_2_path}
 
     assert {:error, :invalid_plane_issue_id} =
@@ -366,6 +397,7 @@ defmodule SymphonyElixir.Plane.AdapterTest do
     settings = tracker_settings(%{"project_id" => project_id(), "project_identifier" => "NAUTILUS"})
     states_path = "/api/v1/workspaces/plane/projects/#{project_id()}/states/"
     issue_path = "/api/v1/workspaces/plane/projects/#{project_id()}/work-items/#{issue_id(1)}/"
+    issue_comments_path = "/api/v1/workspaces/plane/projects/#{project_id()}/work-items/#{issue_id(1)}/comments/"
     in_progress_state_id = "7c4f771b-95e0-44df-ac1b-52c0456ac4a3"
 
     request_fun = fn method, path, params, body, _settings ->
@@ -377,6 +409,9 @@ defmodule SymphonyElixir.Plane.AdapterTest do
 
         {"PATCH", ^issue_path, %{}, %{"state" => ^in_progress_state_id}} ->
           {:ok, %{status: 200, body: Map.put(raw_issue(1, in_progress_state_id), "name", "Claimed item")}}
+
+        {"GET", ^issue_comments_path, %{"per_page" => 100}, nil} ->
+          {:ok, %{status: 200, body: paged([])}}
       end
     end
 
@@ -441,6 +476,14 @@ defmodule SymphonyElixir.Plane.AdapterTest do
       "assignees" => [%{"id" => "user-1"}],
       "created_at" => "2026-08-10T20:06:44.992812Z",
       "updated_at" => "2026-08-10T20:06:44.992852Z"
+    }
+  end
+
+  defp raw_comment(id, body) do
+    %{
+      "id" => id,
+      "comment_html" => body,
+      "created_at" => "2026-08-16T12:12:57.306499Z"
     }
   end
 end
