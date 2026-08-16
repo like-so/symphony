@@ -18,6 +18,13 @@ defmodule SymphonyElixir.Config do
   {% else %}
   No description provided.
   {% endif %}
+
+  {% if issue.comments %}
+  Comments:
+  {% for comment in issue.comments %}
+  - {{ comment.created_at }} {{ comment.body }}
+  {% endfor %}
+  {% endif %}
   """
 
   @type codex_runtime_settings :: %{
