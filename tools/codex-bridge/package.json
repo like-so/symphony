@@ -1,0 +1,16 @@
+{
+  "name": "codex-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Codex app-server stdio bridge that delegates Symphony worker turns to Letta Code agents.",
+  "type": "module",
+  "bin": {
+    "codex-bridge": "./bin/codex-bridge.mjs"
+  },
+  "scripts": {
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=22.19"
+  }
+}
