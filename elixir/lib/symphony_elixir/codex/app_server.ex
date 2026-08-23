@@ -143,8 +143,9 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   @spec stop_session(session()) :: :ok
-  def stop_session(%{port: port}) when is_port(port) do
+  def stop_session(%{port: port, workspace: workspace}) when is_port(port) do
     stop_port(port)
+    stop_detached_omx_sessions(workspace)
   end
 
   defp validate_workspace_cwd(workspace, nil) when is_binary(workspace) do
@@ -405,8 +406,15 @@ defmodule SymphonyElixir.Codex.AppServer do
 
     case Jason.decode(payload_string) do
       {:ok, %{"method" => "turn/completed"} = payload} ->
-        emit_turn_event(on_message, :turn_completed, payload, payload_string, port, payload)
-        {:ok, :turn_completed}
+        case input_required_completion_outcome(payload) do
+          nil ->
+            emit_turn_event(on_message, :turn_completed, payload, payload_string, port, payload)
+            {:ok, :turn_completed}
+
+          outcome ->
+            emit_turn_event(on_message, outcome, payload, payload_string, port, payload)
+            {:error, {outcome, payload}}
+        end
 
       {:ok, %{"method" => "turn/failed", "params" => _} = payload} ->
         emit_turn_event(
@@ -979,6 +987,42 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
+  defp stop_detached_omx_sessions(workspace) when is_binary(workspace) do
+    with tmux when is_binary(tmux) <- System.find_executable("tmux"),
+         {output, _status} <-
+           System.cmd(tmux, ["list-panes", "-a", "-F", "\#{session_name}\t\#{pane_current_path}"], stderr_to_stdout: true) do
+      output
+      |> String.split("\n", trim: true)
+      |> Enum.filter(&detached_omx_session_for_workspace?(&1, workspace))
+      |> Enum.map(&tmux_session_name/1)
+      |> Enum.reject(&is_nil/1)
+      |> Enum.uniq()
+      |> Enum.each(fn session_name ->
+        System.cmd(tmux, ["kill-session", "-t", session_name], stderr_to_stdout: true)
+      end)
+    else
+      _ -> :ok
+    end
+
+    :ok
+  end
+
+  defp stop_detached_omx_sessions(_workspace), do: :ok
+
+  defp detached_omx_session_for_workspace?(line, workspace) when is_binary(line) and is_binary(workspace) do
+    trimmed_line = String.trim_leading(line)
+    String.starts_with?(trimmed_line, "omx") and String.contains?(trimmed_line, Path.expand(workspace))
+  end
+
+  defp detached_omx_session_for_workspace?(_line, _workspace), do: false
+
+  defp tmux_session_name(line) when is_binary(line) do
+    line
+    |> String.trim_leading()
+    |> String.split(~r/\s+/, parts: 2)
+    |> List.first()
+  end
+
   defp emit_message(on_message, event, details, metadata) when is_function(on_message, 1) do
     message = metadata |> Map.merge(details) |> Map.put(:event, event) |> Map.put(:timestamp, DateTime.utc_now())
     on_message.(message)
@@ -999,6 +1043,21 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp maybe_set_usage(metadata, _payload), do: metadata
+
+  defp input_required_completion_outcome(payload) when is_map(payload) do
+    params = Map.get(payload, "params") || %{}
+    completion = Map.get(params, "completion") || %{}
+    outcome = Map.get(params, "outcome") || Map.get(completion, "outcome")
+
+    case outcome do
+      "input_required" -> :turn_input_required
+      "needs_input" -> :turn_input_required
+      "approval_required" -> :approval_required
+      _ -> nil
+    end
+  end
+
+  defp input_required_completion_outcome(_payload), do: nil
 
   defp shell_escape(value) when is_binary(value) do
     "'" <> String.replace(value, "'", "'\"'\"'") <> "'"

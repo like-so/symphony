@@ -118,7 +118,7 @@ defmodule SymphonyElixir.AppServerTest do
       write_workflow_file!(Workflow.workflow_file_path(),
         workspace_root: workspace_root,
         codex_command: "#{codex_binary} app-server",
-        codex_turn_timeout_ms: 250
+        codex_turn_timeout_ms: 500
       )
 
       issue = %Issue{
@@ -347,6 +347,150 @@ defmodule SymphonyElixir.AppServerTest do
 
       assert payload["method"] == "turn/input_required"
     after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "app server marks input-required completion outcomes as a hard failure" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-input-completion-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-89")
+      codex_binary = Path.join(test_root, "fake-codex")
+      File.mkdir_p!(workspace)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      count=0
+      while IFS= read -r _line; do
+        count=$((count + 1))
+
+        case "$count" in
+          1)
+            printf '%s\n' '{"id":1,"result":{}}'
+            ;;
+          2)
+            printf '%s\n' '{"id":2,"result":{"thread":{"id":"thread-89"}}}'
+            ;;
+          3)
+            printf '%s\n' '{"id":3,"result":{"turn":{"id":"turn-89"}}}'
+            ;;
+          4)
+            printf '%s\n' '{"method":"turn/completed","params":{"turn":{"id":"turn-89"},"completion":{"outcome":"input_required"}}}'
+            ;;
+          *)
+            exit 0
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server"
+      )
+
+      parent = self()
+      on_message = fn message -> send(parent, {:app_server_message, message}) end
+
+      issue = %Issue{
+        id: "issue-input-completion",
+        identifier: "MT-89",
+        title: "Input needed",
+        description: "Cannot satisfy codex input",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-89",
+        labels: ["backend"]
+      }
+
+      assert {:error, {:turn_input_required, payload}} =
+               AppServer.run(workspace, "Needs input", issue, on_message: on_message)
+
+      assert payload["method"] == "turn/completed"
+      assert payload["params"]["completion"]["outcome"] == "input_required"
+      assert_received {:app_server_message, %{event: :turn_input_required}}
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "app server cleanup kills detached OMX tmux sessions for the workspace" do
+    tmux = System.find_executable("tmux")
+
+    if is_nil(tmux) do
+      :ok
+    else
+      do_test_app_server_cleanup_kills_detached_omx_tmux_sessions(tmux)
+    end
+  end
+
+  defp do_test_app_server_cleanup_kills_detached_omx_tmux_sessions(tmux) do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-omx-cleanup-#{System.unique_integer([:positive])}"
+      )
+
+    session_name = "omx-symphony-test-#{System.unique_integer([:positive])}"
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-190")
+      bin_dir = Path.join(test_root, "bin")
+      codex_binary = Path.join(bin_dir, "fake-codex")
+      File.mkdir_p!(workspace)
+      File.mkdir_p!(bin_dir)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      count=0
+      while IFS= read -r _line; do
+        count=$((count + 1))
+
+        case "$count" in
+          1) printf '%s\n' '{"id":1,"result":{}}' ;;
+          2) printf '%s\n' '{"id":2,"result":{"thread":{"id":"thread-190"}}}' ;;
+          3) printf '%s\n' '{"id":3,"result":{"turn":{"id":"turn-190"}}}' ;;
+          4) printf '%s\n' '{"method":"turn/completed"}'; exit 0 ;;
+          *) exit 0 ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      {_, 0} =
+        System.cmd(tmux, ["new-session", "-d", "-s", session_name, "-c", workspace, "sleep", "300"])
+
+      assert {_, 0} = System.cmd(tmux, ["has-session", "-t", session_name])
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server"
+      )
+
+      issue = %Issue{
+        id: "issue-omx-cleanup",
+        identifier: "MT-190",
+        title: "Cleanup OMX",
+        description: "Ensure detached OMX tmux sessions do not linger",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-190",
+        labels: ["backend"]
+      }
+
+      assert {:ok, _result} = AppServer.run(workspace, "Cleanup", issue)
+
+      assert {_, 1} = System.cmd(tmux, ["has-session", "-t", session_name], stderr_to_stdout: true)
+    after
+      System.cmd(tmux, ["kill-session", "-t", session_name], stderr_to_stdout: true)
       File.rm_rf(test_root)
     end
   end

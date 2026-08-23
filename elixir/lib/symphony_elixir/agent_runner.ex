@@ -29,6 +29,14 @@ defmodule SymphonyElixir.AgentRunner do
       :ok ->
         :ok
 
+      {:error, reason} when reason in [:turn_input_required, :approval_required] ->
+        Logger.warning("Agent run needs operator intervention for #{issue_context(issue)}: #{inspect(reason)}")
+        {:error, reason}
+
+      {:error, {reason, _payload}} when reason in [:turn_input_required, :approval_required] ->
+        Logger.warning("Agent run needs operator intervention for #{issue_context(issue)}: #{inspect(reason)}")
+        {:error, reason}
+
       {:error, reason} ->
         Logger.error("Agent run failed for #{issue_context(issue)}: #{inspect(reason)}")
         raise RuntimeError, "Agent run failed for #{issue_context(issue)}: #{inspect(reason)}"
