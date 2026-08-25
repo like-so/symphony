@@ -252,11 +252,13 @@ async function handleLine(line) {
 async function runLettaWorkflow(turnStartResponseId, fallbackTurnId, params) {
   const prompt = buildPrompt(params);
   const cwd = params.cwd || process.cwd();
-  let turnStarted = false;
+  let turnStarted = true;
   let turnId = fallbackTurnId;
   let ownedAppServer = null;
 
   try {
+    // Symphony expects turn/start to be acknowledged before a runtime can be provisioned.
+    respond(turnStartResponseId, { turn: { id: turnId } });
     const appServer = await resolveAppServer();
     ownedAppServer = appServer.child;
     const client = await AppServerBridgeClient.connect(appServer.url, {
@@ -268,8 +270,6 @@ async function runLettaWorkflow(turnStartResponseId, fallbackTurnId, params) {
       const runtime = runtimeContext.runtime;
       const conversationId = conversationIdFromRuntime(runtimeContext);
       turnId = turnIdForConversation(conversationId) || fallbackTurnId;
-      respond(turnStartResponseId, { turn: { id: turnId } });
-      turnStarted = true;
 
       emitProgress(
         turnId,
@@ -1325,7 +1325,8 @@ function parseArgs(args) {
     const arg = args[index];
     const next = () => args[++index];
     if (arg === "--agent") parsed.agentId = next();
-    else if (arg === "--name") parsed.agentName = next();
+    else if (arg === "--name" || arg === "--shared-agent")
+      parsed.agentName = next();
     else if (arg === "--letta-bin") parsed.lettaBin = next();
     else if (arg === "--backend") parsed.backend = next();
     else if (arg === "--listen") parsed.listenUrl = next();
@@ -1336,6 +1337,11 @@ function parseArgs(args) {
     else if (arg === "--help" || arg === "-h") usage();
     else throw new Error(`Unknown argument: ${arg}`);
   }
+
+  if (parsed.agentId && parsed.agentName)
+    throw new Error(
+      "Use either --agent <id> or --shared-agent <name>, not both",
+    );
 
   parsed.agentLabel = parsed.agentId
     ? `agent ${parsed.agentId}`
@@ -1360,7 +1366,7 @@ function formatError(error) {
 
 function usage() {
   process.stdout.write(
-    `Usage: codex-bridge [options]\n\nOptions:\n  --agent <id>                 Letta agent id to run\n  --name <name>                Letta agent name to resolve and run\n  --app-server-url <url>       Existing Letta App Server WebSocket URL\n  --listen <url>               Spawn local letta server --listen URL, default ws://127.0.0.1:0\n  --letta-bin <path>           Letta executable, default letta from PATH\n  --backend <local|cloud>      Letta backend, default local\n  --workflow <mode>            plan-execute-review or single\n  --permission-mode <mode>     Letta runtime permission mode\n`,
+    `Usage: codex-bridge [options]\n\nOptions:\n  --shared-agent <name>        Stable Letta agent name shared by Symphony services\n  --agent <id>                 Letta agent id to run\n  --name <name>                Alias for --shared-agent\n  --app-server-url <url>       Existing Letta App Server WebSocket URL\n  --listen <url>               Spawn local letta server --listen URL, default ws://127.0.0.1:0\n  --letta-bin <path>           Letta executable, default letta from PATH\n  --backend <local|cloud>      Letta backend, default local\n  --workflow <mode>            plan-execute-review or single\n  --permission-mode <mode>     Letta runtime permission mode\n`,
   );
   process.exit(0);
 }
