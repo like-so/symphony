@@ -246,7 +246,11 @@ defmodule SymphonyElixir.Plane.AdapterTest do
     states_path = "/api/v1/workspaces/plane/projects/#{project_id()}/states/"
     work_items_path = "/api/v1/workspaces/plane/projects/#{project_id()}/work-items/"
     issue_1_comments_path = "/api/v1/workspaces/plane/projects/#{project_id()}/work-items/#{issue_id(1)}/comments/"
+    issue_1_relations_path = "/api/v1/workspaces/plane/projects/#{project_id()}/work-items/#{issue_id(1)}/relations/"
     issue_2_comments_path = "/api/v1/workspaces/plane/projects/#{project_id()}/work-items/#{issue_id(2)}/comments/"
+    issue_2_relations_path = "/api/v1/workspaces/plane/projects/#{project_id()}/work-items/#{issue_id(2)}/relations/"
+    issue_2_path = "/api/v1/workspaces/plane/projects/#{project_id()}/work-items/#{issue_id(2)}/"
+    issue_3_path = "/api/v1/workspaces/plane/projects/#{project_id()}/work-items/#{issue_id(3)}/"
 
     request_fun = fn method, path, params, body, settings ->
       send(self(), {:plane_call, method, path, params, body, settings})
@@ -267,8 +271,20 @@ defmodule SymphonyElixir.Plane.AdapterTest do
         {"GET", ^issue_1_comments_path, _params} ->
           {:ok, %{status: 200, body: paged([raw_comment("comment-1", "Use the latest requirement")])}}
 
+        {"GET", ^issue_1_relations_path, _params} ->
+          {:ok, %{status: 200, body: %{"blocked_by" => [raw_relation_ref(issue_id(2)), raw_relation_ref(issue_id(3))]}}}
+
+        {"GET", ^issue_2_path, %{}} ->
+          {:ok, %{status: 200, body: raw_issue(2, todo_state_id())}}
+
+        {"GET", ^issue_3_path, %{}} ->
+          {:ok, %{status: 200, body: raw_issue(3, done_state_id())}}
+
         {"GET", ^issue_2_comments_path, _params} ->
           {:ok, %{status: 200, body: paged([])}}
+
+        {"GET", ^issue_2_relations_path, _params} ->
+          {:ok, %{status: 200, body: %{"blocked_by" => []}}}
       end
     end
 
@@ -305,10 +321,21 @@ defmodule SymphonyElixir.Plane.AdapterTest do
                  }
                ]
 
+        assert issue.blocked_by == [
+                 %{
+                   "id" => issue_id(2),
+                   "identifier" => "NAUTILUS-2",
+                   "project_id" => project_id(),
+                   "state" => "Todo",
+                   "title" => "Work item 2"
+                 }
+               ]
+
         assert issue.state == "Todo"
+        assert issue.priority == 3
         assert issue.labels == ["bug", "platform"]
         assert issue.url == "http://plane.local/plane/browse/NAUTILUS-1"
-        assert issue.dispatchable
+        refute issue.dispatchable
         assert %DateTime{} = issue.created_at
         assert %DateTime{} = issue.updated_at
       end)
@@ -320,7 +347,11 @@ defmodule SymphonyElixir.Plane.AdapterTest do
     assert_receive {:plane_call, "GET", ^work_items_path, %{"per_page" => 100}, nil, _settings}
     assert_receive {:plane_call, "GET", ^work_items_path, %{"cursor" => "1000:1:1", "per_page" => 100}, nil, _settings}
     assert_receive {:plane_call, "GET", ^issue_1_comments_path, %{"per_page" => 100}, nil, _settings}
+    assert_receive {:plane_call, "GET", ^issue_1_relations_path, %{}, nil, _settings}
+    assert_receive {:plane_call, "GET", ^issue_2_path, %{}, nil, _settings}
+    assert_receive {:plane_call, "GET", ^issue_3_path, %{}, nil, _settings}
     assert_receive {:plane_call, "GET", ^issue_2_comments_path, %{"per_page" => 100}, nil, _settings}
+    assert_receive {:plane_call, "GET", ^issue_2_relations_path, %{}, nil, _settings}
   end
 
   test "client refreshes Plane UUIDs in order, omits 404s, and rejects malformed records" do
@@ -329,6 +360,8 @@ defmodule SymphonyElixir.Plane.AdapterTest do
     issue_4_path = "/api/v1/workspaces/plane/projects/#{project_id()}/work-items/#{issue_id(4)}/"
     issue_1_comments_path = "/api/v1/workspaces/plane/projects/#{project_id()}/work-items/#{issue_id(1)}/comments/"
     issue_2_comments_path = "/api/v1/workspaces/plane/projects/#{project_id()}/work-items/#{issue_id(2)}/comments/"
+    issue_1_relations_path = "/api/v1/workspaces/plane/projects/#{project_id()}/work-items/#{issue_id(1)}/relations/"
+    issue_2_relations_path = "/api/v1/workspaces/plane/projects/#{project_id()}/work-items/#{issue_id(2)}/relations/"
     states_path = "/api/v1/workspaces/plane/projects/#{project_id()}/states/"
 
     request_fun = fn "GET", path, params, nil, _settings ->
@@ -352,6 +385,12 @@ defmodule SymphonyElixir.Plane.AdapterTest do
 
         {^issue_2_comments_path, %{"per_page" => 100}} ->
           {:ok, %{status: 200, body: paged([raw_comment("comment-2", "Comment for 2")])}}
+
+        {^issue_1_relations_path, %{}} ->
+          {:ok, %{status: 200, body: %{"blocked_by" => []}}}
+
+        {^issue_2_relations_path, %{}} ->
+          {:ok, %{status: 200, body: %{"blocked_by" => [raw_relation_ref(issue_id(1))]}}}
       end
     end
 
@@ -365,12 +404,15 @@ defmodule SymphonyElixir.Plane.AdapterTest do
              )
 
     assert Enum.map(issues, & &1.id) == [issue_id(2), issue_id(1)]
+    assert Enum.map(issues, &Enum.map(&1.blocked_by, fn blocker -> blocker["identifier"] end)) == [["NAUTILUS-1"], []]
     assert Enum.map(issues, &List.first(&1.comments)["body"]) == ["Comment for 2", "Comment for 1"]
     assert_receive {:plane_id_path, ^issue_2_path}
     assert_receive {:plane_id_path, ^issue_1_path}
     assert_receive {:plane_id_path, ^issue_4_path}
     assert_receive {:plane_id_path, ^issue_2_comments_path}
     assert_receive {:plane_id_path, ^issue_1_comments_path}
+    assert_receive {:plane_id_path, ^issue_2_relations_path}
+    assert_receive {:plane_id_path, ^issue_1_relations_path}
     refute_receive {:plane_id_path, ^issue_2_path}
 
     assert {:error, :invalid_plane_issue_id} =
@@ -392,12 +434,80 @@ defmodule SymphonyElixir.Plane.AdapterTest do
              )
   end
 
+  test "client treats active Plane subtasks as parent blockers" do
+    states_path = "/api/v1/workspaces/plane/projects/#{project_id()}/states/"
+    work_items_path = "/api/v1/workspaces/plane/projects/#{project_id()}/work-items/"
+    parent_comments_path = "/api/v1/workspaces/plane/projects/#{project_id()}/work-items/#{issue_id(1)}/comments/"
+    active_child_comments_path = "/api/v1/workspaces/plane/projects/#{project_id()}/work-items/#{issue_id(2)}/comments/"
+    done_child_comments_path = "/api/v1/workspaces/plane/projects/#{project_id()}/work-items/#{issue_id(3)}/comments/"
+    parent_relations_path = "/api/v1/workspaces/plane/projects/#{project_id()}/work-items/#{issue_id(1)}/relations/"
+    active_child_relations_path = "/api/v1/workspaces/plane/projects/#{project_id()}/work-items/#{issue_id(2)}/relations/"
+    done_child_relations_path = "/api/v1/workspaces/plane/projects/#{project_id()}/work-items/#{issue_id(3)}/relations/"
+    in_progress_state_id = "7c4f771b-95e0-44df-ac1b-52c0456ac4a3"
+
+    request_fun = fn method, path, params, body, _settings ->
+      send(self(), {:plane_subtask_call, method, path, params, body})
+
+      case {method, path, params, body} do
+        {"GET", "/api/v1/workspaces/plane/projects/", %{"per_page" => 100}, nil} ->
+          {:ok, %{status: 200, body: paged([raw_project()])}}
+
+        {"GET", ^states_path, %{"per_page" => 100}, nil} ->
+          {:ok,
+           %{
+             status: 200,
+             body: paged([raw_state("Todo", todo_state_id()), raw_state("In Progress", in_progress_state_id), raw_state("Done", done_state_id())])
+           }}
+
+        {"GET", ^work_items_path, %{"per_page" => 100}, nil} ->
+          {:ok,
+           %{
+             status: 200,
+             body:
+               paged([
+                 raw_issue(1, todo_state_id()),
+                 Map.put(raw_issue(2, in_progress_state_id), "parent", issue_id(1)),
+                 Map.put(raw_issue(3, done_state_id()), "parent", issue_id(1))
+               ])
+           }}
+
+        {"GET", path, %{"per_page" => 100}, nil} when path in [parent_comments_path, active_child_comments_path, done_child_comments_path] ->
+          {:ok, %{status: 200, body: paged([])}}
+
+        {"GET", path, %{}, nil} when path in [parent_relations_path, active_child_relations_path, done_child_relations_path] ->
+          {:ok, %{status: 200, body: %{"blocked_by" => []}}}
+      end
+    end
+
+    assert {:ok, [parent]} =
+             PlaneClient.fetch_issues_by_states_for_test(
+               ["Todo"],
+               tracker_settings(),
+               request_fun
+             )
+
+    assert parent.identifier == "NAUTILUS-1"
+
+    assert parent.blocked_by == [
+             %{
+               "id" => issue_id(2),
+               "identifier" => "NAUTILUS-2",
+               "project_id" => project_id(),
+               "state" => "In Progress",
+               "title" => "Work item 2"
+             }
+           ]
+
+    refute parent.dispatchable
+  end
+
   test "client claims a Plane issue by patching configured claim state" do
     issue = %SymphonyElixir.Tracker.Issue{id: issue_id(1), identifier: "NAUTILUS-1", state: "Todo"}
     settings = tracker_settings(%{"project_id" => project_id(), "project_identifier" => "NAUTILUS"})
     states_path = "/api/v1/workspaces/plane/projects/#{project_id()}/states/"
     issue_path = "/api/v1/workspaces/plane/projects/#{project_id()}/work-items/#{issue_id(1)}/"
     issue_comments_path = "/api/v1/workspaces/plane/projects/#{project_id()}/work-items/#{issue_id(1)}/comments/"
+    issue_relations_path = "/api/v1/workspaces/plane/projects/#{project_id()}/work-items/#{issue_id(1)}/relations/"
     in_progress_state_id = "7c4f771b-95e0-44df-ac1b-52c0456ac4a3"
 
     request_fun = fn method, path, params, body, _settings ->
@@ -412,6 +522,9 @@ defmodule SymphonyElixir.Plane.AdapterTest do
 
         {"GET", ^issue_comments_path, %{"per_page" => 100}, nil} ->
           {:ok, %{status: 200, body: paged([])}}
+
+        {"GET", ^issue_relations_path, %{}, nil} ->
+          {:ok, %{status: 200, body: %{"blocked_by" => []}}}
       end
     end
 
@@ -485,5 +598,9 @@ defmodule SymphonyElixir.Plane.AdapterTest do
       "comment_html" => body,
       "created_at" => "2026-08-16T12:12:57.306499Z"
     }
+  end
+
+  defp raw_relation_ref(issue_id) do
+    %{"project_id" => project_id(), "issue_id" => issue_id}
   end
 end

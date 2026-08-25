@@ -199,13 +199,16 @@ defmodule SymphonyElixir.Plane.Client do
              false
            ),
          {:ok, results} <- results_list(payload) do
-      issues = normalize_work_item_page(results, settings, project, states_by_id, request_fun)
-      updated_acc = [issues | acc]
+      updated_acc = [results | acc]
 
       if payload_next_page?(payload) do
         fetch_work_item_pages(settings, project, states_by_id, request_fun, payload["next_cursor"], updated_acc)
       else
-        {:ok, updated_acc |> Enum.reverse() |> List.flatten()}
+        {:ok,
+         updated_acc
+         |> Enum.reverse()
+         |> List.flatten()
+         |> normalize_work_items(settings, project, states_by_id, request_fun)}
       end
     end
   end
@@ -242,7 +245,7 @@ defmodule SymphonyElixir.Plane.Client do
     {:error, :plane_unknown_payload}
   end
 
-  defp normalize_work_item_page(results, settings, project, states_by_id, request_fun) do
+  defp normalize_work_items(results, settings, project, states_by_id, request_fun) do
     issues = Enum.map(results, &normalize_issue_with_comments(&1, settings, project, states_by_id, request_fun))
     malformed_count = Enum.count(issues, &is_nil/1)
 
@@ -250,13 +253,20 @@ defmodule SymphonyElixir.Plane.Client do
       Logger.warning("Dropping malformed Plane work item records count=#{malformed_count}")
     end
 
-    Enum.reject(issues, &is_nil/1)
+    issues
+    |> Enum.reject(&is_nil/1)
+    |> apply_subtask_blockers(settings)
   end
 
   defp normalize_issue_with_comments(raw_issue, settings, project, states_by_id, request_fun) do
     case normalize_issue(raw_issue, settings, project, states_by_id) do
-      %Issue{} = issue -> hydrate_comments(issue, settings, project.id, request_fun)
-      nil -> nil
+      %Issue{} = issue ->
+        issue
+        |> hydrate_comments(settings, project.id, request_fun)
+        |> hydrate_relations(settings, project, states_by_id, request_fun)
+
+      nil ->
+        nil
     end
   end
 
@@ -285,13 +295,15 @@ defmodule SymphonyElixir.Plane.Client do
          present_string?(project_identifier) and is_integer(sequence_id) do
       %Issue{
         id: id,
-        native_ref: %{
-          "id" => id,
-          "workspace_slug" => settings.workspace_slug,
-          "project_id" => project.id,
-          "project_identifier" => project_identifier,
-          "sequence_id" => sequence_id
-        },
+        native_ref:
+          %{
+            "id" => id,
+            "workspace_slug" => settings.workspace_slug,
+            "project_id" => project.id,
+            "project_identifier" => project_identifier,
+            "sequence_id" => sequence_id
+          }
+          |> maybe_put_parent_id(issue["parent"]),
         identifier: "#{project_identifier}-#{sequence_id}",
         title: title,
         description: issue["description_html"] || issue["description_text"] || issue["description"],
@@ -310,6 +322,46 @@ defmodule SymphonyElixir.Plane.Client do
   end
 
   defp normalize_issue(_issue, _settings, _project, _states_by_id), do: nil
+
+  defp apply_subtask_blockers(issues, settings) do
+    blockers_by_parent_id =
+      issues
+      |> Enum.reject(&terminal_state?(&1.state, settings))
+      |> Enum.group_by(&get_in(&1.native_ref, ["parent_id"]), &subtask_blocker/1)
+      |> Map.delete(nil)
+
+    Enum.map(issues, fn issue ->
+      case Map.get(blockers_by_parent_id, issue.id, []) do
+        [] ->
+          issue
+
+        blockers ->
+          %{issue | blocked_by: unique_blockers(issue.blocked_by ++ blockers), dispatchable: false}
+      end
+    end)
+  end
+
+  defp subtask_blocker(%Issue{} = issue) do
+    %{
+      "id" => issue.id,
+      "identifier" => issue.identifier,
+      "project_id" => get_in(issue.native_ref, ["project_id"]),
+      "state" => issue.state,
+      "title" => issue.title
+    }
+    |> Enum.reject(fn {_key, value} -> is_nil(value) end)
+    |> Map.new()
+  end
+
+  defp unique_blockers(blockers) do
+    Enum.uniq_by(blockers, fn blocker -> {blocker["project_id"], blocker["id"], blocker["identifier"]} end)
+  end
+
+  defp maybe_put_parent_id(native_ref, parent_id) when is_binary(parent_id) and parent_id != "" do
+    Map.put(native_ref, "parent_id", parent_id)
+  end
+
+  defp maybe_put_parent_id(native_ref, _parent_id), do: native_ref
 
   defp fetch_comments(settings, project_id, issue_id, request_fun) do
     with {:ok, payload} <-
@@ -337,6 +389,93 @@ defmodule SymphonyElixir.Plane.Client do
   end
 
   defp normalize_comments({:error, reason}), do: {:error, reason}
+
+  defp hydrate_relations(%Issue{id: issue_id} = issue, settings, project, states_by_id, request_fun) do
+    case fetch_relations(settings, project.id, issue_id, states_by_id, request_fun) do
+      {:ok, blocked_by} ->
+        %{issue | blocked_by: blocked_by, dispatchable: issue.dispatchable and blocked_by == []}
+
+      {:error, reason} ->
+        Logger.warning("Plane relation fetch failed issue_id=#{issue_id} reason=#{inspect(reason)}")
+        issue
+    end
+  end
+
+  defp fetch_relations(settings, project_id, issue_id, states_by_id, request_fun) do
+    with {:ok, payload} <-
+           request_with_settings(
+             "GET",
+             project_work_item_relations_path(settings, project_id, issue_id),
+             %{},
+             nil,
+             settings,
+             request_fun,
+             true
+           ) do
+      case payload do
+        :not_found -> {:ok, []}
+        %{"blocked_by" => blocked_by} when is_list(blocked_by) -> {:ok, normalize_blockers(blocked_by, settings, states_by_id, request_fun)}
+        _payload -> {:error, :plane_unknown_payload}
+      end
+    end
+  end
+
+  defp normalize_blockers(blocked_by, settings, states_by_id, request_fun) do
+    blocked_by
+    |> Enum.map(&normalize_blocker(&1, settings, states_by_id, request_fun))
+    |> Enum.reject(&is_nil/1)
+    |> Enum.reject(&terminal_blocker?(&1, settings))
+  end
+
+  defp terminal_blocker?(%{"state" => state_name}, settings) when is_binary(state_name),
+    do: terminal_state?(state_name, settings)
+
+  defp terminal_blocker?(_blocker, _settings), do: false
+
+  defp normalize_blocker(%{"issue_id" => issue_id, "project_id" => project_id}, settings, states_by_id, request_fun)
+       when is_binary(issue_id) and is_binary(project_id) do
+    case request_with_settings(
+           "GET",
+           project_work_item_path(settings, project_id, issue_id),
+           %{},
+           nil,
+           settings,
+           request_fun,
+           true
+         ) do
+      {:ok, %{} = blocker} ->
+        blocker
+        |> Map.put_new("project_id", project_id)
+        |> normalize_blocker_details(settings, states_by_id)
+
+      _ ->
+        %{"id" => issue_id, "project_id" => project_id}
+    end
+  end
+
+  defp normalize_blocker(blocker, settings, states_by_id, _request_fun),
+    do: normalize_blocker_details(blocker, settings, states_by_id)
+
+  defp normalize_blocker_details(%{"id" => id, "sequence_id" => sequence_id} = blocker, settings, states_by_id)
+       when is_binary(id) and is_integer(sequence_id) do
+    project_identifier = normalize_string(blocker["project_identifier"]) || settings.project_identifier
+
+    %{
+      "id" => id,
+      "identifier" => "#{project_identifier}-#{sequence_id}",
+      "project_id" => normalize_string(blocker["project_id"]),
+      "state" => blocker_state_name(blocker, states_by_id),
+      "title" => normalize_string(blocker["name"])
+    }
+    |> Enum.reject(fn {_key, value} -> is_nil(value) end)
+    |> Map.new()
+  end
+
+  defp normalize_blocker_details(_blocker, _settings, _states_by_id), do: nil
+
+  defp blocker_state_name(%{"state" => state_id}, states_by_id) when is_binary(state_id), do: Map.get(states_by_id, state_id)
+  defp blocker_state_name(%{"state" => %{"name" => state_name}}, _states_by_id), do: normalize_string(state_name)
+  defp blocker_state_name(_blocker, _states_by_id), do: nil
 
   defp normalize_comment(comment) when is_map(comment) do
     body = comment["comment_html"] || comment["comment_stripped"] || comment["comment"] || comment["body"]
@@ -537,6 +676,9 @@ defmodule SymphonyElixir.Plane.Client do
   defp project_work_item_comments_path(settings, project_id, issue_id),
     do: "/api/v1/workspaces/#{encoded(settings.workspace_slug)}/projects/#{project_id}/work-items/#{issue_id}/comments/"
 
+  defp project_work_item_relations_path(settings, project_id, issue_id),
+    do: "/api/v1/workspaces/#{encoded(settings.workspace_slug)}/projects/#{project_id}/work-items/#{issue_id}/relations/"
+
   defp results_list(%{"results" => results}) when is_list(results), do: {:ok, results}
   defp results_list(results) when is_list(results), do: {:ok, results}
   defp results_list(_payload), do: {:error, :plane_unknown_payload}
@@ -560,6 +702,17 @@ defmodule SymphonyElixir.Plane.Client do
   end
 
   defp normalize_priority(value) when is_integer(value), do: value
+
+  defp normalize_priority(value) when is_binary(value) do
+    case normalize_state(value) do
+      "urgent" -> 1
+      "high" -> 2
+      "medium" -> 3
+      "low" -> 4
+      _priority -> nil
+    end
+  end
+
   defp normalize_priority(_value), do: nil
 
   defp assignee_id(%{"assignees" => [%{"id" => id} | _]}) when is_binary(id), do: id
