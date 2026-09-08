@@ -1854,9 +1854,11 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     %{session: session, tracer_pid: tracer_pid}
   end
 
-  defp assert_trace_delivered(%{session: session}) do
-    delivery_ref = :trace.delivered(session, self())
+  defp assert_trace_delivered(%{session: session, tracer_pid: tracer_pid}) do
     test_pid = self()
+
+    send(tracer_pid, {:deliver, session, test_pid})
+    assert_receive {:trace_delivery_requested, ^tracer_pid, delivery_ref}
     assert_receive {:trace_delivered, ^test_pid, ^delivery_ref}
   end
 
@@ -1869,6 +1871,11 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
 
   defp forward_trace_events(test_pid) do
     receive do
+      {:deliver, session, tracee_pid} ->
+        delivery_ref = :trace.delivered(session, tracee_pid)
+        send(test_pid, {:trace_delivery_requested, self(), delivery_ref})
+        forward_trace_events(test_pid)
+
       :stop ->
         :ok
 
