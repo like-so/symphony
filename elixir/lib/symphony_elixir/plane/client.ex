@@ -384,15 +384,14 @@ defmodule SymphonyElixir.Plane.Client do
 
   defp unique_blockers(blockers) do
     Enum.uniq_by(blockers, fn blocker ->
-      project_id = normalize_string(blocker["project_id"])
       id = normalize_string(blocker["id"])
       identifier = normalize_string(blocker["identifier"])
 
-      case {project_id, id, identifier} do
-        {project_id, id, _identifier} when is_binary(project_id) and is_binary(id) ->
-          {:native, project_id, id}
+      case {id, identifier} do
+        {id, _identifier} when is_binary(id) ->
+          {:native, id}
 
-        {_project_id, _id, identifier} when is_binary(identifier) ->
+        {_id, identifier} when is_binary(identifier) ->
           {:identifier, identifier}
 
         _missing_identity ->

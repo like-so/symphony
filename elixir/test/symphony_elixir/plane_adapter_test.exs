@@ -495,11 +495,8 @@ defmodule SymphonyElixir.Plane.AdapterTest do
           {:ok,
            %{
              status: 200,
-             body: %{"blocked_by" => [raw_relation_ref(issue_id(2)), raw_relation_ref(issue_id(4))]}
+             body: %{"blocked_by" => [raw_issue(2, in_progress_state_id), raw_relation_ref(issue_id(4))]}
            }}
-
-        {"GET", ^active_child_path, %{}, nil} ->
-          {:ok, %{status: 404, body: %{"error" => "not found"}}}
 
         {"GET", ^relation_blocker_path, %{}, nil} ->
           {:ok, %{status: 200, body: raw_issue(4, in_progress_state_id)}}
@@ -536,7 +533,7 @@ defmodule SymphonyElixir.Plane.AdapterTest do
            ]
 
     refute parent.dispatchable
-    assert_receive {:plane_subtask_call, "GET", ^active_child_path, %{}, nil}
+    refute_receive {:plane_subtask_call, "GET", ^active_child_path, %{}, nil}
     refute_receive {:plane_subtask_call, "GET", ^active_child_comments_path, _, _}
     refute_receive {:plane_subtask_call, "GET", ^done_child_comments_path, _, _}
     refute_receive {:plane_subtask_call, "GET", ^active_child_relations_path, _, _}
