@@ -1414,8 +1414,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
       assert is_binary(latest_state.pending_content)
       refute latest_state.pending_content == pending_content
 
-      send(tracer, {:barrier, self()})
-      assert_receive :trace_barrier
+      assert_trace_delivered(tracer)
       refute_received {:trace, ^test_pid, :call, {:erlang, :send_after, _args}}
 
       assert {:noreply, flushed_state} =
@@ -1840,23 +1839,38 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
 
   defp start_timer_call_tracer do
     test_pid = self()
-    tracer = spawn_link(fn -> forward_trace_events(test_pid) end)
-    :erlang.trace_pattern({:erlang, :send_after, 3}, [{:_, [], [{:return_trace}]}], [])
-    :erlang.trace(test_pid, true, [:call, {:tracer, tracer}])
-    tracer
+    tracer_pid = spawn(fn -> forward_trace_events(test_pid) end)
+    session = :trace.session_create(__MODULE__, tracer_pid, [])
+
+    assert 1 ==
+             :trace.function(
+               session,
+               {:erlang, :send_after, 3},
+               [{:_, [], [{:return_trace}]}],
+               []
+             )
+
+    assert 1 == :trace.process(session, test_pid, true, [:call])
+    %{session: session, tracer_pid: tracer_pid}
   end
 
-  defp stop_timer_call_tracer(tracer) do
-    :erlang.trace(self(), false, [:call])
-    :erlang.trace_pattern({:erlang, :send_after, 3}, false, [])
-    Process.exit(tracer, :normal)
+  defp assert_trace_delivered(%{session: session}) do
+    delivery_ref = :trace.delivered(session, self())
+    test_pid = self()
+    assert_receive {:trace_delivered, ^test_pid, ^delivery_ref}
+  end
+
+  defp stop_timer_call_tracer(%{session: session, tracer_pid: tracer_pid}) do
+    assert :trace.session_destroy(session)
+    monitor_ref = Process.monitor(tracer_pid)
+    send(tracer_pid, :stop)
+    assert_receive {:DOWN, ^monitor_ref, :process, ^tracer_pid, :normal}
   end
 
   defp forward_trace_events(test_pid) do
     receive do
-      {:barrier, sender} ->
-        send(sender, :trace_barrier)
-        forward_trace_events(test_pid)
+      :stop ->
+        :ok
 
       event ->
         send(test_pid, event)
