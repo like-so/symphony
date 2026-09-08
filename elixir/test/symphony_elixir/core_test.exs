@@ -1048,15 +1048,21 @@ defmodule SymphonyElixir.CoreTest do
       |> Map.put(:retry_attempts, %{})
     end)
 
+    down_sent_at_ms = System.monotonic_time(:millisecond)
     send(pid, {:DOWN, ref, :process, self(), :normal})
-    Process.sleep(50)
+
+    assert %{attempt: 1, due_at_ms: due_at_ms, identifier: "MT-558", timer_ref: timer_ref} =
+             eventually_value(fn -> :sys.get_state(pid).retry_attempts[issue_id] end)
+
+    down_observed_at_ms = System.monotonic_time(:millisecond)
     state = :sys.get_state(pid)
 
     refute Map.has_key?(state.running, issue_id)
     assert MapSet.member?(state.completed, issue_id)
-    assert %{attempt: 1, due_at_ms: due_at_ms} = state.retry_attempts[issue_id]
     assert is_integer(due_at_ms)
-    assert_due_in_range(due_at_ms, 500, 1_100)
+    assert due_at_ms >= down_sent_at_ms + 1_000
+    assert due_at_ms <= down_observed_at_ms + 1_000
+    assert Process.cancel_timer(timer_ref) > 0
   end
 
   test "abnormal worker exit increments retry attempt progressively" do

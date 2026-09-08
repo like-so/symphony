@@ -171,24 +171,30 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert Process.alive?(manual_pid)
 
     state = :sys.get_state(manual_pid)
-    File.write!(manual_path, "---\ntracker: [\n---\nBroken prompt\n")
-    assert {:noreply, returned_state} = WorkflowStore.handle_info(:poll, state)
-    assert returned_state.workflow.prompt == "Manual workflow prompt"
-    refute returned_state.stamp == nil
-    assert_receive :poll, 1_100
-
-    Workflow.set_workflow_file_path(missing_path)
-    assert {:noreply, path_error_state} = WorkflowStore.handle_info(:poll, returned_state)
-    assert path_error_state.workflow.prompt == "Manual workflow prompt"
-    assert_receive :poll, 1_100
-
-    Workflow.set_workflow_file_path(manual_path)
-    File.rm!(manual_path)
-    assert {:noreply, removed_state} = WorkflowStore.handle_info(:poll, path_error_state)
-    assert removed_state.workflow.prompt == "Manual workflow prompt"
-    assert_receive :poll, 1_100
-
     assert :ok = GenServer.stop(manual_pid)
+
+    tracer = start_timer_call_tracer()
+
+    try do
+      File.write!(manual_path, "---\ntracker: [\n---\nBroken prompt\n")
+      assert {:noreply, returned_state} = WorkflowStore.handle_info(:poll, state)
+      assert returned_state.workflow.prompt == "Manual workflow prompt"
+      refute returned_state.stamp == nil
+      assert_poll_timer_scheduled()
+
+      Workflow.set_workflow_file_path(missing_path)
+      assert {:noreply, path_error_state} = WorkflowStore.handle_info(:poll, returned_state)
+      assert path_error_state.workflow.prompt == "Manual workflow prompt"
+      assert_poll_timer_scheduled()
+
+      Workflow.set_workflow_file_path(manual_path)
+      File.rm!(manual_path)
+      assert {:noreply, removed_state} = WorkflowStore.handle_info(:poll, path_error_state)
+      assert removed_state.workflow.prompt == "Manual workflow prompt"
+      assert_poll_timer_scheduled()
+    after
+      stop_timer_call_tracer(tracer)
+    end
 
     Workflow.set_workflow_file_path(existing_path)
 
@@ -727,6 +733,38 @@ defmodule SymphonyElixir.ExtensionsTest do
   end
 
   defp assert_eventually(_fun, 0), do: flunk("condition not met in time")
+
+  defp start_timer_call_tracer do
+    test_pid = self()
+    tracer = spawn_link(fn -> forward_trace_events(test_pid) end)
+    :erlang.trace_pattern({:erlang, :send_after, 3}, [{:_, [], [{:return_trace}]}], [])
+    :erlang.trace(test_pid, true, [:call, {:tracer, tracer}])
+    tracer
+  end
+
+  defp stop_timer_call_tracer(tracer) do
+    :erlang.trace(self(), false, [:call])
+    :erlang.trace_pattern({:erlang, :send_after, 3}, false, [])
+    Process.exit(tracer, :normal)
+  end
+
+  defp forward_trace_events(test_pid) do
+    receive do
+      event ->
+        send(test_pid, event)
+        forward_trace_events(test_pid)
+    end
+  end
+
+  defp assert_poll_timer_scheduled do
+    test_pid = self()
+
+    assert_receive {:trace, ^test_pid, :call, {:erlang, :send_after, [1_000, ^test_pid, :poll]}}
+
+    assert_receive {:trace, ^test_pid, :return_from, {:erlang, :send_after, 3}, timer_ref}
+    assert is_reference(timer_ref)
+    assert Process.cancel_timer(timer_ref) > 0
+  end
 
   defp ensure_workflow_store_running do
     if Process.whereis(WorkflowStore) do
