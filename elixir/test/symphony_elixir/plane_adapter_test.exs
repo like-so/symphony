@@ -473,7 +473,12 @@ defmodule SymphonyElixir.Plane.AdapterTest do
           {:ok,
            %{
              status: 200,
-             body: paged([raw_state("Todo", todo_state_id()), raw_state("In Progress", in_progress_state_id), raw_state("Done", done_state_id())])
+             body:
+               paged([
+                 raw_state("Todo", todo_state_id()),
+                 raw_state("In Progress", in_progress_state_id),
+                 raw_state("Done", done_state_id())
+               ])
            }}
 
         {"GET", ^work_items_path, %{"per_page" => 100}, nil} ->
@@ -488,7 +493,8 @@ defmodule SymphonyElixir.Plane.AdapterTest do
                ])
            }}
 
-        {"GET", path, %{"per_page" => 100}, nil} when path in [parent_comments_path, active_child_comments_path, done_child_comments_path] ->
+        {"GET", path, %{"per_page" => 100}, nil}
+        when path in [parent_comments_path, active_child_comments_path, done_child_comments_path] ->
           {:ok, %{status: 200, body: paged([])}}
 
         {"GET", ^parent_relations_path, %{}, nil} ->

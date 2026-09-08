@@ -462,9 +462,14 @@ defmodule SymphonyElixir.Plane.Client do
              true
            ) do
       case payload do
-        :not_found -> {:ok, []}
-        %{"blocked_by" => blocked_by} when is_list(blocked_by) -> {:ok, normalize_blockers(blocked_by, settings, states_by_id, request_fun)}
-        _payload -> {:error, :plane_unknown_payload}
+        :not_found ->
+          {:ok, []}
+
+        %{"blocked_by" => blocked_by} when is_list(blocked_by) ->
+          {:ok, normalize_blockers(blocked_by, settings, states_by_id, request_fun)}
+
+        _payload ->
+          {:error, :plane_unknown_payload}
       end
     end
   end
@@ -472,8 +477,9 @@ defmodule SymphonyElixir.Plane.Client do
   defp normalize_blockers(blocked_by, settings, states_by_id, request_fun) do
     blocked_by
     |> Enum.map(&normalize_blocker(&1, settings, states_by_id, request_fun))
-    |> Enum.reject(&is_nil/1)
-    |> Enum.reject(&terminal_blocker?(&1, settings))
+    |> Enum.reject(fn blocker ->
+      is_nil(blocker) or terminal_blocker?(blocker, settings)
+    end)
   end
 
   defp terminal_blocker?(%{"state" => state_name}, settings) when is_binary(state_name),
@@ -544,13 +550,11 @@ defmodule SymphonyElixir.Plane.Client do
 
   defp append_comments(description, comments) do
     comment_text =
-      comments
-      |> Enum.map(fn comment ->
+      Enum.map_join(comments, "\n", fn comment ->
         created_at = Map.get(comment, "created_at", "unknown time")
         body = Map.get(comment, "body", "")
         "- #{created_at}: #{body}"
       end)
-      |> Enum.join("\n")
 
     [blank_to_nil(description), "Tracker comments:\n" <> comment_text]
     |> Enum.reject(&is_nil/1)
