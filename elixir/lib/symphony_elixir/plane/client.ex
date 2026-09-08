@@ -280,25 +280,19 @@ defmodule SymphonyElixir.Plane.Client do
     |> Enum.reject(&is_nil/1)
     |> apply_subtask_blockers(settings)
     |> Enum.filter(&MapSet.member?(requested_states, normalize_state(&1.state)))
-    |> Enum.map(&hydrate_active_issue(&1, settings, project, states_by_id, request_fun))
+    |> Enum.map(&hydrate_issue(&1, settings, project, states_by_id, request_fun))
   end
 
-  defp hydrate_active_issue(%Issue{} = issue, settings, project, states_by_id, request_fun) do
-    if terminal_state?(issue.state, settings) do
-      issue
-    else
-      issue
-      |> hydrate_comments(settings, project.id, request_fun)
-      |> hydrate_relations(settings, project, states_by_id, request_fun)
-    end
+  defp hydrate_issue(%Issue{} = issue, settings, project, states_by_id, request_fun) do
+    issue
+    |> hydrate_comments(settings, project.id, request_fun)
+    |> hydrate_relations(settings, project, states_by_id, request_fun)
   end
 
   defp normalize_issue_with_comments(raw_issue, settings, project, states_by_id, request_fun) do
     case normalize_issue(raw_issue, settings, project, states_by_id) do
       %Issue{} = issue ->
-        issue
-        |> hydrate_comments(settings, project.id, request_fun)
-        |> hydrate_relations(settings, project, states_by_id, request_fun)
+        hydrate_issue(issue, settings, project, states_by_id, request_fun)
 
       nil ->
         nil
@@ -389,7 +383,22 @@ defmodule SymphonyElixir.Plane.Client do
   end
 
   defp unique_blockers(blockers) do
-    Enum.uniq_by(blockers, fn blocker -> {blocker["project_id"], blocker["id"], blocker["identifier"]} end)
+    Enum.uniq_by(blockers, fn blocker ->
+      project_id = normalize_string(blocker["project_id"])
+      id = normalize_string(blocker["id"])
+      identifier = normalize_string(blocker["identifier"])
+
+      case {project_id, id, identifier} do
+        {project_id, id, _identifier} when is_binary(project_id) and is_binary(id) ->
+          {:native, project_id, id}
+
+        {_project_id, _id, identifier} when is_binary(identifier) ->
+          {:identifier, identifier}
+
+        _missing_identity ->
+          {:unidentified, blocker}
+      end
+    end)
   end
 
   defp maybe_put_parent_id(native_ref, parent_id) when is_binary(parent_id) and parent_id != "" do
