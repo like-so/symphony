@@ -406,15 +406,7 @@ defmodule SymphonyElixir.Codex.AppServer do
 
     case Jason.decode(payload_string) do
       {:ok, %{"method" => "turn/completed"} = payload} ->
-        case input_required_completion_outcome(payload) do
-          nil ->
-            emit_turn_event(on_message, :turn_completed, payload, payload_string, port, payload)
-            {:ok, :turn_completed}
-
-          outcome ->
-            emit_turn_event(on_message, outcome, payload, payload_string, port, payload)
-            {:error, {outcome, payload}}
-        end
+        handle_turn_completion(port, on_message, payload, payload_string)
 
       {:ok, %{"method" => "turn/failed", "params" => _} = payload} ->
         emit_turn_event(
@@ -482,6 +474,18 @@ defmodule SymphonyElixir.Codex.AppServer do
         end
 
         receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests)
+    end
+  end
+
+  defp handle_turn_completion(port, on_message, payload, payload_string) do
+    case input_required_completion_outcome(payload) do
+      nil ->
+        emit_turn_event(on_message, :turn_completed, payload, payload_string, port, payload)
+        {:ok, :turn_completed}
+
+      outcome ->
+        emit_turn_event(on_message, outcome, payload, payload_string, port, payload)
+        {:error, {outcome, payload}}
     end
   end
 
@@ -1056,8 +1060,6 @@ defmodule SymphonyElixir.Codex.AppServer do
       _ -> nil
     end
   end
-
-  defp input_required_completion_outcome(_payload), do: nil
 
   defp shell_escape(value) when is_binary(value) do
     "'" <> String.replace(value, "'", "'\"'\"'") <> "'"
