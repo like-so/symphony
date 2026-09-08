@@ -1089,14 +1089,15 @@ defmodule SymphonyElixir.CoreTest do
       |> Map.put(:retry_attempts, %{})
     end)
 
+    down_sent_at_ms = System.monotonic_time(:millisecond)
     send(pid, {:DOWN, ref, :process, self(), :boom})
-    Process.sleep(50)
-    state = :sys.get_state(pid)
 
     assert %{attempt: 3, due_at_ms: due_at_ms, identifier: "MT-559", error: "agent exited: :boom"} =
-             state.retry_attempts[issue_id]
+             eventually_value(fn -> :sys.get_state(pid).retry_attempts[issue_id] end)
 
-    assert_due_in_range(due_at_ms, 39_500, 40_500)
+    retry_delay_ms = due_at_ms - down_sent_at_ms
+    assert retry_delay_ms >= 40_000
+    assert retry_delay_ms <= 40_500
   end
 
   test "first abnormal worker exit waits before retrying" do
