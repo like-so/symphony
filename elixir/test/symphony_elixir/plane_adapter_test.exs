@@ -350,8 +350,8 @@ defmodule SymphonyElixir.Plane.AdapterTest do
     assert_receive {:plane_call, "GET", ^issue_1_relations_path, %{}, nil, _settings}
     assert_receive {:plane_call, "GET", ^issue_2_path, %{}, nil, _settings}
     assert_receive {:plane_call, "GET", ^issue_3_path, %{}, nil, _settings}
-    assert_receive {:plane_call, "GET", ^issue_2_comments_path, %{"per_page" => 100}, nil, _settings}
-    assert_receive {:plane_call, "GET", ^issue_2_relations_path, %{}, nil, _settings}
+    refute_receive {:plane_call, "GET", ^issue_2_comments_path, %{"per_page" => 100}, nil, _settings}
+    refute_receive {:plane_call, "GET", ^issue_2_relations_path, %{}, nil, _settings}
   end
 
   test "client refreshes Plane UUIDs in order, omits 404s, and rejects malformed records" do
@@ -434,7 +434,7 @@ defmodule SymphonyElixir.Plane.AdapterTest do
              )
   end
 
-  test "client treats active Plane subtasks as parent blockers" do
+  test "client combines active Plane subtask and relation blockers" do
     states_path = "/api/v1/workspaces/plane/projects/#{project_id()}/states/"
     work_items_path = "/api/v1/workspaces/plane/projects/#{project_id()}/work-items/"
     parent_comments_path = "/api/v1/workspaces/plane/projects/#{project_id()}/work-items/#{issue_id(1)}/comments/"
@@ -443,6 +443,7 @@ defmodule SymphonyElixir.Plane.AdapterTest do
     parent_relations_path = "/api/v1/workspaces/plane/projects/#{project_id()}/work-items/#{issue_id(1)}/relations/"
     active_child_relations_path = "/api/v1/workspaces/plane/projects/#{project_id()}/work-items/#{issue_id(2)}/relations/"
     done_child_relations_path = "/api/v1/workspaces/plane/projects/#{project_id()}/work-items/#{issue_id(3)}/relations/"
+    relation_blocker_path = "/api/v1/workspaces/plane/projects/#{project_id()}/work-items/#{issue_id(4)}/"
     in_progress_state_id = "7c4f771b-95e0-44df-ac1b-52c0456ac4a3"
 
     request_fun = fn method, path, params, body, _settings ->
@@ -474,7 +475,13 @@ defmodule SymphonyElixir.Plane.AdapterTest do
         {"GET", path, %{"per_page" => 100}, nil} when path in [parent_comments_path, active_child_comments_path, done_child_comments_path] ->
           {:ok, %{status: 200, body: paged([])}}
 
-        {"GET", path, %{}, nil} when path in [parent_relations_path, active_child_relations_path, done_child_relations_path] ->
+        {"GET", ^parent_relations_path, %{}, nil} ->
+          {:ok, %{status: 200, body: %{"blocked_by" => [raw_relation_ref(issue_id(4))]}}}
+
+        {"GET", ^relation_blocker_path, %{}, nil} ->
+          {:ok, %{status: 200, body: raw_issue(4, in_progress_state_id)}}
+
+        {"GET", path, %{}, nil} when path in [active_child_relations_path, done_child_relations_path] ->
           {:ok, %{status: 200, body: %{"blocked_by" => []}}}
       end
     end
@@ -495,10 +502,21 @@ defmodule SymphonyElixir.Plane.AdapterTest do
                "project_id" => project_id(),
                "state" => "In Progress",
                "title" => "Work item 2"
+             },
+             %{
+               "id" => issue_id(4),
+               "identifier" => "NAUTILUS-4",
+               "project_id" => project_id(),
+               "state" => "In Progress",
+               "title" => "Work item 4"
              }
            ]
 
     refute parent.dispatchable
+    refute_receive {:plane_subtask_call, "GET", ^active_child_comments_path, _, _}
+    refute_receive {:plane_subtask_call, "GET", ^done_child_comments_path, _, _}
+    refute_receive {:plane_subtask_call, "GET", ^active_child_relations_path, _, _}
+    refute_receive {:plane_subtask_call, "GET", ^done_child_relations_path, _, _}
   end
 
   test "client claims a Plane issue by patching configured claim state" do

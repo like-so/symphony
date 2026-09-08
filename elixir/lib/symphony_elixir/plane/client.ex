@@ -91,9 +91,16 @@ defmodule SymphonyElixir.Plane.Client do
 
     with {:ok, plane_settings} <- settings(tracker_settings),
          {:ok, project} <- resolve_project(plane_settings, request_fun),
-         {:ok, states_by_id} <- fetch_states_by_id(plane_settings, project.id, request_fun),
-         {:ok, issues} <- fetch_work_item_pages(plane_settings, project, states_by_id, request_fun, nil, []) do
-      {:ok, Enum.filter(issues, &MapSet.member?(requested_states, normalize_state(&1.state)))}
+         {:ok, states_by_id} <- fetch_states_by_id(plane_settings, project.id, request_fun) do
+      fetch_work_item_pages(
+        plane_settings,
+        project,
+        states_by_id,
+        requested_states,
+        request_fun,
+        nil,
+        []
+      )
     end
   end
 
@@ -184,7 +191,15 @@ defmodule SymphonyElixir.Plane.Client do
     end
   end
 
-  defp fetch_work_item_pages(settings, project, states_by_id, request_fun, cursor, acc) do
+  defp fetch_work_item_pages(
+         settings,
+         project,
+         states_by_id,
+         requested_states,
+         request_fun,
+         cursor,
+         acc
+       ) do
     params = %{"per_page" => @page_size}
     params = if is_nil(cursor), do: params, else: Map.put(params, "cursor", cursor)
 
@@ -202,13 +217,21 @@ defmodule SymphonyElixir.Plane.Client do
       updated_acc = [results | acc]
 
       if payload_next_page?(payload) do
-        fetch_work_item_pages(settings, project, states_by_id, request_fun, payload["next_cursor"], updated_acc)
+        fetch_work_item_pages(
+          settings,
+          project,
+          states_by_id,
+          requested_states,
+          request_fun,
+          payload["next_cursor"],
+          updated_acc
+        )
       else
         {:ok,
          updated_acc
          |> Enum.reverse()
          |> List.flatten()
-         |> normalize_work_items(settings, project, states_by_id, request_fun)}
+         |> normalize_work_items(settings, project, states_by_id, requested_states, request_fun)}
       end
     end
   end
@@ -245,8 +268,8 @@ defmodule SymphonyElixir.Plane.Client do
     {:error, :plane_unknown_payload}
   end
 
-  defp normalize_work_items(results, settings, project, states_by_id, request_fun) do
-    issues = Enum.map(results, &normalize_issue_with_comments(&1, settings, project, states_by_id, request_fun))
+  defp normalize_work_items(results, settings, project, states_by_id, requested_states, request_fun) do
+    issues = Enum.map(results, &normalize_issue(&1, settings, project, states_by_id))
     malformed_count = Enum.count(issues, &is_nil/1)
 
     if malformed_count > 0 do
@@ -256,6 +279,18 @@ defmodule SymphonyElixir.Plane.Client do
     issues
     |> Enum.reject(&is_nil/1)
     |> apply_subtask_blockers(settings)
+    |> Enum.filter(&MapSet.member?(requested_states, normalize_state(&1.state)))
+    |> Enum.map(&hydrate_active_issue(&1, settings, project, states_by_id, request_fun))
+  end
+
+  defp hydrate_active_issue(%Issue{} = issue, settings, project, states_by_id, request_fun) do
+    if terminal_state?(issue.state, settings) do
+      issue
+    else
+      issue
+      |> hydrate_comments(settings, project.id, request_fun)
+      |> hydrate_relations(settings, project, states_by_id, request_fun)
+    end
   end
 
   defp normalize_issue_with_comments(raw_issue, settings, project, states_by_id, request_fun) do
@@ -393,7 +428,13 @@ defmodule SymphonyElixir.Plane.Client do
   defp hydrate_relations(%Issue{id: issue_id} = issue, settings, project, states_by_id, request_fun) do
     case fetch_relations(settings, project.id, issue_id, states_by_id, request_fun) do
       {:ok, blocked_by} ->
-        %{issue | blocked_by: blocked_by, dispatchable: issue.dispatchable and blocked_by == []}
+        combined_blockers = unique_blockers(issue.blocked_by ++ blocked_by)
+
+        %{
+          issue
+          | blocked_by: combined_blockers,
+            dispatchable: issue.dispatchable and combined_blockers == []
+        }
 
       {:error, reason} ->
         Logger.warning("Plane relation fetch failed issue_id=#{issue_id} reason=#{inspect(reason)}")
