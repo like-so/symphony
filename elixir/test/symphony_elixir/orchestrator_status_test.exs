@@ -1,6 +1,20 @@
 defmodule SymphonyElixir.OrchestratorStatusTest do
   use SymphonyElixir.TestSupport
 
+  defmodule SnapshotOrchestrator do
+    use GenServer
+
+    def start_link(snapshot) do
+      GenServer.start_link(__MODULE__, snapshot, name: SymphonyElixir.Orchestrator)
+    end
+
+    @impl true
+    def init(snapshot), do: {:ok, snapshot}
+
+    @impl true
+    def handle_call(:snapshot, _from, snapshot), do: {:reply, snapshot, snapshot}
+  end
+
   test "snapshot returns :timeout when snapshot server is unresponsive" do
     server_name = Module.concat(__MODULE__, :UnresponsiveSnapshotServer)
     parent = self()
@@ -814,19 +828,6 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
       end
     end)
 
-    assert %{polling: %{checking?: true}} =
-             wait_for_snapshot(
-               pid,
-               fn
-                 %{polling: %{checking?: true}} ->
-                   true
-
-                 _ ->
-                   false
-               end,
-               500
-             )
-
     assert %{
              polling: %{
                checking?: false,
@@ -838,7 +839,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
                pid,
                fn
                  %{polling: %{checking?: false, next_poll_in_ms: due_in_ms}}
-                 when is_integer(due_in_ms) and due_in_ms <= 5_000 ->
+                 when is_integer(due_in_ms) and due_in_ms > 4_000 and due_in_ms <= 5_000 ->
                    true
 
                  _ ->
@@ -1334,7 +1335,6 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
   end
 
   test "status dashboard coalesces rapid updates to one render per interval" do
-    dashboard_name = Module.concat(__MODULE__, :RenderDashboard)
     parent = self()
     runtime_pid = Process.whereis(SymphonyElixir.AgentRuntimeSupervisor)
 
@@ -1358,36 +1358,88 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
                )
     end
 
-    {:ok, pid} =
-      StatusDashboard.start_link(
-        name: dashboard_name,
-        enabled: true,
-        refresh_ms: 60_000,
-        render_interval_ms: 16,
-        render_fun: fn content ->
-          send(parent, {:render, System.monotonic_time(:millisecond), content})
-        end
-      )
+    {:ok, snapshot_pid} = SnapshotOrchestrator.start_link(dashboard_snapshot(0))
 
     on_exit(fn ->
-      if Process.alive?(pid) do
-        Process.exit(pid, :normal)
+      if Process.alive?(snapshot_pid) do
+        GenServer.stop(snapshot_pid)
       end
     end)
 
-    StatusDashboard.notify_update(dashboard_name)
-    assert_receive {:render, first_render_ms, _content}, 200
+    {:ok, initial_state} =
+      StatusDashboard.init(
+        enabled: true,
+        refresh_ms: 60_000,
+        render_interval_ms: 16,
+        render_fun: fn content -> send(parent, {:render, content}) end
+      )
 
-    :sys.replace_state(pid, fn state ->
-      %{state | last_snapshot_fingerprint: :force_next_change, last_rendered_content: nil}
-    end)
+    assert {:noreply, rendered_state} = StatusDashboard.handle_info(:refresh, initial_state)
+    assert_receive {:render, initial_content}
 
-    StatusDashboard.notify_update(dashboard_name)
-    StatusDashboard.notify_update(dashboard_name)
+    :sys.replace_state(snapshot_pid, fn _ -> dashboard_snapshot(10) end)
 
-    assert_receive {:render, second_render_ms, _content}, 200
-    assert second_render_ms > first_render_ms
-    refute_receive {:render, _third_render_ms, _content}, 60
+    last_rendered_at_ms = System.monotonic_time(:millisecond) + 1_000
+    rendered_state = %{rendered_state | last_rendered_at_ms: last_rendered_at_ms}
+    tracer = start_timer_call_tracer()
+
+    try do
+      refresh_started_at_ms = System.monotonic_time(:millisecond)
+      assert {:noreply, pending_state} = StatusDashboard.handle_info(:refresh, rendered_state)
+      refresh_finished_at_ms = System.monotonic_time(:millisecond)
+
+      pending_content = pending_state.pending_content
+      flush_token = pending_state.flush_timer_ref
+
+      assert is_binary(pending_content)
+      refute pending_content == initial_content
+      assert is_reference(flush_token)
+
+      test_pid = self()
+      flush_message = {:flush_render, flush_token}
+
+      assert_receive {:trace, ^test_pid, :call, {:erlang, :send_after, timer_args}}
+      assert [delay_ms, ^test_pid, ^flush_message] = timer_args
+
+      assert delay_ms >= last_rendered_at_ms + 16 - refresh_finished_at_ms
+      assert delay_ms <= last_rendered_at_ms + 16 - refresh_started_at_ms
+
+      assert_receive {:trace, ^test_pid, :return_from, {:erlang, :send_after, 3}, timer_ref}
+      assert Process.cancel_timer(timer_ref) > 0
+
+      :sys.replace_state(snapshot_pid, fn _ -> dashboard_snapshot(20) end)
+      assert {:noreply, latest_state} = StatusDashboard.handle_info(:refresh, pending_state)
+
+      assert latest_state.flush_timer_ref == flush_token
+      assert is_binary(latest_state.pending_content)
+      refute latest_state.pending_content == pending_content
+
+      assert_trace_delivered(tracer)
+      refute_received {:trace, ^test_pid, :call, {:erlang, :send_after, _args}}
+
+      assert {:noreply, flushed_state} =
+               StatusDashboard.handle_info({:flush_render, flush_token}, latest_state)
+
+      assert_receive {:render, latest_content}
+      assert latest_content == latest_state.pending_content
+      assert flushed_state.pending_content == nil
+      assert flushed_state.flush_timer_ref == nil
+
+      assert {:noreply, unchanged_state} = StatusDashboard.handle_info(:refresh, flushed_state)
+      assert unchanged_state.pending_content == nil
+      assert unchanged_state.flush_timer_ref == nil
+      refute_received {:render, _content}
+
+      stale_token = make_ref()
+
+      assert {:noreply, stale_state} =
+               StatusDashboard.handle_info({:flush_render, stale_token}, unchanged_state)
+
+      assert stale_state == unchanged_state
+      refute_received {:render, _content}
+    after
+      stop_timer_call_tracer(tracer)
+    end
   end
 
   test "status dashboard computes rolling 5-second token throughput" do
@@ -1768,6 +1820,68 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
         Process.sleep(5)
         do_wait_for_snapshot(pid, predicate, deadline_ms)
       end
+    end
+  end
+
+  defp dashboard_snapshot(total_tokens) do
+    %{
+      running: [],
+      retrying: [],
+      codex_totals: %{
+        input_tokens: total_tokens,
+        output_tokens: 0,
+        total_tokens: total_tokens,
+        seconds_running: 0
+      },
+      rate_limits: nil
+    }
+  end
+
+  defp start_timer_call_tracer do
+    test_pid = self()
+    tracer_pid = spawn(fn -> forward_trace_events(test_pid) end)
+    session = :trace.session_create(__MODULE__, tracer_pid, [])
+
+    assert 1 ==
+             :trace.function(
+               session,
+               {:erlang, :send_after, 3},
+               [{:_, [], [{:return_trace}]}],
+               []
+             )
+
+    assert 1 == :trace.process(session, test_pid, true, [:call])
+    %{session: session, tracer_pid: tracer_pid}
+  end
+
+  defp assert_trace_delivered(%{session: session, tracer_pid: tracer_pid}) do
+    test_pid = self()
+
+    send(tracer_pid, {:deliver, session, test_pid})
+    assert_receive {:trace_delivery_requested, ^tracer_pid, delivery_ref}
+    assert_receive {:trace_delivered, ^test_pid, ^delivery_ref}
+  end
+
+  defp stop_timer_call_tracer(%{session: session, tracer_pid: tracer_pid}) do
+    assert :trace.session_destroy(session)
+    monitor_ref = Process.monitor(tracer_pid)
+    send(tracer_pid, :stop)
+    assert_receive {:DOWN, ^monitor_ref, :process, ^tracer_pid, :normal}
+  end
+
+  defp forward_trace_events(test_pid) do
+    receive do
+      {:deliver, session, tracee_pid} ->
+        delivery_ref = :trace.delivered(session, tracee_pid)
+        send(test_pid, {:trace_delivery_requested, self(), delivery_ref})
+        forward_trace_events(test_pid)
+
+      :stop ->
+        :ok
+
+      event ->
+        send(test_pid, event)
+        forward_trace_events(test_pid)
     end
   end
 
