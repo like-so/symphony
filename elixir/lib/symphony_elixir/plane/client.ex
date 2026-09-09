@@ -134,10 +134,7 @@ defmodule SymphonyElixir.Plane.Client do
              request_fun,
              false
            ) do
-      case normalize_issue_with_comments(payload, plane_settings, project, states_by_id, request_fun) do
-        %Issue{} = issue -> {:ok, issue}
-        nil -> {:error, :plane_unknown_payload}
-      end
+      normalize_issue_with_comments(payload, plane_settings, project, states_by_id, request_fun)
     end
   end
 
@@ -227,11 +224,10 @@ defmodule SymphonyElixir.Plane.Client do
           updated_acc
         )
       else
-        {:ok,
-         updated_acc
-         |> Enum.reverse()
-         |> List.flatten()
-         |> normalize_work_items(settings, project, states_by_id, requested_states, request_fun)}
+        updated_acc
+        |> Enum.reverse()
+        |> List.flatten()
+        |> normalize_work_items(settings, project, states_by_id, requested_states, request_fun)
       end
     end
   end
@@ -259,8 +255,8 @@ defmodule SymphonyElixir.Plane.Client do
 
   defp continue_fetch_issue_ids(%{} = raw_issue, rest, settings, project, states_by_id, request_fun, acc) do
     case normalize_issue_with_comments(raw_issue, settings, project, states_by_id, request_fun) do
-      %Issue{} = issue -> fetch_issue_ids(rest, settings, project, states_by_id, request_fun, [issue | acc])
-      nil -> {:error, :plane_unknown_payload}
+      {:ok, %Issue{} = issue} -> fetch_issue_ids(rest, settings, project, states_by_id, request_fun, [issue | acc])
+      {:error, reason} -> {:error, reason}
     end
   end
 
@@ -280,13 +276,22 @@ defmodule SymphonyElixir.Plane.Client do
     |> Enum.reject(&is_nil/1)
     |> apply_subtask_blockers(settings)
     |> Enum.filter(&MapSet.member?(requested_states, normalize_state(&1.state)))
-    |> Enum.map(&hydrate_issue(&1, settings, project, states_by_id, request_fun))
+    |> Enum.reduce_while({:ok, []}, fn issue, {:ok, hydrated} ->
+      case hydrate_issue(issue, settings, project, states_by_id, request_fun) do
+        {:ok, hydrated_issue} -> {:cont, {:ok, [hydrated_issue | hydrated]}}
+        {:error, reason} -> {:halt, {:error, reason}}
+      end
+    end)
+    |> case do
+      {:ok, hydrated} -> {:ok, Enum.reverse(hydrated)}
+      {:error, reason} -> {:error, reason}
+    end
   end
 
   defp hydrate_issue(%Issue{} = issue, settings, project, states_by_id, request_fun) do
-    issue
-    |> hydrate_comments(settings, project.id, request_fun)
-    |> hydrate_relations(settings, project, states_by_id, request_fun)
+    with {:ok, issue} <- hydrate_comments(issue, settings, project.id, request_fun) do
+      hydrate_relations(issue, settings, project, states_by_id, request_fun)
+    end
   end
 
   defp normalize_issue_with_comments(raw_issue, settings, project, states_by_id, request_fun) do
@@ -295,21 +300,21 @@ defmodule SymphonyElixir.Plane.Client do
         hydrate_issue(issue, settings, project, states_by_id, request_fun)
 
       nil ->
-        nil
+        {:error, :plane_unknown_payload}
     end
   end
 
   defp hydrate_comments(%Issue{id: issue_id} = issue, settings, project_id, request_fun) do
     case fetch_comments(settings, project_id, issue_id, request_fun) do
       {:ok, []} ->
-        issue
+        {:ok, issue}
 
       {:ok, comments} ->
-        %{issue | comments: comments, description: append_comments(issue.description, comments)}
+        {:ok, %{issue | comments: comments, description: append_comments(issue.description, comments)}}
 
       {:error, reason} ->
         Logger.warning("Plane comment fetch failed issue_id=#{issue_id} reason=#{inspect(reason)}")
-        issue
+        {:error, reason}
     end
   end
 
@@ -438,15 +443,16 @@ defmodule SymphonyElixir.Plane.Client do
       {:ok, blocked_by} ->
         combined_blockers = unique_blockers(issue.blocked_by ++ blocked_by)
 
-        %{
-          issue
-          | blocked_by: combined_blockers,
-            dispatchable: issue.dispatchable and combined_blockers == []
-        }
+        {:ok,
+         %{
+           issue
+           | blocked_by: combined_blockers,
+             dispatchable: issue.dispatchable and combined_blockers == []
+         }}
 
       {:error, reason} ->
         Logger.warning("Plane relation fetch failed issue_id=#{issue_id} reason=#{inspect(reason)}")
-        issue
+        {:error, reason}
     end
   end
 
