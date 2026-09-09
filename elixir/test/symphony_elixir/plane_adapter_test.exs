@@ -449,6 +449,59 @@ defmodule SymphonyElixir.Plane.AdapterTest do
              )
   end
 
+  test "client propagates comment and relation hydration failures" do
+    states_path = "/api/v1/workspaces/plane/projects/#{project_id()}/states/"
+    work_items_path = "/api/v1/workspaces/plane/projects/#{project_id()}/work-items/"
+    issue_path = "/api/v1/workspaces/plane/projects/#{project_id()}/work-items/#{issue_id(1)}/"
+    comments_path = issue_path <> "comments/"
+    relations_path = issue_path <> "relations/"
+    settings = tracker_settings(%{"project_id" => project_id(), "project_identifier" => "NAUTILUS"})
+
+    failures = [
+      {:non_2xx, {:ok, %{status: 500, body: %{"error" => "failed"}}}, {:plane_api_status, 500}},
+      {:transport, {:error, {:plane_api_request, :econnrefused}}, {:plane_api_request, :econnrefused}},
+      {:malformed, {:ok, %{status: 200, body: %{"unexpected" => []}}}, :plane_unknown_payload}
+    ]
+
+    for hydration <- [:comments, :relations],
+        mode <- [:collection, :id_refresh],
+        {failure_kind, failure_response, expected_reason} <- failures do
+      request_fun = fn "GET", path, params, nil, _settings ->
+        cond do
+          path == states_path and params == %{"per_page" => 100} ->
+            {:ok, %{status: 200, body: paged([raw_state("Todo", todo_state_id())])}}
+
+          path == work_items_path and params == %{"per_page" => 100} ->
+            {:ok, %{status: 200, body: paged([raw_issue(1, todo_state_id())])}}
+
+          path == issue_path and params == %{} ->
+            {:ok, %{status: 200, body: raw_issue(1, todo_state_id())}}
+
+          path == comments_path and hydration == :comments ->
+            failure_response
+
+          path == comments_path ->
+            {:ok, %{status: 200, body: paged([])}}
+
+          path == relations_path and hydration == :relations ->
+            failure_response
+
+          path == relations_path ->
+            {:ok, %{status: 200, body: %{"blocked_by" => []}}}
+        end
+      end
+
+      result =
+        case mode do
+          :collection -> PlaneClient.fetch_issues_by_states_for_test(["Todo"], settings, request_fun)
+          :id_refresh -> PlaneClient.fetch_issues_by_ids_for_test([issue_id(1)], settings, request_fun)
+        end
+
+      assert result == {:error, expected_reason},
+             "expected #{hydration} #{failure_kind} to fail during #{mode}"
+    end
+  end
+
   test "client combines active Plane subtask and relation blockers" do
     states_path = "/api/v1/workspaces/plane/projects/#{project_id()}/states/"
     work_items_path = "/api/v1/workspaces/plane/projects/#{project_id()}/work-items/"
