@@ -1,6 +1,7 @@
 defmodule SymphonyElixir.ExtensionsTest do
   use SymphonyElixir.TestSupport
 
+  import Plug.Conn, only: [get_resp_header: 2, put_req_header: 3]
   import Phoenix.ConnTest
   import Phoenix.LiveViewTest
 
@@ -57,6 +58,16 @@ defmodule SymphonyElixir.ExtensionsTest do
     def handle_call(:request_refresh, _from, state) do
       {:reply, Keyword.get(state, :refresh, :unavailable), state}
     end
+
+    def handle_call({:queue_correction, correction}, _from, state) do
+      if test_pid = Keyword.get(state, :test_pid), do: send(test_pid, {:queued_correction, correction})
+      {:reply, Keyword.get(state, :correction_reply, {:error, :unavailable}), state}
+    end
+
+    def handle_call({:correction_status, instruction_id}, _from, state) do
+      if test_pid = Keyword.get(state, :test_pid), do: send(test_pid, {:correction_status, instruction_id})
+      {:reply, Keyword.get(state, :correction_status_reply, {:error, :not_found}), state}
+    end
   end
 
   setup do
@@ -75,9 +86,16 @@ defmodule SymphonyElixir.ExtensionsTest do
 
   setup do
     endpoint_config = Application.get_env(:symphony_elixir, SymphonyElixirWeb.Endpoint, [])
+    correction_control_startup = Application.get_env(:symphony_elixir, :correction_control_startup)
 
     on_exit(fn ->
       Application.put_env(:symphony_elixir, SymphonyElixirWeb.Endpoint, endpoint_config)
+
+      if correction_control_startup do
+        Application.put_env(:symphony_elixir, :correction_control_startup, correction_control_startup)
+      else
+        Application.delete_env(:symphony_elixir, :correction_control_startup)
+      end
     end)
 
     :ok
@@ -420,6 +438,125 @@ defmodule SymphonyElixir.ExtensionsTest do
              }
   end
 
+  test "correction control authenticates and keeps receipt separate from execution" do
+    orchestrator_name = {:global, Module.concat(__MODULE__, :CorrectionApiOrchestrator)}
+    now = DateTime.utc_now()
+
+    record = %{
+      instruction_id: "instruction-1",
+      issue_id: "issue-1",
+      issue_identifier: "MT-1",
+      session_id: "local-letta-turn-1",
+      workspace_path: "/workspaces/MT-1",
+      worker_pid: "4242",
+      worker_host: nil,
+      status: :queued,
+      queued_at: now,
+      updated_at: now,
+      result: nil,
+      error: nil
+    }
+
+    {:ok, _pid} =
+      StaticOrchestrator.start_link(
+        name: orchestrator_name,
+        snapshot: static_snapshot(),
+        test_pid: self(),
+        correction_reply: {:ok, record},
+        correction_status_reply: {:ok, %{record | status: :delivered}}
+      )
+
+    start_test_endpoint(
+      orchestrator: orchestrator_name,
+      snapshot_timeout_ms: 50,
+      correction_token: "correction-secret"
+    )
+
+    body = %{
+      "instruction_id" => "instruction-1",
+      "instruction" => "Apply the authorized correction.",
+      "target" => %{
+        "issue_id" => "issue-1",
+        "session_id" => "local-letta-turn-1",
+        "workspace_path" => "/workspaces/MT-1",
+        "worker_pid" => "4242",
+        "worker_host" => nil
+      }
+    }
+
+    assert json_response(post(build_conn(), "/api/v1/issues/MT-1/corrections", body), 401) ==
+             %{"error" => %{"code" => "unauthorized", "message" => "Unauthorized"}}
+
+    assert %{"error" => %{"code" => "unauthorized"}} =
+             build_conn()
+             |> put_req_header("authorization", "Bearer wrong-secret")
+             |> get("/api/v1/corrections/instruction-1")
+             |> json_response(401)
+
+    assert %{"error" => %{"code" => "correction_control_requires_local_transport"}} =
+             build_conn()
+             |> Map.put(:remote_ip, {192, 0, 2, 10})
+             |> put_req_header("authorization", "Bearer correction-secret")
+             |> post("/api/v1/issues/MT-1/corrections", body)
+             |> json_response(403)
+
+    conn =
+      build_conn()
+      |> put_req_header("authorization", "Bearer correction-secret")
+      |> post("/api/v1/issues/MT-1/corrections", body)
+
+    assert %{"instruction_id" => "instruction-1", "status" => "queued", "result" => nil} =
+             json_response(conn, 202)
+
+    assert get_resp_header(conn, "location") == ["/api/v1/corrections/instruction-1"]
+
+    assert_receive {:queued_correction,
+                    %{
+                      issue_identifier: "MT-1",
+                      session_id: "local-letta-turn-1",
+                      text: "Apply the authorized correction."
+                    }}
+
+    missing_worker_host = update_in(body, ["target"], &Map.delete(&1, "worker_host"))
+
+    invalid_conn =
+      build_conn()
+      |> put_req_header("authorization", "Bearer correction-secret")
+      |> post("/api/v1/issues/MT-1/corrections", missing_worker_host)
+
+    assert %{"error" => %{"code" => "invalid_correction"}} = json_response(invalid_conn, 422)
+
+    status_conn =
+      build_conn()
+      |> put_req_header("authorization", "Bearer correction-secret")
+      |> get("/api/v1/corrections/instruction-1")
+
+    assert %{"status" => "delivered", "result" => nil} = json_response(status_conn, 200)
+    assert_receive {:correction_status, "instruction-1"}
+
+    mapped_loopback_status =
+      build_conn()
+      |> Map.put(:remote_ip, {0, 0, 0, 0, 0, 65_535, 0x7F00, 1})
+      |> put_req_header("authorization", "Bearer correction-secret")
+      |> get("/api/v1/corrections/instruction-1")
+
+    assert %{"status" => "delivered"} = json_response(mapped_loopback_status, 200)
+    assert_receive {:correction_status, "instruction-1"}
+  end
+
+  test "correction control is unavailable without a configured token" do
+    start_test_endpoint(correction_token: nil)
+
+    conn = post(build_conn(), "/api/v1/issues/MT-1/corrections", %{})
+
+    assert json_response(conn, 503) == %{
+             "error" => %{
+               "code" => "correction_control_unavailable",
+               "message" => "Correction control is not configured"
+             }
+           }
+  end
+
   test "phoenix observability api preserves snapshot timeout behavior" do
     timeout_orchestrator = Module.concat(__MODULE__, :TimeoutOrchestrator)
     {:ok, _pid} = SlowOrchestrator.start_link(name: timeout_orchestrator)
@@ -645,6 +782,21 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert method_not_allowed_response.body["error"]["code"] == "method_not_allowed"
 
     assert {:error, _reason} = HttpServer.start_link(host: "bad host", port: 0)
+  end
+
+  test "http server keeps the service-start correction credential across child restarts" do
+    Application.put_env(:symphony_elixir, :correction_control_startup, %{
+      token: "service-start-token",
+      secret_environment_names: ["SERVICE_START_TOKEN"]
+    })
+
+    start_supervised!({HttpServer, host: "127.0.0.1", port: 0})
+
+    assert SymphonyElixirWeb.Endpoint.config(:correction_token) == "service-start-token"
+
+    assert SymphonyElixirWeb.Endpoint.config(:correction_secret_environment_names) == [
+             "SERVICE_START_TOKEN"
+           ]
   end
 
   defp start_test_endpoint(overrides) do

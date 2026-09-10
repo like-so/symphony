@@ -396,12 +396,17 @@ defmodule SymphonyElixir.Workspace do
 
   defp run_hook(command, workspace, issue_context, hook_name, nil) do
     timeout_ms = Config.settings!().hooks.timeout_ms
+    command = prepend_correction_secret_unset(command)
 
     Logger.info("Running workspace hook hook=#{hook_name} #{issue_log_context(issue_context)} workspace=#{workspace} worker_host=local")
 
     task =
       Task.async(fn ->
-        System.cmd("sh", ["-lc", command], cd: workspace, stderr_to_stdout: true)
+        System.cmd("sh", ["-lc", command],
+          cd: workspace,
+          env: correction_secret_command_env(),
+          stderr_to_stdout: true
+        )
       end)
 
     case Task.yield(task, timeout_ms) do
@@ -546,9 +551,14 @@ defmodule SymphonyElixir.Workspace do
 
   defp run_remote_command(worker_host, script, timeout_ms)
        when is_binary(worker_host) and is_binary(script) and is_integer(timeout_ms) and timeout_ms > 0 do
+    script = prepend_correction_secret_unset(script)
+
     task =
       Task.async(fn ->
-        SSH.run(worker_host, script, stderr_to_stdout: true)
+        SSH.run(worker_host, script,
+          env: correction_secret_command_env(),
+          stderr_to_stdout: true
+        )
       end)
 
     case Task.yield(task, timeout_ms) do
@@ -559,6 +569,22 @@ defmodule SymphonyElixir.Workspace do
         Task.shutdown(task, :brutal_kill)
         {:error, {:workspace_hook_timeout, "remote_command", timeout_ms}}
     end
+  end
+
+  defp correction_secret_command_env do
+    correction_secret_environment_names()
+    |> Enum.map(&{&1, nil})
+  end
+
+  defp prepend_correction_secret_unset(script) do
+    case correction_secret_environment_names() do
+      [] -> script
+      names -> "unset #{Enum.join(names, " ")}\n#{script}"
+    end
+  end
+
+  defp correction_secret_environment_names do
+    Config.correction_secret_environment_names()
   end
 
   defp shell_escape(value) when is_binary(value) do

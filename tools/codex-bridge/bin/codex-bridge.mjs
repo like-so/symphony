@@ -166,6 +166,8 @@ const threadId = "local";
 let turnCounter = 0;
 let shutdownPromise = null;
 let dynamicTools = [];
+let activeCorrectionTarget = null;
+const acceptedCorrectionIds = new Set();
 const pendingSymphonyResponses = new Map();
 const toolNamesById = new Map();
 const lastProgressByTurn = new Map();
@@ -188,7 +190,14 @@ export const bridgeTestHooks = {
   meaningfulStreamingText,
   AppServerProcessManager,
   createAppServerBridgeClientForTest,
+  correctionBindingMatches,
+  correctionCompletionError,
+  correctionRunIdForMessage,
+  correctionStatus,
+  drainCorrections,
+  queueDispositionForMessage,
   resolveAppServer,
+  submitAndWaitForTurn,
 };
 
 if (isMain) {
@@ -225,7 +234,10 @@ async function handleLine(line) {
   if (method === "initialize") {
     respond(id, {
       protocolVersion: "codex-bridge/0.2",
-      capabilities: { experimentalApi: true },
+      capabilities: {
+        experimentalApi: true,
+        symphonyCorrectionDelivery: true,
+      },
     });
     return;
   }
@@ -246,6 +258,11 @@ async function handleLine(line) {
     return;
   }
 
+  if (method === "symphony/correction/deliver") {
+    acceptCorrection(id, params);
+    return;
+  }
+
   respond(id, null);
 }
 
@@ -255,10 +272,13 @@ async function runLettaWorkflow(turnStartResponseId, fallbackTurnId, params) {
   let turnStarted = true;
   let turnId = fallbackTurnId;
   let ownedAppServer = null;
+  let correctionTarget = null;
 
   try {
     // Symphony expects turn/start to be acknowledged before a runtime can be provisioned.
     respond(turnStartResponseId, { turn: { id: turnId } });
+    correctionTarget = createCorrectionTarget(params, fallbackTurnId, null, null);
+    activeCorrectionTarget = correctionTarget;
     const appServer = await resolveAppServer();
     ownedAppServer = appServer.child;
     const client = await AppServerBridgeClient.connect(appServer.url, {
@@ -269,7 +289,8 @@ async function runLettaWorkflow(turnStartResponseId, fallbackTurnId, params) {
       const runtimeContext = await startRuntime(client, cwd);
       const runtime = runtimeContext.runtime;
       const conversationId = conversationIdFromRuntime(runtimeContext);
-      turnId = turnIdForConversation(conversationId) || fallbackTurnId;
+      correctionTarget.client = client;
+      correctionTarget.runtime = runtime;
 
       emitProgress(
         turnId,
@@ -292,19 +313,38 @@ async function runLettaWorkflow(turnStartResponseId, fallbackTurnId, params) {
 
       for (const phase of phases) {
         emitProgress(turnId, `phase ${phase.name}: starting`);
-        const report = await submitAndWaitForTurn(
+        const terminal = await submitAndWaitForTurn(
           client,
           runtime,
           phase.prompt,
           turnId,
           usage,
         );
+        if (terminal.stopReason === "requires_approval") {
+          emitInputRequired(turnId, {
+            reason: "Owner turn requires operator approval",
+            missing: [],
+            remainingScope: "operator approval",
+          });
+          emitBlockedCompletion(turnId, usage);
+          return;
+        }
         if (blockedTurns.has(turnId)) {
           emitBlockedCompletion(turnId, usage);
           return;
         }
-        phaseReports.push(`## ${phase.name}\n${report || "Completed."}`);
+        const completionError = correctionCompletionError(terminal);
+        if (completionError) throw new Error(completionError);
+        phaseReports.push(
+          `## ${phase.name}\n${terminal.text || "Completed."}`,
+        );
         emitProgress(turnId, `phase ${phase.name}: completed`);
+        const correctionDrain = await drainCorrections(correctionTarget, usage);
+        if (correctionDrain.outcomeUnresolved) {
+          throw new Error(
+            "Correction terminal outcome is unresolved; stopping the owner workflow",
+          );
+        }
         if (blockedTurns.has(turnId)) {
           emitBlockedCompletion(turnId, usage);
           return;
@@ -325,8 +365,216 @@ async function runLettaWorkflow(turnStartResponseId, fallbackTurnId, params) {
       respond(turnStartResponseId, { turn: { id: fallbackTurnId } });
     throw error;
   } finally {
+    closeCorrectionTarget(correctionTarget, "owner turn ended before correction execution");
+    if (activeCorrectionTarget === correctionTarget) activeCorrectionTarget = null;
     await appServers.stop(ownedAppServer);
   }
+}
+
+function createCorrectionTarget(params, turnId, client, runtime) {
+  const symphony = params.symphony || {};
+  return {
+    binding: {
+      issueId: symphony.issueId,
+      issueIdentifier: symphony.issueIdentifier,
+      threadId,
+      turnId,
+      sessionId: `${threadId}-${turnId}`,
+      workspacePath: symphony.workspacePath || params.cwd,
+      workerPid: symphony.workerPid,
+      workerHost: symphony.workerHost ?? null,
+    },
+    client,
+    runtime,
+    turnId,
+    accepting: true,
+    queue: [],
+    emitStatus: emitCorrectionStatus,
+    emitInputRequired,
+  };
+}
+
+function acceptCorrection(responseId, params) {
+  const target = activeCorrectionTarget;
+  const instructionId = params.instructionId;
+
+  if (!target || !target.accepting) {
+    respond(responseId, {
+      correction: correctionStatus(params, "failed", {
+        error: "no active correction target",
+      }),
+    });
+    return;
+  }
+
+  if (!correctionBindingMatches(params, target.binding)) {
+    respond(responseId, {
+      correction: correctionStatus(params, "failed", {
+        error: "active correction target does not match",
+      }),
+    });
+    return;
+  }
+
+  if (
+    typeof instructionId !== "string" ||
+    !instructionId.trim() ||
+    typeof params.text !== "string" ||
+    !params.text.trim()
+  ) {
+    respond(responseId, {
+      correction: correctionStatus(params, "failed", {
+        error: "invalid correction payload",
+      }),
+    });
+    return;
+  }
+
+  if (acceptedCorrectionIds.has(instructionId)) {
+    respond(responseId, {
+      correction: correctionStatus(params, "failed", {
+        error: "duplicate instruction id",
+      }),
+    });
+    return;
+  }
+
+  acceptedCorrectionIds.add(instructionId);
+  target.queue.push(params);
+  respond(responseId, { correction: correctionStatus(params, "delivered") });
+}
+
+async function drainCorrections(target, usage, submitTurn = submitAndWaitForTurn) {
+  while (target.queue.length > 0) {
+    const correction = target.queue.shift();
+    let executionStarted = false;
+    const markExecutionStarted = (runId) => {
+      if (executionStarted) return;
+      executionStarted = true;
+      target.emitStatus(correction, "execution_started", { runId });
+    };
+
+    try {
+      const terminal = await submitTurn(
+        target.client,
+        target.runtime,
+        correction.text,
+        target.turnId,
+        usage,
+        {
+          clientMessageId: `symphony-correction-${correction.instructionId}`,
+          onAccepted: (acceptance) => {
+            if (!acceptance.accepted) {
+              throw new Error(acceptance.error || "correction input was rejected");
+            }
+          },
+          onExecutionStarted: (runId) => {
+            markExecutionStarted(runId);
+          },
+        },
+      );
+
+      if (
+        terminal.stopReason === "input_required" ||
+        terminal.stopReason === "requires_approval"
+      ) {
+        target.emitStatus(correction, "blocked", {
+          runId: terminal.runId,
+          error:
+            terminal.stopReason === "requires_approval"
+              ? "correction turn requires operator approval"
+              : "correction turn requires operator input",
+        });
+        closeCorrectionTarget(target, "owner turn blocked before correction execution");
+        (target.emitInputRequired || emitInputRequired)(
+          target.turnId,
+          terminal.blocker ||
+            (terminal.stopReason === "requires_approval"
+              ? "Correction turn requires operator approval."
+              : "Correction turn requires operator input."),
+        );
+        break;
+      }
+
+      const completionError = correctionCompletionError(terminal);
+      if (completionError) throw new Error(completionError);
+
+      target.emitStatus(correction, "completed", {
+        runId: terminal.runId,
+        result: terminal.text || "Completed.",
+      });
+    } catch (error) {
+      target.emitStatus(correction, "failed", {
+        error: formatError(error),
+      });
+      if (error?.correctionOutcomeUnresolved) {
+        closeCorrectionTarget(
+          target,
+          "earlier accepted correction has no observed terminal outcome",
+        );
+        return { outcomeUnresolved: true };
+      }
+    }
+  }
+
+  return { outcomeUnresolved: false };
+}
+
+function closeCorrectionTarget(target, error) {
+  if (!target) return;
+  target.accepting = false;
+  for (const correction of target.queue.splice(0)) {
+    target.emitStatus(correction, "failed", { error });
+  }
+}
+
+function correctionBindingMatches(params, binding) {
+  return (
+    params.issueId === binding.issueId &&
+    params.issueIdentifier === binding.issueIdentifier &&
+    params.threadId === binding.threadId &&
+    params.expectedTurnId === binding.turnId &&
+    params.sessionId === binding.sessionId &&
+    params.workspacePath === binding.workspacePath &&
+    params.workerPid === binding.workerPid &&
+    (params.workerHost ?? null) === binding.workerHost
+  );
+}
+
+function correctionStatus(correction, status, extra = {}) {
+  return {
+    instructionId: correction.instructionId,
+    issueId: correction.issueId,
+    issueIdentifier: correction.issueIdentifier,
+    threadId: correction.threadId,
+    expectedTurnId: correction.expectedTurnId,
+    sessionId: correction.sessionId,
+    workspacePath: correction.workspacePath,
+    workerPid: correction.workerPid,
+    workerHost: correction.workerHost ?? null,
+    status,
+    ...extra,
+  };
+}
+
+function correctionCompletionError(terminal) {
+  if (!terminal || typeof terminal !== "object") {
+    return "correction turn returned no terminal evidence";
+  }
+  if (terminal.stopReason === "end_turn" || terminal.stopReason === "tool_rule") {
+    return null;
+  }
+  return (
+    terminal.error ||
+    `correction turn ended with stop reason ${terminal.stopReason || "unknown"}`
+  );
+}
+
+function emitCorrectionStatus(correction, status, extra = {}) {
+  emit({
+    method: "symphony/correction/status",
+    params: correctionStatus(correction, status, extra),
+  });
 }
 
 async function startRuntime(client, cwd) {
@@ -383,22 +631,10 @@ function conversationIdFromRuntime(runtimeContext) {
   );
 }
 
-function turnIdForConversation(conversationId) {
-  if (!conversationId) return null;
-  const prefix = `${threadId}-`;
-  return String(conversationId).startsWith(prefix)
-    ? String(conversationId).slice(prefix.length)
-    : String(conversationId);
-}
-
 async function handleExternalToolCall(client, message, turnId) {
   if (message.type !== "external_tool_call_request") return;
 
   if (isInputRequiredTool(message.tool_name)) {
-    emitInputRequired(
-      turnId,
-      inputRequiredBlockerForTool(message.tool_name, message.input),
-    );
     client.send({
       type: "external_tool_call_response",
       request_id: message.request_id,
@@ -606,86 +842,432 @@ function normalizeWebSocketUrl(url) {
   return parsed.toString();
 }
 
-async function submitAndWaitForTurn(client, runtime, prompt, turnId, usage) {
+async function submitAndWaitForTurn(client, runtime, prompt, turnId, usage, hooks = {}) {
   const runEvents = [];
+  const runIdsByToolCallId = new Map();
+  const pendingCorrelationMessages = [];
+  const pendingToolCorrelationMessages = [];
+  let replayingToolCorrelationMessages = false;
+  let executionObserved = false;
+  let executionReported = false;
+  let correctionRunId = null;
+  let inputAccepted = false;
+  let inputRejected = false;
+  let inputSubmissionAttempted = false;
+  let terminalOutcomeObserved = false;
+  let observedTerminal = null;
   addTokenUsage(usage, { input: estimateTokens(prompt) });
   emitTokenUsage(usage, turnId);
 
   let detach = () => {};
   const terminal = new Promise((resolve) => {
-    detach = client.onMessage((message) => {
+    const resolveTerminal = (result) => {
+      if (observedTerminal) return;
+      observedTerminal = result;
+      resolve(result);
+    };
+    const replayToolCorrelationMessages = () => {
+      if (
+        !correctionRunId ||
+        replayingToolCorrelationMessages ||
+        pendingToolCorrelationMessages.length === 0
+      ) {
+        return;
+      }
+      replayingToolCorrelationMessages = true;
+      const pending = pendingToolCorrelationMessages.splice(0);
+      for (const pendingMessage of pending) processMessage(pendingMessage);
+      replayingToolCorrelationMessages = false;
+    };
+    const processMessage = (message) => {
       if (!sameRuntime(message.runtime, runtime)) return;
+
+      if (recordToolRunCorrelations(message, runIdsByToolCallId)) {
+        replayToolCorrelationMessages();
+      }
+
+      const queueDisposition = queueDispositionForMessage(
+        message,
+        hooks.clientMessageId,
+      );
+
+      if (queueDisposition === "dequeued") {
+        executionObserved = true;
+      } else if (queueDisposition === "cancelled") {
+        resolveTerminal({ cancelled: true, text: collapseText(runEvents) });
+        return;
+      }
+
+      const correlatedRunId = correctionRunIdForMessage(
+        message,
+        hooks.clientMessageId,
+        correctionRunId,
+        pendingCorrelationMessages.map(runIdForMessage).filter(Boolean),
+      );
+      if (correlatedRunId) {
+        correctionRunId = correlatedRunId;
+        executionObserved = true;
+        const pending = pendingCorrelationMessages.splice(0);
+        for (const pendingMessage of pending) {
+          recordToolRunCorrelations(pendingMessage, runIdsByToolCallId);
+        }
+        for (const pendingMessage of pending) processMessage(pendingMessage);
+      }
+
+      if (
+        hooks.clientMessageId &&
+        executionObserved &&
+        correctionRunId &&
+        !executionReported
+      ) {
+        executionReported = true;
+        if (hooks.onExecutionStarted) hooks.onExecutionStarted(correctionRunId);
+      }
+
+      if (
+        hooks.clientMessageId &&
+        !correctionRunId &&
+        (message.type === "external_tool_call_request" ||
+          message.type === "control_request" ||
+          message.type === "stream_delta" ||
+          message.type === "turn_finished")
+      ) {
+        pendingCorrelationMessages.push(message);
+        return;
+      }
+
+      const eventRunId = runIdForMessage(message);
+      if (
+        hooks.clientMessageId &&
+        eventRunId &&
+        eventRunId !== correctionRunId
+      ) {
+        pendingCorrelationMessages.push(message);
+        return;
+      }
 
       if (
         message.type === "external_tool_call_request" &&
         isInputRequiredTool(message.tool_name)
       ) {
-        emitInputRequired(
-          turnId,
-          inputRequiredBlockerForTool(message.tool_name, message.input),
+        const toolRunId = runIdsByToolCallId.get(message.tool_call_id);
+        if (hooks.clientMessageId && !toolRunId) {
+          pendingToolCorrelationMessages.push(message);
+          return;
+        }
+        if (
+          hooks.clientMessageId &&
+          toolRunId !== correctionRunId
+        ) {
+          pendingToolCorrelationMessages.push(message);
+          return;
+        }
+        const blocker = inputRequiredBlockerForTool(
+          message.tool_name,
+          message.input,
         );
-        resolve({
+        if (!hooks.clientMessageId) emitInputRequired(turnId, blocker);
+        resolveTerminal({
           stopReason: "input_required",
+          runId: correctionRunId,
+          blocker,
+          text: collapseText(runEvents),
+        });
+        return;
+      }
+
+      if (
+        message.type === "control_request" &&
+        message.request?.subtype === "can_use_tool"
+      ) {
+        const toolRunId = runIdsByToolCallId.get(message.request.tool_call_id);
+        if (hooks.clientMessageId && !toolRunId) {
+          pendingToolCorrelationMessages.push(message);
+          return;
+        }
+        if (
+          hooks.clientMessageId &&
+          toolRunId !== correctionRunId
+        ) {
+          pendingToolCorrelationMessages.push(message);
+          return;
+        }
+        const inputRequired = isInputRequiredTool(message.request.tool_name);
+        const blocker = inputRequired
+          ? inputRequiredBlockerForTool(
+              message.request.tool_name,
+              message.request.input,
+            )
+          : {
+              reason: `${message.request.tool_name || "Tool"} requires operator approval`,
+              missing: [],
+              remainingScope: "operator approval",
+            };
+        if (!hooks.clientMessageId) emitInputRequired(turnId, blocker);
+        resolveTerminal({
+          stopReason: inputRequired ? "input_required" : "requires_approval",
+          runId: correctionRunId,
+          blocker,
           text: collapseText(runEvents),
         });
         return;
       }
 
       if (message.type === "stream_delta") {
+        if (
+          hooks.clientMessageId &&
+          message.delta?.run_id !== correctionRunId
+        ) {
+          return;
+        }
         const text = textFromStreamDelta(message.delta);
         if (text) {
           runEvents.push(text);
           addTokenUsage(usage, { output: estimateTokens(text) });
           emitTokenUsage(usage, turnId);
         }
-        forwardStreamDelta(turnId, message.delta, usage);
-        if (blockedTurns.has(turnId)) {
-          resolve({
+        const streamBlocker = forwardStreamDelta(
+          turnId,
+          message.delta,
+          usage,
+          hooks.clientMessageId !== undefined,
+        );
+        if (streamBlocker && !hooks.clientMessageId) {
+          resolveTerminal({
             stopReason: "input_required",
+            runId: correctionRunId,
+            blocker: streamBlocker,
+            text: collapseText(runEvents),
+          });
+          return;
+        }
+        if (blockedTurns.has(turnId)) {
+          resolveTerminal({
+            stopReason: "input_required",
+            runId: correctionRunId,
             text: collapseText(runEvents),
           });
         }
       }
 
       if (message.type === "turn_finished") {
-        resolve({
+        if (
+          hooks.clientMessageId &&
+          pendingToolCorrelationMessages.some((pendingMessage) => {
+            const toolCallId = toolCallIdForControlMessage(pendingMessage);
+            const toolRunId = runIdsByToolCallId.get(toolCallId);
+            return !toolRunId || toolRunId === correctionRunId;
+          })
+        ) {
+          pendingToolCorrelationMessages.push(message);
+          return;
+        }
+        if (
+          hooks.clientMessageId &&
+          (!correctionRunId || message.run_id !== correctionRunId)
+        ) {
+          return;
+        }
+        resolveTerminal({
           stopReason: message.stop_reason,
+          runId: message.run_id,
+          turnId: message.turn_id,
+          error: message.error,
           text: collapseText(runEvents),
         });
       }
-    });
+    };
+
+    detach = client.onMessage(processMessage);
   });
 
   try {
-    await client.submitInput(
-      {
-        runtime,
-        payload: {
-          kind: "create_message",
-          messages: [
-            {
-              role: "user",
-              content: [{ type: "text", text: prompt }],
-              client_message_id: `symphony-${randomUUID()}`,
-            },
-          ],
-          ...(dynamicTools.length > 0
-            ? { external_tool_scope_ids: ["symphony-dynamic-tools"] }
-            : {}),
+    inputSubmissionAttempted = true;
+    let acceptance;
+    try {
+      acceptance = await client.submitInput(
+        {
+          runtime,
+          payload: {
+            kind: "create_message",
+            messages: [
+              {
+                role: "user",
+                content: [{ type: "text", text: prompt }],
+                client_message_id: hooks.clientMessageId || `symphony-${randomUUID()}`,
+              },
+            ],
+            ...(dynamicTools.length > 0
+              ? { external_tool_scope_ids: ["symphony-dynamic-tools"] }
+              : {}),
+          },
         },
-      },
-      { timeoutMs: options.requestTimeoutMs },
-    );
+        { timeoutMs: options.requestTimeoutMs },
+      );
+    } catch (error) {
+      if (hooks.clientMessageId && observedTerminal) {
+        terminalOutcomeObserved = true;
+        if (observedTerminal.cancelled) {
+          throw new Error("correction input was cancelled before execution");
+        }
+        return observedTerminal;
+      }
+      throw error;
+    }
+
+    inputAccepted = acceptance.accepted === true;
+    inputRejected = !inputAccepted;
+    if (hooks.onAccepted) hooks.onAccepted(acceptance);
+    if (acceptance.accepted && acceptance.disposition === "started") {
+      executionObserved = true;
+      if (correctionRunId && !executionReported) {
+        executionReported = true;
+        if (hooks.onExecutionStarted) hooks.onExecutionStarted(correctionRunId);
+      }
+    }
 
     const result = await withTimeout(
       Promise.race([terminal, client.waitForClose()]),
       options.turnTimeoutMs,
       "Timed out waiting for Letta turn_finished",
     );
-    return result.text;
+    terminalOutcomeObserved = true;
+
+    if (result.cancelled) throw new Error("correction input was cancelled before execution");
+    if (hooks.clientMessageId && !executionObserved) {
+      throw new Error("correction execution could not be correlated to its queued input");
+    }
+
+    return result;
+  } catch (error) {
+    if (
+      hooks.clientMessageId &&
+      inputSubmissionAttempted &&
+      !inputRejected &&
+      !terminalOutcomeObserved &&
+      !error?.correctionOutcomeUnresolved
+    ) {
+      const acceptance = inputAccepted ? "was accepted" : "may have been accepted";
+      const unresolved = new Error(
+        `Correction input ${acceptance} but its terminal outcome is unresolved: ${formatError(error)}`,
+        { cause: error },
+      );
+      unresolved.correctionOutcomeUnresolved = true;
+      throw unresolved;
+    }
+    throw error;
   } finally {
     detach();
   }
+}
+
+function recordToolRunCorrelations(message, runIdsByToolCallId) {
+  if (message?.type !== "stream_delta") return false;
+
+  const delta = message.delta;
+  if (typeof delta?.run_id !== "string") return false;
+
+  let toolCallIds = [];
+  if (
+    delta.message_type === "client_tool_start" &&
+    typeof delta.tool_call_id === "string"
+  ) {
+    toolCallIds = [delta.tool_call_id];
+  } else if (delta.message_type === "approval_request_message") {
+    const toolCalls =
+      Array.isArray(delta.tool_calls) && delta.tool_calls.length > 0
+      ? delta.tool_calls
+      : delta.tool_call
+        ? [delta.tool_call]
+        : [];
+    toolCallIds = toolCalls
+      .map((toolCall) => toolCall?.tool_call_id)
+      .filter((toolCallId) => typeof toolCallId === "string");
+  }
+
+  for (const toolCallId of toolCallIds) {
+    runIdsByToolCallId.set(toolCallId, delta.run_id);
+  }
+  return toolCallIds.length > 0;
+}
+
+function runIdForMessage(message) {
+  if (message?.type === "stream_delta" && typeof message.delta?.run_id === "string") {
+    return message.delta.run_id;
+  }
+  if (message?.type === "turn_finished" && typeof message.run_id === "string") {
+    return message.run_id;
+  }
+  return null;
+}
+
+function toolCallIdForControlMessage(message) {
+  if (message?.type === "external_tool_call_request") {
+    return message.tool_call_id;
+  }
+  if (message?.type === "control_request") {
+    return message.request?.tool_call_id;
+  }
+  return null;
+}
+
+function queueDispositionForMessage(message, clientMessageId) {
+  if (
+    message?.type !== "update_queue" ||
+    typeof clientMessageId !== "string" ||
+    !Array.isArray(message.removed)
+  ) {
+    return null;
+  }
+
+  const transition = message.removed.find(
+    (item) => item?.client_message_id === clientMessageId,
+  );
+  return transition?.disposition || null;
+}
+
+function correctionRunIdForMessage(
+  message,
+  clientMessageId,
+  currentRunId = null,
+  observedRunIds = [],
+) {
+  if (
+    message?.type !== "update_loop_status" ||
+    typeof clientMessageId !== "string" ||
+    !message.loop_status?.client_message_ids_by_run_id
+  ) {
+    return null;
+  }
+
+  const matches = Object.entries(
+    message.loop_status.client_message_ids_by_run_id,
+  )
+    .filter(
+      ([, clientMessageIds]) =>
+        Array.isArray(clientMessageIds) &&
+        clientMessageIds.includes(clientMessageId),
+    )
+    .map(([runId]) => runId);
+
+  const activeRunIds = Array.isArray(message.loop_status.active_run_ids)
+    ? message.loop_status.active_run_ids
+    : [];
+  const activeMatches = matches.filter((runId) => activeRunIds.includes(runId));
+
+  if (activeMatches.length === 1) return activeMatches[0];
+  if (activeMatches.length > 1) return null;
+  const observedMatches = [
+    ...new Set(
+      observedRunIds.filter(
+        (runId) => runId !== currentRunId && matches.includes(runId),
+      ),
+    ),
+  ];
+  if (observedMatches.length === 1) return observedMatches[0];
+  if (observedMatches.length > 1) return null;
+  if (currentRunId && matches.includes(currentRunId)) return currentRunId;
+  return matches.length === 1 ? matches[0] : null;
 }
 
 function buildWorkflowPhases(prompt) {
@@ -827,7 +1409,7 @@ function runCommand(command, args, cwd) {
   });
 }
 
-function forwardStreamDelta(turnId, delta, usage) {
+function forwardStreamDelta(turnId, delta, usage, deferInputRequired = false) {
   const messageType = delta?.message_type;
 
   if (delta?.type === "message") {
@@ -877,12 +1459,14 @@ function forwardStreamDelta(turnId, delta, usage) {
     if (delta.tool_call_id && delta.tool_name)
       toolNamesById.set(delta.tool_call_id, delta.tool_name);
     if (isInputRequiredTool(delta.tool_name)) {
-      emitInputRequired(turnId, {
+      const blocker = {
         reason: `${delta.tool_name} requested operator input`,
         missing: [],
         remainingScope: "operator input",
-      });
-      return;
+      };
+      if (deferInputRequired) return blocker;
+      emitInputRequired(turnId, blocker);
+      return null;
     }
     emitProgress(turnId, summarizeClientToolStart(delta.tool_name));
   }
@@ -926,6 +1510,8 @@ function forwardStreamDelta(turnId, delta, usage) {
     );
     emitTokenUsage(usage, turnId);
   }
+
+  return null;
 }
 
 function textFromStreamDelta(delta) {
@@ -1157,6 +1743,12 @@ function inputRequiredBlockerForTool(toolName, input) {
 function inputRequiredReason(toolName, input) {
   if (typeof input?.question === "string" && input.question.trim())
     return input.question.trim();
+  const questions = Array.isArray(input?.questions)
+    ? input.questions
+        .map((question) => question?.question)
+        .filter((question) => typeof question === "string" && question.trim())
+    : [];
+  if (questions.length > 0) return questions.join(" ");
   return `${toolName || "tool"} requested operator input`;
 }
 
@@ -1282,12 +1874,12 @@ function emitAgentMessage(turnId, text) {
 }
 
 function withTimeout(promise, timeoutMs, message) {
-  return Promise.race([
-    promise,
-    new Promise((_, reject) =>
-      setTimeout(() => reject(new Error(message)), timeoutMs),
-    ),
-  ]);
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(message)), timeoutMs);
+  });
+
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
 }
 
 function parseArgs(args) {

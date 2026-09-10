@@ -38,6 +38,7 @@ defmodule SymphonyElixir.Orchestrator do
       completed: MapSet.new(),
       claimed: MapSet.new(),
       blocked: %{},
+      corrections: %{},
       retry_attempts: %{},
       codex_totals: nil,
       codex_rate_limits: nil
@@ -135,6 +136,7 @@ defmodule SymphonyElixir.Orchestrator do
 
       issue_id ->
         {running_entry, state} = pop_running_entry(state, issue_id)
+        state = fail_pending_corrections(state, issue_id, running_entry, "owner process ended")
         state = record_session_completion_totals(state, running_entry)
         session_id = running_entry_session_id(running_entry)
 
@@ -179,6 +181,8 @@ defmodule SymphonyElixir.Orchestrator do
           state
           |> apply_codex_token_delta(token_delta)
           |> apply_codex_rate_limits(update)
+          |> integrate_correction_update(issue_id, running_entry, update)
+          |> maybe_fail_ended_owner_corrections(issue_id, running_entry, updated_running_entry, update)
 
         notify_dashboard()
         {:noreply, %{state | running: Map.put(running, issue_id, updated_running_entry)}}
@@ -557,6 +561,7 @@ defmodule SymphonyElixir.Orchestrator do
         release_issue_claim(state, issue_id)
 
       %{pid: pid, ref: ref, identifier: identifier} = running_entry ->
+        state = fail_pending_corrections(state, issue_id, running_entry, "owner process stopped")
         state = record_session_completion_totals(state, running_entry)
 
         stop_running_task(pid, ref, state.task_supervisor)
@@ -751,7 +756,9 @@ defmodule SymphonyElixir.Orchestrator do
       state.task_supervisor
     )
 
-    block_issue_from_entry(state, issue_id, running_entry, error)
+    state
+    |> fail_pending_corrections(issue_id, running_entry, error)
+    |> block_issue_from_entry(issue_id, running_entry, error)
   end
 
   defp block_issue_from_entry(%State{} = state, issue_id, running_entry, error) do
@@ -975,6 +982,8 @@ defmodule SymphonyElixir.Orchestrator do
             worker_host: worker_host,
             workspace_path: nil,
             session_id: nil,
+            correction_owner_active: false,
+            correction_delivery_supported: false,
             last_codex_message: nil,
             last_codex_timestamp: nil,
             last_codex_event: nil,
@@ -1388,11 +1397,34 @@ defmodule SymphonyElixir.Orchestrator do
 
   @spec request_refresh(GenServer.server()) :: map() | :unavailable
   def request_refresh(server) do
-    if Process.whereis(server) do
+    if server_available?(server) do
       GenServer.call(server, :request_refresh)
     else
       :unavailable
     end
+  end
+
+  @spec queue_correction(GenServer.server(), map()) :: {:ok, map()} | {:error, term()}
+  def queue_correction(server, correction) when is_map(correction) do
+    if server_available?(server) do
+      GenServer.call(server, {:queue_correction, correction}, :infinity)
+    else
+      {:error, :unavailable}
+    end
+  catch
+    :exit, _reason -> {:error, :unavailable}
+  end
+
+  @spec correction_status(GenServer.server(), String.t()) ::
+          {:ok, map()} | {:error, :not_found | :unavailable}
+  def correction_status(server, instruction_id) when is_binary(instruction_id) do
+    if server_available?(server) do
+      GenServer.call(server, {:correction_status, instruction_id})
+    else
+      {:error, :unavailable}
+    end
+  catch
+    :exit, _reason -> {:error, :unavailable}
   end
 
   @spec snapshot() :: map() | :timeout | :unavailable
@@ -1506,6 +1538,230 @@ defmodule SymphonyElixir.Orchestrator do
      }, state}
   end
 
+  def handle_call({:queue_correction, correction}, _from, state) do
+    case validate_correction_binding(state, correction) do
+      {:ok, running_entry} ->
+        now = DateTime.utc_now()
+
+        record = %{
+          instruction_id: correction.instruction_id,
+          issue_id: correction.issue_id,
+          issue_identifier: correction.issue_identifier,
+          session_id: correction.session_id,
+          workspace_path: correction.workspace_path,
+          worker_pid: correction.worker_pid,
+          worker_host: correction.worker_host,
+          status: :queued,
+          queued_at: now,
+          updated_at: now,
+          result: nil,
+          error: nil
+        }
+
+        send(running_entry.pid, {:deliver_correction, correction})
+
+        {:reply, {:ok, record}, %{state | corrections: Map.put(state.corrections, correction.instruction_id, record)}}
+
+      {:error, reason} ->
+        {:reply, {:error, reason}, state}
+    end
+  end
+
+  def handle_call({:correction_status, instruction_id}, _from, state) do
+    case Map.fetch(state.corrections, instruction_id) do
+      {:ok, record} -> {:reply, {:ok, record}, state}
+      :error -> {:reply, {:error, :not_found}, state}
+    end
+  end
+
+  defp validate_correction_binding(%State{} = state, correction) do
+    required = [
+      :instruction_id,
+      :issue_id,
+      :issue_identifier,
+      :session_id,
+      :workspace_path,
+      :worker_pid,
+      :text
+    ]
+
+    cond do
+      not Enum.all?(required, &present_string?(Map.get(correction, &1))) ->
+        {:error, :invalid_correction}
+
+      not Map.has_key?(correction, :worker_host) ->
+        {:error, :invalid_correction}
+
+      Map.has_key?(state.corrections, correction.instruction_id) ->
+        {:error, :duplicate_instruction_id}
+
+      true ->
+        validate_running_correction_binding(Map.get(state.running, correction.issue_id), correction)
+    end
+  end
+
+  defp validate_running_correction_binding(nil, _correction), do: {:error, :stale_owner}
+
+  defp validate_running_correction_binding(running_entry, correction) do
+    binding_matches? =
+      running_entry.identifier == correction.issue_identifier and
+        running_entry.session_id == correction.session_id and
+        Map.get(running_entry, :workspace_path) == correction.workspace_path and
+        Map.get(running_entry, :codex_app_server_pid) == correction.worker_pid and
+        Map.get(running_entry, :worker_host) == correction.worker_host
+
+    cond do
+      not is_pid(Map.get(running_entry, :pid)) or not Process.alive?(running_entry.pid) ->
+        {:error, :stale_owner}
+
+      not binding_matches? ->
+        {:error, :owner_binding_mismatch}
+
+      Map.get(running_entry, :correction_owner_active) != true ->
+        {:error, :stale_owner}
+
+      true ->
+        if Map.get(running_entry, :correction_delivery_supported) == true do
+          {:ok, running_entry}
+        else
+          {:error, :unsupported_correction_transport}
+        end
+    end
+  end
+
+  defp integrate_correction_update(state, issue_id, running_entry, update) do
+    with status when not is_nil(status) <- correction_status_for_event(update.event),
+         instruction_id when is_binary(instruction_id) <- Map.get(update, :instruction_id),
+         %{issue_id: ^issue_id} = correction <- Map.get(state.corrections, instruction_id),
+         true <- correction_update_matches?(correction, running_entry, update, status) do
+      updated = transition_correction(correction, status, update)
+      %{state | corrections: Map.put(state.corrections, instruction_id, updated)}
+    else
+      _ -> state
+    end
+  end
+
+  defp correction_update_matches?(correction, running_entry, update, status) do
+    update_matches? =
+      correction.session_id == Map.get(update, :session_id) and
+        correction.workspace_path == Map.get(update, :workspace_path) and
+        correction.worker_pid == Map.get(update, :worker_pid) and
+        correction.worker_host == Map.get(update, :worker_host)
+
+    current_owner_matches? =
+      correction.session_id == running_entry.session_id and
+        correction.workspace_path == Map.get(running_entry, :workspace_path) and
+        correction.worker_pid == Map.get(running_entry, :codex_app_server_pid) and
+        correction.worker_host == Map.get(running_entry, :worker_host)
+
+    update_matches? and correction_run_evidence?(status, update) and
+      (status == :failed or current_owner_matches?)
+  end
+
+  defp correction_run_evidence?(status, update)
+       when status in [:execution_started, :completed, :blocked],
+       do: present_string?(Map.get(update, :run_id))
+
+  defp correction_run_evidence?(_status, _update), do: true
+
+  defp correction_status_for_event(:correction_delivered), do: :delivered
+  defp correction_status_for_event(:correction_execution_started), do: :execution_started
+  defp correction_status_for_event(:correction_completed), do: :completed
+  defp correction_status_for_event(:correction_blocked), do: :blocked
+  defp correction_status_for_event(:correction_failed), do: :failed
+  defp correction_status_for_event(_event), do: nil
+
+  defp transition_correction(correction, status, update) do
+    if correction_transition_allowed?(correction.status, status) do
+      correction
+      |> Map.put(:status, status)
+      |> Map.put(:updated_at, DateTime.utc_now())
+      |> maybe_put_runtime_value(:result, Map.get(update, :result))
+      |> maybe_put_runtime_value(:error, Map.get(update, :error))
+      |> maybe_put_runtime_value(:run_id, Map.get(update, :run_id))
+    else
+      correction
+    end
+  end
+
+  defp correction_transition_allowed?(:queued, status), do: status in [:delivered, :failed]
+
+  defp correction_transition_allowed?(:delivered, status),
+    do: status in [:execution_started, :failed]
+
+  defp correction_transition_allowed?(:execution_started, status),
+    do: status in [:completed, :blocked, :failed]
+
+  defp correction_transition_allowed?(_current, _status), do: false
+
+  defp fail_pending_corrections(state, issue_id, running_entry, error) do
+    corrections =
+      Map.new(state.corrections, fn {instruction_id, correction} ->
+        matches_owner? =
+          correction_matches_owner?(correction, issue_id, running_entry) and
+            correction.status not in [:completed, :blocked, :failed]
+
+        updated =
+          if matches_owner? do
+            correction
+            |> Map.put(:status, :failed)
+            |> Map.put(:error, error)
+            |> Map.put(:updated_at, DateTime.utc_now())
+          else
+            correction
+          end
+
+        {instruction_id, updated}
+      end)
+
+    %{state | corrections: corrections}
+  end
+
+  defp correction_matches_owner?(correction, issue_id, running_entry) when is_map(running_entry) do
+    correction.issue_id == issue_id and
+      correction.issue_identifier == Map.get(running_entry, :identifier) and
+      correction.session_id == Map.get(running_entry, :session_id) and
+      correction.workspace_path == Map.get(running_entry, :workspace_path) and
+      correction.worker_pid == Map.get(running_entry, :codex_app_server_pid) and
+      correction.worker_host == Map.get(running_entry, :worker_host)
+  end
+
+  defp correction_matches_owner?(_correction, _issue_id, _running_entry), do: false
+
+  defp maybe_fail_ended_owner_corrections(
+         state,
+         issue_id,
+         running_entry,
+         updated_running_entry,
+         %{event: event}
+       )
+       when event in [
+              :turn_completed,
+              :turn_failed,
+              :turn_cancelled,
+              :turn_input_required,
+              :approval_required,
+              :turn_ended_with_error
+            ] do
+    if Map.get(running_entry, :correction_owner_active) == true and
+         Map.get(updated_running_entry, :correction_owner_active) != true do
+      fail_pending_corrections(state, issue_id, running_entry, "owner turn ended")
+    else
+      state
+    end
+  end
+
+  defp maybe_fail_ended_owner_corrections(
+         state,
+         _issue_id,
+         _running_entry,
+         _updated_running_entry,
+         _update
+       ),
+       do: state
+
+  defp server_available?(server), do: not is_nil(GenServer.whereis(server))
+
   defp blocked_issue_state(%{issue: %Issue{state: state}}), do: state
   defp blocked_issue_state(_metadata), do: nil
 
@@ -1528,6 +1784,8 @@ defmodule SymphonyElixir.Orchestrator do
         last_codex_timestamp: timestamp,
         last_codex_message: summarize_codex_update(update),
         session_id: session_id_for_update(running_entry.session_id, update),
+        correction_owner_active: correction_owner_active_for_update(running_entry, update),
+        correction_delivery_supported: correction_delivery_supported_for_update(running_entry, update),
         last_codex_event: event,
         codex_app_server_pid: codex_app_server_pid_for_update(codex_app_server_pid, update),
         codex_input_tokens: codex_input_tokens + token_delta.input_tokens,
@@ -1559,6 +1817,32 @@ defmodule SymphonyElixir.Orchestrator do
     do: session_id
 
   defp session_id_for_update(existing, _update), do: existing
+
+  defp correction_owner_active_for_update(_running_entry, %{event: :session_started}), do: true
+
+  defp correction_owner_active_for_update(_running_entry, %{event: event})
+       when event in [
+              :turn_completed,
+              :turn_failed,
+              :turn_cancelled,
+              :turn_input_required,
+              :approval_required,
+              :turn_ended_with_error
+            ],
+       do: false
+
+  defp correction_owner_active_for_update(running_entry, _update),
+    do: Map.get(running_entry, :correction_owner_active, false)
+
+  defp correction_delivery_supported_for_update(_running_entry, %{
+         event: :session_started,
+         correction_delivery_supported: supported
+       })
+       when is_boolean(supported),
+       do: supported
+
+  defp correction_delivery_supported_for_update(running_entry, _update),
+    do: Map.get(running_entry, :correction_delivery_supported, false)
 
   defp turn_count_for_update(existing_count, existing_session_id, %{
          event: :session_started,
