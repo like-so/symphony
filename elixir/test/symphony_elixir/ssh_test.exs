@@ -157,6 +157,39 @@ defmodule SymphonyElixir.SSHTest do
     assert trace =~ "-T -p 2222 localhost bash -lc"
   end
 
+  test "start_port/3 removes selected variables from the ssh process environment" do
+    test_root = Path.join(System.tmp_dir!(), "symphony-ssh-env-port-test-#{System.unique_integer([:positive])}")
+    trace_file = Path.join(test_root, "ssh.trace")
+    secret_name = "SYMPHONY_SSH_CHILD_SECRET_#{System.unique_integer([:positive])}"
+    previous_path = System.get_env("PATH")
+    previous_secret = System.get_env(secret_name)
+
+    on_exit(fn ->
+      restore_env("PATH", previous_path)
+      restore_env(secret_name, previous_secret)
+      File.rm_rf(test_root)
+    end)
+
+    install_fake_ssh!(test_root, trace_file, """
+    #!/bin/sh
+    if env | grep -q '^#{secret_name}='; then
+      printf 'secret-present\n' >> "#{trace_file}"
+    else
+      printf 'secret-absent\n' >> "#{trace_file}"
+    fi
+    exit 0
+    """)
+
+    System.put_env(secret_name, "configured-secret")
+
+    assert {:ok, port} =
+             SSH.start_port("localhost", "printf ok", env: [{String.to_charlist(secret_name), false}])
+
+    assert is_port(port)
+    wait_for_trace!(trace_file)
+    assert File.read!(trace_file) == "secret-absent\n"
+  end
+
   test "remote_shell_command/1 escapes embedded single quotes" do
     assert SSH.remote_shell_command("printf 'hello'") ==
              "bash -lc 'printf '\"'\"'hello'\"'\"''"

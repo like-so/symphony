@@ -123,11 +123,46 @@ defmodule SymphonyElixir.Config do
   @doc false
   @spec validate_settings(Schema.t()) :: :ok | {:error, term()}
   def validate_settings(settings) do
+    with :ok <- validate_tracker_settings(settings),
+         :ok <- validate_correction_control_settings(settings.server) do
+      :ok
+    end
+  end
+
+  @doc false
+  @spec correction_secret_environment_names() :: [String.t()]
+  def correction_secret_environment_names do
+    startup_names =
+      :symphony_elixir
+      |> Application.get_env(:correction_control_startup, %{})
+      |> Map.get(:secret_environment_names, [])
+
+    (startup_names ++ settings!().server.secret_environment_names)
+    |> Enum.filter(fn name ->
+      is_binary(name) and String.match?(name, ~r/^[A-Za-z_][A-Za-z0-9_]*$/)
+    end)
+    |> Enum.uniq()
+  end
+
+  defp validate_tracker_settings(settings) do
     if is_nil(settings.tracker.kind) do
       {:error, :missing_tracker_kind}
     else
       Tracker.validate_config(settings.tracker)
     end
+  end
+
+  defp validate_correction_control_settings(%{correction_token: nil}), do: :ok
+
+  defp validate_correction_control_settings(%{
+         correction_token: token,
+         secret_environment_names: [_name]
+       })
+       when is_binary(token),
+       do: :ok
+
+  defp validate_correction_control_settings(%{correction_token: token}) when is_binary(token) do
+    {:error, {:invalid_workflow_config, "server.correction_token must use a host environment reference such as $SYMPHONY_CORRECTION_TOKEN"}}
   end
 
   defp format_config_error(reason) do

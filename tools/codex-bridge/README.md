@@ -37,6 +37,17 @@ through `letta agents list --name` before running the turn.
   isolated Letta runtime conversation: planning, execution, then review.
 - `--workflow single` sends only one execution input.
 
+While a turn is active, Symphony may send `symphony/correction/deliver` with the exact issue,
+session, workspace, worker-PID, and worker-host binding supplied on `turn/start`. The bridge rejects
+stale or duplicate instruction IDs, acknowledges receipt separately, and drains accepted corrections
+serially on the same Letta runtime and conversation between workflow phases. It reports execution
+start after the App Server correlates the exact correction message to a run with accepted or dequeued
+execution evidence, and completion only after that run reaches a successful `turn_finished`.
+Input-required outcomes are reported as blocked; other terminal outcomes are failed. If an input may
+have been accepted but its terminal outcome cannot be observed, the bridge fails the delivery and
+stops later corrections and workflow
+phases instead of submitting more input behind unresolved execution.
+
 ## App Server lifecycle
 
 A locally spawned App Server is owned by the Symphony turn that created it. The

@@ -150,6 +150,26 @@ defmodule SymphonyElixir.CoreTest do
     assert :ok = Config.validate!()
   end
 
+  test "correction control token resolves from an environment reference" do
+    env_name = "SYMPHONY_CORRECTION_TOKEN_TEST_#{System.unique_integer([:positive])}"
+    previous = System.get_env(env_name)
+    System.put_env(env_name, "configured-token")
+    on_exit(fn -> restore_env(env_name, previous) end)
+
+    write_workflow_file!(Workflow.workflow_file_path(), server_correction_token: "$#{env_name}")
+
+    settings = Config.settings!()
+    assert settings.server.correction_token == "configured-token"
+    assert settings.server.secret_environment_names == [env_name]
+  end
+
+  test "correction control token rejects a literal workflow secret" do
+    write_workflow_file!(Workflow.workflow_file_path(), server_correction_token: "literal-token")
+
+    assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
+    assert message =~ "server.correction_token must use a host environment reference"
+  end
+
   test "linear assignee resolves from LINEAR_ASSIGNEE env var" do
     previous_linear_assignee = System.get_env("LINEAR_ASSIGNEE")
     env_assignee = "dev@example.com"
@@ -1213,6 +1233,338 @@ defmodule SymphonyElixir.CoreTest do
 
     assert coalesced_state.tick_token == refreshed_state.tick_token
     assert {:noreply, ^coalesced_state} = Orchestrator.handle_info({:tick, stale_tick_token}, coalesced_state)
+  end
+
+  test "correction delivery requires the exact active owner and rejects duplicate instruction IDs" do
+    issue_id = "issue-correction"
+
+    running_entry = %{
+      pid: self(),
+      identifier: "MT-CORRECTION",
+      session_id: "local-letta-turn-7",
+      workspace_path: "/workspaces/MT-CORRECTION",
+      codex_app_server_pid: "4242",
+      worker_host: nil,
+      correction_owner_active: true,
+      correction_delivery_supported: true
+    }
+
+    correction = %{
+      instruction_id: "correction-1",
+      issue_id: issue_id,
+      issue_identifier: "MT-CORRECTION",
+      session_id: "local-letta-turn-7",
+      workspace_path: "/workspaces/MT-CORRECTION",
+      worker_pid: "4242",
+      worker_host: nil,
+      text: "Apply the authorized correction."
+    }
+
+    state = %Orchestrator.State{running: %{issue_id => running_entry}}
+
+    assert {:reply, {:ok, %{status: :queued}}, queued_state} =
+             Orchestrator.handle_call({:queue_correction, correction}, {self(), make_ref()}, state)
+
+    assert_receive {:deliver_correction, ^correction}
+
+    unrelated_correction = %{
+      queued_state.corrections[correction.instruction_id]
+      | instruction_id: "correction-other-owner",
+        workspace_path: "/workspaces/MT-ENDED-OTHER"
+    }
+
+    queued_state = %{
+      queued_state
+      | corrections:
+          Map.put(
+            queued_state.corrections,
+            unrelated_correction.instruction_id,
+            unrelated_correction
+          )
+    }
+
+    assert {:reply, {:error, :duplicate_instruction_id}, ^queued_state} =
+             Orchestrator.handle_call({:queue_correction, correction}, {self(), make_ref()}, queued_state)
+
+    refute_receive {:deliver_correction, _correction}
+
+    missing_worker_host = correction |> Map.delete(:worker_host) |> Map.put(:instruction_id, "correction-missing-host")
+
+    assert {:reply, {:error, :invalid_correction}, ^state} =
+             Orchestrator.handle_call(
+               {:queue_correction, missing_worker_host},
+               {self(), make_ref()},
+               state
+             )
+
+    stale_state = %Orchestrator.State{}
+
+    assert {:reply, {:error, :stale_owner}, ^stale_state} =
+             Orchestrator.handle_call({:queue_correction, correction}, {self(), make_ref()}, stale_state)
+
+    mismatched = %{correction | instruction_id: "correction-2", session_id: "local-letta-turn-old"}
+
+    assert {:reply, {:error, :owner_binding_mismatch}, ^state} =
+             Orchestrator.handle_call({:queue_correction, mismatched}, {self(), make_ref()}, state)
+
+    for {field, value} <- [
+          {:issue_identifier, "MT-OTHER"},
+          {:workspace_path, "/workspaces/MT-OTHER"},
+          {:worker_host, "worker-b"}
+        ] do
+      changed = correction |> Map.put(:instruction_id, "correction-changed-#{field}") |> Map.put(field, value)
+
+      assert {:reply, {:error, :owner_binding_mismatch}, ^state} =
+               Orchestrator.handle_call({:queue_correction, changed}, {self(), make_ref()}, state)
+    end
+
+    replaced = %{correction | instruction_id: "correction-replaced", worker_pid: "5252"}
+
+    assert {:reply, {:error, :owner_binding_mismatch}, ^state} =
+             Orchestrator.handle_call({:queue_correction, replaced}, {self(), make_ref()}, state)
+
+    ended_state = put_in(state.running[issue_id].correction_owner_active, false)
+    ended = %{correction | instruction_id: "correction-ended"}
+
+    assert {:reply, {:error, :stale_owner}, ^ended_state} =
+             Orchestrator.handle_call({:queue_correction, ended}, {self(), make_ref()}, ended_state)
+
+    dead_pid = spawn(fn -> receive do: (:stop -> :ok) end)
+    dead_ref = Process.monitor(dead_pid)
+    send(dead_pid, :stop)
+    assert_receive {:DOWN, ^dead_ref, :process, ^dead_pid, :normal}
+    dead_state = put_in(state.running[issue_id].pid, dead_pid)
+    dead = %{correction | instruction_id: "correction-dead"}
+
+    assert {:reply, {:error, :stale_owner}, ^dead_state} =
+             Orchestrator.handle_call({:queue_correction, dead}, {self(), make_ref()}, dead_state)
+
+    unsupported_state = put_in(state.running[issue_id].correction_delivery_supported, false)
+    unsupported = %{correction | instruction_id: "correction-3"}
+
+    assert {:reply, {:error, :unsupported_correction_transport}, ^unsupported_state} =
+             Orchestrator.handle_call(
+               {:queue_correction, unsupported},
+               {self(), make_ref()},
+               unsupported_state
+             )
+  end
+
+  test "correction submission waits for the orchestrator's authoritative receipt" do
+    server =
+      spawn(fn ->
+        receive do
+          {:"$gen_call", from, {:queue_correction, %{instruction_id: "correction-delayed"}}} ->
+            Process.sleep(5_010)
+            GenServer.reply(from, {:ok, %{status: :queued}})
+        end
+      end)
+
+    assert {:ok, %{status: :queued}} =
+             Orchestrator.queue_correction(server, %{instruction_id: "correction-delayed"})
+  end
+
+  test "correction receipt does not skip execution-started before completion" do
+    issue_id = "issue-correction-lifecycle"
+    issue = %Issue{id: issue_id, identifier: "MT-LIFECYCLE", title: "Lifecycle", state: "In Progress"}
+
+    running_entry = %{
+      pid: self(),
+      ref: make_ref(),
+      identifier: issue.identifier,
+      issue: issue,
+      session_id: "local-letta-turn-8",
+      workspace_path: "/workspaces/MT-LIFECYCLE",
+      codex_app_server_pid: "4343",
+      worker_host: "worker-a",
+      correction_owner_active: true,
+      correction_delivery_supported: true,
+      started_at: DateTime.utc_now()
+    }
+
+    correction = %{
+      instruction_id: "correction-lifecycle",
+      issue_id: issue_id,
+      issue_identifier: issue.identifier,
+      session_id: running_entry.session_id,
+      workspace_path: running_entry.workspace_path,
+      worker_pid: running_entry.codex_app_server_pid,
+      worker_host: running_entry.worker_host,
+      text: "Apply the authorized correction."
+    }
+
+    state = %Orchestrator.State{
+      running: %{issue_id => running_entry},
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
+    }
+
+    assert {:reply, {:ok, _record}, queued_state} =
+             Orchestrator.handle_call({:queue_correction, correction}, {self(), make_ref()}, state)
+
+    assert_receive {:deliver_correction, ^correction}
+
+    update = fn event, extra ->
+      Map.merge(
+        %{
+          event: event,
+          timestamp: DateTime.utc_now(),
+          instruction_id: correction.instruction_id,
+          session_id: correction.session_id,
+          workspace_path: correction.workspace_path,
+          worker_pid: correction.worker_pid,
+          worker_host: correction.worker_host
+        },
+        extra
+      )
+    end
+
+    assert {:noreply, delivered_state} =
+             Orchestrator.handle_info(
+               {:codex_worker_update, issue_id, update.(:correction_delivered, %{})},
+               queued_state
+             )
+
+    assert delivered_state.corrections[correction.instruction_id].status == :delivered
+
+    assert {:noreply, still_delivered_state} =
+             Orchestrator.handle_info(
+               {:codex_worker_update, issue_id, update.(:correction_completed, %{result: "too early"})},
+               delivered_state
+             )
+
+    assert still_delivered_state.corrections[correction.instruction_id].status == :delivered
+
+    assert {:noreply, still_without_run_state} =
+             Orchestrator.handle_info(
+               {:codex_worker_update, issue_id, update.(:correction_execution_started, %{})},
+               still_delivered_state
+             )
+
+    assert still_without_run_state.corrections[correction.instruction_id].status == :delivered
+
+    assert {:noreply, started_state} =
+             Orchestrator.handle_info(
+               {:codex_worker_update, issue_id, update.(:correction_execution_started, %{run_id: "run-1"})},
+               still_without_run_state
+             )
+
+    assert {:noreply, still_started_state} =
+             Orchestrator.handle_info(
+               {:codex_worker_update, issue_id, update.(:correction_blocked, %{error: "missing run"})},
+               started_state
+             )
+
+    assert still_started_state.corrections[correction.instruction_id].status == :execution_started
+
+    assert {:noreply, still_started_state} =
+             Orchestrator.handle_info(
+               {:codex_worker_update, issue_id, update.(:correction_completed, %{result: "missing run"})},
+               still_started_state
+             )
+
+    assert {:noreply, completed_state} =
+             Orchestrator.handle_info(
+               {:codex_worker_update, issue_id, update.(:correction_completed, %{run_id: "run-2", result: "revision abc"})},
+               still_started_state
+             )
+
+    record = completed_state.corrections[correction.instruction_id]
+    assert record.status == :completed
+    assert record.run_id == "run-2"
+    assert record.result == "revision abc"
+  end
+
+  test "ending an owner turn fails a correction that has not executed" do
+    issue_id = "issue-correction-ended"
+    issue = %Issue{id: issue_id, identifier: "MT-ENDED", title: "Ended", state: "In Progress"}
+
+    running_entry = %{
+      pid: self(),
+      ref: make_ref(),
+      identifier: issue.identifier,
+      issue: issue,
+      session_id: "local-letta-turn-ended",
+      workspace_path: "/workspaces/MT-ENDED",
+      codex_app_server_pid: "4444",
+      worker_host: nil,
+      correction_owner_active: true,
+      correction_delivery_supported: true,
+      started_at: DateTime.utc_now()
+    }
+
+    correction = %{
+      instruction_id: "correction-ended-before-execution",
+      issue_id: issue_id,
+      issue_identifier: issue.identifier,
+      session_id: running_entry.session_id,
+      workspace_path: running_entry.workspace_path,
+      worker_pid: running_entry.codex_app_server_pid,
+      worker_host: nil,
+      text: "Apply the authorized correction."
+    }
+
+    state = %Orchestrator.State{
+      running: %{issue_id => running_entry},
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
+    }
+
+    assert {:reply, {:ok, _record}, queued_state} =
+             Orchestrator.handle_call({:queue_correction, correction}, {self(), make_ref()}, state)
+
+    assert_receive {:deliver_correction, ^correction}
+
+    unrelated_correction = %{
+      queued_state.corrections[correction.instruction_id]
+      | instruction_id: "correction-ended-other-owner",
+        workspace_path: "/workspaces/MT-ENDED-OTHER"
+    }
+
+    queued_state = %{
+      queued_state
+      | corrections:
+          Map.put(
+            queued_state.corrections,
+            unrelated_correction.instruction_id,
+            unrelated_correction
+          )
+    }
+
+    update = %{
+      event: :turn_completed,
+      timestamp: DateTime.utc_now(),
+      codex_input_tokens: 0,
+      codex_output_tokens: 0,
+      codex_total_tokens: 0
+    }
+
+    assert {:noreply, ended_state} =
+             Orchestrator.handle_info({:codex_worker_update, issue_id, update}, queued_state)
+
+    record = ended_state.corrections[correction.instruction_id]
+    assert record.status == :failed
+    assert record.error == "owner turn ended"
+    assert ended_state.corrections[unrelated_correction.instruction_id].status == :queued
+    refute ended_state.running[issue_id].correction_owner_active
+
+    active_again_state = %{
+      queued_state
+      | running: %{issue_id => %{running_entry | correction_owner_active: true}}
+    }
+
+    error_update = %{
+      event: :turn_ended_with_error,
+      timestamp: DateTime.utc_now(),
+      reason: :turn_timeout
+    }
+
+    assert {:noreply, errored_state} =
+             Orchestrator.handle_info(
+               {:codex_worker_update, issue_id, error_update},
+               active_again_state
+             )
+
+    assert errored_state.corrections[correction.instruction_id].status == :failed
+    refute errored_state.running[issue_id].correction_owner_active
   end
 
   test "select_worker_host_for_test skips full ssh hosts under the shared per-host cap" do

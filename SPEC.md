@@ -1472,6 +1472,12 @@ Extension config:
   - Enables the HTTP server extension.
   - `0` requests an ephemeral port for local development and tests.
   - CLI `--port` overrides `server.port` when both are present.
+- `server.correction_token` (string, OPTIONAL)
+  - Enables authenticated correction delivery when present.
+  - MUST reference a host-side environment variable with `$VAR` syntax.
+  - MUST NOT be exposed to worker child processes, logs, dashboards, or API responses.
+  - Correction requests MUST originate from loopback; remote callers require a same-host TLS proxy.
+  - Changes require a service restart so active workers cannot retain a newly selected token.
 
 Enablement (extension):
 
@@ -1495,6 +1501,14 @@ Enablement (extension):
 #### 13.7.2 JSON REST API (`/api/v1/*`)
 
 Provide a JSON REST API under `/api/v1/*` for current runtime state and operational debugging.
+
+An implementation MAY also expose authenticated correction delivery for an existing active owner.
+Such an operation MUST bind the request to the exact issue ID and identifier, session, workspace,
+controller-owned worker PID, and worker host; reject stale or mismatched ownership and reused
+instruction IDs; and keep queued, delivery acknowledgement, execution start, blocked, failed, and
+terminal completion as distinct states. Acceptance of a refresh, tracker comment, or continuation
+request MUST NOT be reported as execution proof. The controller MUST reject an active transport
+that has not advertised correction-delivery support.
 
 Minimum endpoints:
 
