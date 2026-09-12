@@ -167,6 +167,11 @@ Notes:
   invocation when a turn completes normally but the issue is still in an active state. Default: `20`.
 - If the Markdown body is blank, Symphony uses a default prompt template that includes the issue
   identifier, title, and body.
+- Tracker comments are retained separately from the issue description. When comments exist,
+  the prompt renderer appends a labelled historical-evidence section with their full bodies,
+  IDs, and timestamps, including for description-only custom templates. Dated commands are
+  not a second execution queue; unresolved reviews and unsuperseded user restrictions remain
+  visible. Custom templates need not append the comments themselves.
 - Use `hooks.after_create` to bootstrap a fresh workspace. For a Git-backed repo, you can run
   `git clone ... .` there, along with any other setup commands you need.
 - If a hook needs `mise exec` inside a freshly cloned workspace, trust the repo config and fetch

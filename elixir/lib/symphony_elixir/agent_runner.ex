@@ -46,20 +46,21 @@ defmodule SymphonyElixir.AgentRunner do
   defp run_on_worker_host(issue, codex_update_recipient, opts, worker_host) do
     Logger.info("Starting worker attempt for #{issue_context(issue)} worker_host=#{worker_host_for_log(worker_host)}")
 
-    case Workspace.create_for_issue(issue, worker_host) do
-      {:ok, workspace} ->
-        send_worker_runtime_info(codex_update_recipient, issue, worker_host, workspace)
+    with {:ok, workspace} <- Workspace.create_for_issue(issue, worker_host),
+         {:ok, context} <- Workspace.context_for_issue(issue, worker_host),
+         true <- context.workspace_path == workspace do
+      send_worker_runtime_info(codex_update_recipient, issue, worker_host, context)
 
-        try do
-          with :ok <- Workspace.run_before_run_hook(workspace, issue, worker_host) do
-            run_codex_turns(workspace, issue, codex_update_recipient, opts, worker_host)
-          end
-        after
-          Workspace.run_after_run_hook(workspace, issue, worker_host)
+      try do
+        with :ok <- Workspace.run_before_run_hook(workspace, issue, worker_host) do
+          run_codex_turns(workspace, issue, codex_update_recipient, opts, worker_host)
         end
-
-      {:error, reason} ->
-        {:error, reason}
+      after
+        Workspace.run_after_run_hook(workspace, issue, worker_host)
+      end
+    else
+      false -> {:error, :workspace_context_changed}
+      {:error, _reason} = error -> error
     end
   end
 
@@ -77,14 +78,16 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp send_codex_update(_recipient, _issue, _message), do: :ok
 
-  defp send_worker_runtime_info(recipient, %Issue{id: issue_id}, worker_host, workspace)
-       when is_binary(issue_id) and is_pid(recipient) and is_binary(workspace) do
+  defp send_worker_runtime_info(recipient, %Issue{id: issue_id}, worker_host, context)
+       when is_binary(issue_id) and is_pid(recipient) and is_map(context) do
     send(
       recipient,
       {:worker_runtime_info, issue_id,
        %{
          worker_host: worker_host,
-         workspace_path: workspace
+         workspace_path: context.workspace_path,
+         workspace_managed: context.managed,
+         source_revision: context.source_revision
        }}
     )
 
@@ -97,12 +100,20 @@ defmodule SymphonyElixir.AgentRunner do
     max_turns = Keyword.get(opts, :max_turns, Config.settings!().agent.max_turns)
     issue_state_fetcher = Keyword.get(opts, :issue_state_fetcher, &Tracker.fetch_issues_by_ids/1)
 
-    with {:ok, session} <- AppServer.start_session(workspace, worker_host: worker_host) do
+    with {:ok, context} <- Workspace.context_for_issue(issue, worker_host),
+         true <- context.workspace_path == workspace,
+         :ok <- send_worker_runtime_info(codex_update_recipient, issue, worker_host, context),
+         {:ok, session} <- AppServer.start_session(workspace, worker_host: worker_host, workspace_root: Map.get(context, :root)) do
+      opts = Keyword.put(opts, :workspace_context, context)
+
       try do
         do_run_codex_turns(session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, 1, max_turns)
       after
         AppServer.stop_session(session)
       end
+    else
+      false -> {:error, :workspace_context_changed}
+      {:error, _reason} = error -> error
     end
   end
 

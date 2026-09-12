@@ -310,8 +310,8 @@ defmodule SymphonyElixir.Plane.AdapterTest do
 
         assert issue.title == "Work item 1"
         assert issue.description =~ "<p>Body 1</p>"
-        assert issue.description =~ "Tracker comments:"
-        assert issue.description =~ "Use the latest requirement"
+        refute issue.description =~ "Tracker comments:"
+        refute issue.description =~ "Use the latest requirement"
 
         assert issue.comments == [
                  %{

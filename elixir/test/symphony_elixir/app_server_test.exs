@@ -668,11 +668,93 @@ defmodule SymphonyElixir.AppServerTest do
         text: "Apply the authorized correction."
       }
 
+      send(task.pid, {:deliver_correction, Map.put(correction, :recovery, true)})
+
+      assert_receive {:app_server_message,
+                      %{event: :correction_failed, error: "active transport does not advertise explicit recovery"}}
+
       send(task.pid, {:deliver_correction, correction})
 
       assert_receive {:app_server_message, %{event: :correction_delivered}}
       assert_receive {:app_server_message, %{event: :correction_execution_started}}
       assert_receive {:app_server_message, %{event: :correction_completed, result: "revision abc"}}
+      assert {:ok, _result} = Task.await(task)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "recovery transport forwards current manager validation without granting authority itself" do
+    test_root = Path.join(System.tmp_dir!(), "symphony-recovery-#{System.unique_integer([:positive])}")
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "LIKE-179")
+      codex_binary = Path.join(test_root, "fake-codex")
+      File.mkdir_p!(workspace)
+      assert {:ok, canonical_workspace} = SymphonyElixir.PathSafety.canonicalize(workspace)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      count=0
+      while IFS= read -r line; do
+        count=$((count + 1))
+        case "$count" in
+          1) printf '%s\\n' '{"id":1,"result":{"capabilities":{"symphonyCorrectionDelivery":true,"symphonyCorrectionRecovery":true}}}' ;;
+          2) ;;
+          3) printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-recovery"}}}' ;;
+          4) printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-recovery"}}}' ;;
+          5)
+            case "$line" in *'"recovery":true'*) ;; *) exit 9 ;; esac
+            case "$line" in *'"sourceRevision":"source-v2"'*) ;; *) exit 10 ;; esac
+            case "$line" in *'"authorizationId":"auth-v2"'*) ;; *) exit 11 ;; esac
+            case "$line" in *'"cwdRevision":4'*) ;; *) exit 12 ;; esac
+            printf '%s%s%s\\n' '{"id":"symphony-recovery-validation-test","method":"symphony/correction/validate","params":{"instructionId":"new-recovery","issueId":"issue-recovery","issueIdentifier":"LIKE-179","threadId":"thread-recovery","expectedTurnId":"turn-recovery","sessionId":"thread-recovery-turn-recovery","workspacePath":"#{canonical_workspace}","workerPid":"' "$$" '","workerHost":null,"sourceRevision":"source-v2","authorizationId":"auth-v2","cwdRevision":4,"stage":"acceptance","runtime":{"agent_id":"agent","conversation_id":"conversation"}}}'
+            ;;
+          6)
+            case "$line" in *'"current":false'*) ;; *) exit 13 ;; esac
+            printf '%s\\n' '{"method":"turn/completed"}'
+            exit 0
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+      write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root, codex_command: "#{codex_binary} app-server")
+      issue = %Issue{id: "issue-recovery", identifier: "LIKE-179", title: "Explicit recovery", state: "In Progress"}
+      parent = self()
+
+      task = Task.async(fn ->
+        AppServer.run(workspace, "wait for recovery", issue, on_message: fn message -> send(parent, {:recovery_message, message}) end)
+      end)
+
+      assert_receive {:recovery_message, %{event: :session_started, codex_app_server_pid: worker_pid}}, 1_000
+
+      send(task.pid, {:deliver_correction, %{
+        instruction_id: "new-recovery",
+        issue_id: issue.id,
+        issue_identifier: issue.identifier,
+        session_id: "thread-recovery-turn-recovery",
+        workspace_path: canonical_workspace,
+        worker_pid: worker_pid,
+        worker_host: nil,
+        text: "Explicit new correction",
+        recovery: true,
+        source_revision: "source-v2",
+        authorization_id: "auth-v2",
+        cwd_revision: 4
+      }})
+
+      assert_receive {:recovery_message, %{
+        event: :correction_validation_requested,
+        request_id: "symphony-recovery-validation-test",
+        reply_to: reply_to,
+        validation: %{"stage" => "acceptance", "sourceRevision" => "source-v2", "authorizationId" => "auth-v2"}
+      }}, 1_000
+
+      assert reply_to == task.pid
+      send(reply_to, {:correction_validation_result, "symphony-recovery-validation-test", %{"current" => false}})
       assert {:ok, _result} = Task.await(task)
     after
       File.rm_rf(test_root)

@@ -5,6 +5,41 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
   alias SymphonyElixir.Config.Schema.{Codex, StringOrMap}
   alias SymphonyElixir.Linear.Client
 
+  test "explicit directory binding reuses and protects an existing operations workspace" do
+    root = Path.join(System.tmp_dir!(), "symphony-bound-directory-#{System.unique_integer([:positive])}")
+    path = Path.join(root, "operations")
+    File.mkdir_p!(path)
+    on_exit(fn -> File.rm_rf!(root) end)
+    File.write!(Path.join(path, "keep.txt"), "existing data")
+    binding = %{"root" => root, "path" => "operations", "kind" => "directory"}
+    write_workflow_file!(Workflow.workflow_file_path(),
+      workspace_bindings: %{"OPS-1" => binding}, hook_after_create: "exit 99")
+    issue = %Issue{id: "ops-1", identifier: "OPS-1", description: "Inspect the service"}
+    assert {:ok, context} = Workspace.context_for_issue(issue)
+    refute context.managed
+    assert {:ok, canonical} = SymphonyElixir.PathSafety.canonicalize(path)
+    assert context.workspace_path == canonical
+    assert {:ok, ^canonical} = Workspace.create_for_issue(issue)
+    refute File.exists?(Path.join(path, ".git"))
+    assert {:ok, []} = Workspace.remove(canonical)
+    assert {:ok, []} = Workspace.remove_recorded(canonical, nil, false)
+    assert File.read!(Path.join(path, "keep.txt")) == "existing data"
+    assert {:ok, changed} = Workspace.context_for_issue(%{issue | description: "New direction"})
+    refute changed.source_revision == context.source_revision
+  end
+
+  test "missing explicit directory fails without falling back to the default workspace" do
+    root = Path.join(System.tmp_dir!(), "symphony-missing-binding-#{System.unique_integer([:positive])}")
+    File.mkdir_p!(root)
+    on_exit(fn -> File.rm_rf!(root) end)
+    write_workflow_file!(Workflow.workflow_file_path(),
+      workspace_root: Path.join(root, "default"),
+      workspace_bindings: %{"OPS-2" => %{"root" => root, "path" => "missing", "kind" => "directory"}})
+    assert {:error, _reason} = Workspace.create_for_issue("OPS-2")
+    refute File.exists?(Path.join(root, "default"))
+    refute File.exists?(Path.join(root, "missing"))
+  end
+
   test "workspace bootstrap can be implemented in after_create hook" do
     test_root =
       Path.join(

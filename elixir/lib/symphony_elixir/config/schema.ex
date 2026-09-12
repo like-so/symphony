@@ -114,12 +114,29 @@ defmodule SymphonyElixir.Config.Schema do
     @primary_key false
     embedded_schema do
       field(:root, :string, default: Path.join(System.tmp_dir!(), "symphony_workspaces"))
+      field(:bindings, :map, default: %{})
     end
 
     @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
     def changeset(schema, attrs) do
       schema
-      |> cast(attrs, [:root], empty_values: [])
+      |> cast(attrs, [:root, :bindings], empty_values: [])
+      |> validate_required([:bindings])
+      |> update_change(:bindings, fn bindings ->
+        Map.new(bindings || %{}, fn {identifier, binding} ->
+          {identifier, SymphonyElixir.Config.Schema.resolve_workspace_binding(binding)}
+        end)
+      end)
+      |> validate_change(:bindings, fn :bindings, bindings ->
+        if Enum.all?(bindings, fn {identifier, binding} ->
+             is_binary(identifier) and String.trim(identifier) != "" and
+               SymphonyElixir.Config.Schema.valid_workspace_binding?(binding)
+           end) do
+          []
+        else
+          [bindings: "must contain exact identifiers and valid root/path/kind/origin/revision bindings"]
+        end
+      end)
     end
   end
 
@@ -385,6 +402,42 @@ defmodule SymphonyElixir.Config.Schema do
     end)
   end
 
+  @doc false
+  @spec resolve_workspace_binding(term()) :: term()
+  def resolve_workspace_binding(binding) when is_map(binding) do
+    Map.new(binding, fn
+      {key, value} when key in ["root", "path", "origin", "revision"] and is_binary(value) ->
+        {key, resolve_env_value(value, nil)}
+
+      pair ->
+        pair
+    end)
+  end
+
+  def resolve_workspace_binding(binding), do: binding
+
+  @doc false
+  @spec valid_workspace_binding?(term()) :: boolean()
+  def valid_workspace_binding?(binding) when is_map(binding) do
+    text? = fn value ->
+      is_binary(value) and String.trim(value) != "" and
+        not String.contains?(value, ["\n", "\r", <<0>>])
+    end
+
+    Enum.all?(Map.keys(binding), &(&1 in ["root", "path", "kind", "origin", "revision"])) and
+      text?.(binding["root"]) and text?.(binding["path"]) and
+      case binding["kind"] do
+        "directory" -> not Map.has_key?(binding, "origin") and not Map.has_key?(binding, "revision")
+        "repository" ->
+          text?.(binding["origin"]) and
+            (not Map.has_key?(binding, "revision") or
+               (is_binary(binding["revision"]) and Regex.match?(~r/\A(?:[0-9a-f]{40}|[0-9a-f]{64})\z/, binding["revision"])))
+        _ -> false
+      end
+  end
+
+  def valid_workspace_binding?(_binding), do: false
+
   defp changeset(attrs) do
     %__MODULE__{}
     |> cast(attrs, [])
@@ -504,6 +557,11 @@ defmodule SymphonyElixir.Config.Schema do
 
   defp normalize_key(value) when is_atom(value), do: Atom.to_string(value)
   defp normalize_key(value), do: to_string(value)
+
+  # Binding nulls are errors, not absent configuration (which would enable fallback).
+  defp drop_nil_values(%{"bindings" => bindings} = value) do
+    value |> Map.delete("bindings") |> drop_nil_values() |> Map.put("bindings", bindings)
+  end
 
   defp drop_nil_values(value) when is_map(value) do
     Enum.reduce(value, %{}, fn {key, nested}, acc ->

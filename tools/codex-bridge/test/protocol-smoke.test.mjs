@@ -208,6 +208,52 @@ test("correction completion rejects non-success terminal outcomes", () => {
   );
 });
 
+for (const outcome of ["llm_api_error", "cancelled", "timeout"]) {
+  test(`a ${outcome} phase fails queued corrections without submitting them`, async () => {
+    const statuses = [];
+    const correction = { instructionId: `queued-${outcome}` };
+    const target = {
+      client: {}, runtime: {}, turnId: "phase-1", accepting: true, queue: [],
+      emitStatus: (item, status, extra) => statuses.push({ item, status, ...extra }),
+    };
+    let submissions = 0;
+    const submit = async () => {
+      submissions += 1;
+      target.queue.push(correction);
+      if (outcome === "timeout") throw new Error("phase timed out");
+      return { stopReason: outcome };
+    };
+
+    await assert.rejects(bridgeTestHooks.submitWorkflowPhase(
+      target, "original phase", {}, submit,
+    ));
+    assert.equal(submissions, 1);
+    assert.equal(target.accepting, false);
+    assert.deepEqual(target.queue, []);
+    assert.equal(statuses.length, 1);
+    assert.equal(statuses[0].item, correction);
+    assert.equal(statuses[0].status, "failed");
+    assert.equal(statuses[0].runId, undefined);
+  });
+}
+
+test("successful phase preserves queued corrections for the existing drain", async () => {
+  const correction = { instructionId: "queued-success" };
+  const target = {
+    client: {}, runtime: {}, turnId: "phase-1", accepting: true, queue: [],
+    emitStatus: () => assert.fail("successful phase must not fail the queue"),
+  };
+  const terminal = await bridgeTestHooks.submitWorkflowPhase(
+    target, "original phase", {}, async () => {
+      target.queue.push(correction);
+      return { stopReason: "end_turn", text: "finished" };
+    },
+  );
+  assert.equal(terminal.stopReason, "end_turn");
+  assert.equal(target.accepting, true);
+  assert.deepEqual(target.queue, [correction]);
+});
+
 test("queued correction execution is correlated by client message id", () => {
   const message = {
     type: "update_queue",
@@ -303,6 +349,43 @@ test("queued correction execution is correlated by client message id", () => {
     ),
     "run-duplicate",
   );
+});
+
+test("owner phase ignores another input's terminal before its own correlation arrives", async () => {
+  const runtime = { agent_id: "agent-owner", conversation_id: "conversation-owner" };
+  let receive;
+  const client = {
+    onMessage: (handler) => { receive = handler; return () => {}; },
+    submitInput: async (command) => {
+      const messageId = command.payload.messages[0].client_message_id;
+      queueMicrotask(() => {
+        for (const runId of ["another-input", "owner-input"]) {
+          receive({
+            type: "turn_finished", runtime, run_id: runId,
+            turn_id: runId, stop_reason: "end_turn",
+          });
+        }
+        receive({
+          type: "update_loop_status", runtime,
+          loop_status: {
+            active_run_ids: [],
+            client_message_ids_by_run_id: { "owner-input": [messageId] },
+          },
+        });
+      });
+      return { accepted: true, disposition: "started" };
+    },
+    waitForClose: () => new Promise(() => {}),
+  };
+  const target = {
+    client, runtime, turnId: "owner-phase", accepting: true, queue: [],
+    emitStatus: () => assert.fail("no correction was submitted"),
+  };
+  const terminal = await bridgeTestHooks.submitWorkflowPhase(
+    target, "Perform the owner phase", { input_tokens: 0, output_tokens: 0, total_tokens: 0 },
+  );
+  assert.equal(terminal.runId, "owner-input");
+  assert.equal(terminal.turnId, "owner-input");
 });
 
 test("correction waits for the correlated run terminal", async () => {

@@ -13,6 +13,16 @@ defmodule SymphonyElixir.Workspace do
   @spec create_for_issue(map() | String.t() | nil, worker_host()) ::
           {:ok, Path.t()} | {:error, term()}
   def create_for_issue(issue_or_identifier, worker_host \\ nil) do
+    with {:ok, context} <- context_for_issue(issue_or_identifier, worker_host) do
+      if context.managed do
+        create_managed_for_issue(issue_or_identifier, worker_host)
+      else
+        {:ok, context.workspace_path}
+      end
+    end
+  end
+
+  defp create_managed_for_issue(issue_or_identifier, worker_host) do
     issue_context = issue_context(issue_or_identifier)
 
     try do
@@ -36,6 +46,120 @@ defmodule SymphonyElixir.Workspace do
         {:error, error}
     end
   end
+
+  @doc """
+  Resolves an issue's workspace without creating it or running hooks.
+
+  Explicit bindings borrow existing local directories. Root is relative to the workflow;
+  path is relative to that root. Repository origin and optional full HEAD pin match exactly.
+  Directory bindings never probe Git. Explicit remote bindings fail closed.
+  Persist `managed` with the path and use remove_recorded/3 after configuration reloads.
+  """
+  @spec context_for_issue(map() | String.t() | nil, worker_host()) :: {:ok, map()} | {:error, term()}
+  def context_for_issue(issue, worker_host \\ nil) do
+    with {:ok, settings} <- Config.settings(),
+         {:ok, context} <- resolve_context(issue, worker_host, settings) do
+      identity = {issue_field(issue, :id), issue_identifier(issue), issue_field(issue, :description)}
+      digest = :crypto.hash(:sha256, :erlang.term_to_binary({identity, context})) |> Base.encode16(case: :lower)
+      {:ok, Map.put(context, :source_revision, digest)}
+    end
+  rescue
+    _error in [ArgumentError, ErlangError, File.Error] -> {:error, :workspace_context_unreadable}
+  end
+
+  defp resolve_context(issue, worker_host, settings) do
+    case Map.fetch(settings.workspace.bindings, issue_identifier(issue)) do
+      {:ok, _binding} when not is_nil(worker_host) ->
+        {:error, :explicit_remote_workspace_unsupported}
+
+      {:ok, binding} ->
+        resolve_binding(binding)
+
+      :error ->
+        with {:ok, path} <- workspace_path_for_issue(workspace_key(issue), worker_host),
+             :ok <- validate_workspace_path(path, worker_host) do
+          head = if is_nil(worker_host) and File.dir?(path), do: git_value(path, ["rev-parse", "--verify", "HEAD"]), else: nil
+          {:ok, %{workspace_path: path, managed: true, kind: :default, worker_host: worker_host, head: head}}
+        end
+    end
+  end
+
+  defp resolve_binding(binding) do
+    workflow_dir = SymphonyElixir.Workflow.workflow_file_path() |> Path.expand() |> Path.dirname()
+    root = Path.expand(binding["root"], workflow_dir)
+    path = Path.expand(binding["path"], root)
+
+    with true <- SymphonyElixir.Config.Schema.valid_workspace_binding?(binding),
+         true <- File.dir?(root) and File.dir?(path),
+         {:ok, canonical_root} <- PathSafety.canonicalize(root),
+         {:ok, canonical_path} <- PathSafety.canonicalize(path),
+         :ok <- validate_local_workspace_path(path, root),
+         # Permit platform/root aliases, but never a redirected child within the root.
+         true <- canonical_path == Path.expand(Path.relative_to(path, root), canonical_root),
+         {:ok, head} <- binding_head(binding, canonical_path) do
+      {:ok, %{workspace_path: canonical_path, root: canonical_root, binding: binding,
+              managed: false, kind: binding["kind"], worker_host: nil, head: head}}
+    else
+      false -> {:error, :invalid_workspace_binding}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp binding_head(%{"kind" => "directory"}, _path), do: {:ok, nil}
+
+  defp binding_head(binding, path) do
+    head = git_value(path, ["rev-parse", "--verify", "HEAD"])
+    top = git_value(path, ["rev-parse", "--show-toplevel"])
+    origin = git_value(path, ["config", "--get", "remote.origin.url"])
+
+    with true <- is_binary(head) and head != "" and is_binary(top),
+         {:ok, ^path} <- PathSafety.canonicalize(top),
+         true <- origin == binding["origin"],
+         true <- not Map.has_key?(binding, "revision") or binding["revision"] == head do
+      {:ok, head}
+    else
+      _ -> {:error, :workspace_repository_mismatch}
+    end
+  end
+
+  defp git_value(path, args) do
+    # Do not inherit a launcher-selected repository or alternate Git configuration.
+    env = System.get_env() |> Map.keys() |> Enum.filter(&String.starts_with?(&1, "GIT_")) |> Enum.map(&{&1, nil})
+    case System.cmd("git", ["-C", path | args], env: env, stderr_to_stdout: true) do
+      {output, 0} -> String.trim(output)
+      _ -> nil
+    end
+  rescue
+    _error in [ArgumentError, ErlangError] -> nil
+  end
+
+  defp issue_identifier(issue) when is_binary(issue), do: issue
+  defp issue_identifier(issue), do: issue_field(issue, :identifier)
+  defp issue_field(issue, key) when is_map(issue), do: Map.get(issue, key, Map.get(issue, Atom.to_string(key)))
+  defp issue_field(_issue, _key), do: nil
+
+  @doc "Returns whether current bindings protect this path or a containing directory from removal."
+  @spec borrowed_workspace?(Path.t()) :: boolean()
+  def borrowed_workspace?(workspace) do
+    with {:ok, settings} <- Config.settings(),
+         {:ok, candidate} <- PathSafety.canonicalize(workspace) do
+      workflow_dir = SymphonyElixir.Workflow.workflow_file_path() |> Path.expand() |> Path.dirname()
+      Enum.any?(settings.workspace.bindings, fn {_identifier, binding} ->
+        path = Path.expand(binding["path"], Path.expand(binding["root"], workflow_dir))
+        case PathSafety.canonicalize(path) do
+          {:ok, borrowed} -> borrowed == candidate or String.starts_with?(borrowed, candidate <> "/") or String.starts_with?(candidate, borrowed <> "/")
+          _ -> true
+        end
+      end)
+    else
+      _ -> true
+    end
+  end
+
+  @doc "Remove a recorded workspace only if its persisted ownership permits it."
+  @spec remove_recorded(Path.t(), worker_host(), boolean()) :: {:ok, [String.t()]} | {:error, term(), String.t()}
+  def remove_recorded(_workspace, _worker_host, false), do: {:ok, []}
+  def remove_recorded(workspace, worker_host, true), do: remove_recorded(workspace, worker_host)
 
   defp ensure_workspace(workspace, nil) do
     cond do
@@ -95,19 +219,7 @@ defmodule SymphonyElixir.Workspace do
 
   @spec remove(Path.t(), worker_host()) :: {:ok, [String.t()]} | {:error, term(), String.t()}
   def remove(workspace, nil) do
-    case File.exists?(workspace) do
-      true ->
-        case validate_workspace_path(workspace, nil) do
-          :ok ->
-            remove_local_workspace(workspace)
-
-          {:error, reason} ->
-            {:error, reason, ""}
-        end
-
-      false ->
-        File.rm_rf(workspace)
-    end
+    if borrowed_workspace?(workspace), do: {:ok, []}, else: remove_managed_local(workspace)
   end
 
   def remove(workspace, worker_host) when is_binary(worker_host) do
@@ -135,17 +247,7 @@ defmodule SymphonyElixir.Workspace do
   @doc false
   @spec remove_recorded(Path.t(), worker_host()) :: {:ok, [String.t()]} | {:error, term(), String.t()}
   def remove_recorded(workspace, nil) when is_binary(workspace) do
-    if Path.type(workspace) == :absolute do
-      case validate_recorded_workspace_path(workspace) do
-        :ok ->
-          remove_local_workspace(workspace)
-
-        {:error, reason} ->
-          {:error, reason, ""}
-      end
-    else
-      {:error, {:workspace_path_unreadable, workspace, :not_absolute}, ""}
-    end
+    if borrowed_workspace?(workspace), do: {:ok, []}, else: remove_recorded_local(workspace)
   end
 
   def remove_recorded(workspace, worker_host) when is_binary(workspace) and is_binary(worker_host) do
@@ -159,6 +261,29 @@ defmodule SymphonyElixir.Workspace do
   defp remove_local_workspace(workspace) do
     maybe_run_before_remove_hook(workspace, nil)
     File.rm_rf(workspace)
+  end
+
+  defp remove_managed_local(workspace) do
+    case File.exists?(workspace) do
+      true ->
+        case validate_workspace_path(workspace, nil) do
+          :ok -> remove_local_workspace(workspace)
+          {:error, reason} -> {:error, reason, ""}
+        end
+
+      false -> File.rm_rf(workspace)
+    end
+  end
+
+  defp remove_recorded_local(workspace) do
+    if Path.type(workspace) == :absolute do
+      case validate_recorded_workspace_path(workspace) do
+        :ok -> remove_local_workspace(workspace)
+        {:error, reason} -> {:error, reason, ""}
+      end
+    else
+      {:error, {:workspace_path_unreadable, workspace, :not_absolute}, ""}
+    end
   end
 
   @spec remove_issue_workspaces(term()) :: :ok
