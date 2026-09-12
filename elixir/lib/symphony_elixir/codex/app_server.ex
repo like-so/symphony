@@ -20,6 +20,7 @@ defmodule SymphonyElixir.Codex.AppServer do
           turn_sandbox_policy: map(),
           thread_id: String.t(),
           correction_delivery_supported: boolean(),
+          correction_recovery_supported: boolean(),
           workspace: Path.t(),
           worker_host: String.t() | nil,
           dynamic_tool_binding: map()
@@ -41,12 +42,12 @@ defmodule SymphonyElixir.Codex.AppServer do
     worker_host = Keyword.get(opts, :worker_host)
     dynamic_tool_binding = DynamicTool.bind()
 
-    with {:ok, expanded_workspace} <- validate_workspace_cwd(workspace, worker_host),
+    with {:ok, expanded_workspace} <- validate_workspace_cwd(workspace, worker_host, Keyword.get(opts, :workspace_root)),
          {:ok, port} <- start_port(expanded_workspace, worker_host, dynamic_tool_binding) do
       metadata = port_metadata(port, worker_host)
 
       with {:ok, session_policies} <- session_policies(expanded_workspace, worker_host),
-           {:ok, thread_id, correction_delivery_supported} <-
+           {:ok, thread_id, correction_delivery_supported, correction_recovery_supported} <-
              do_start_session(port, expanded_workspace, session_policies, dynamic_tool_binding) do
         {:ok,
          %{
@@ -58,6 +59,7 @@ defmodule SymphonyElixir.Codex.AppServer do
            turn_sandbox_policy: session_policies.turn_sandbox_policy,
            thread_id: thread_id,
            correction_delivery_supported: correction_delivery_supported,
+           correction_recovery_supported: correction_recovery_supported,
            workspace: expanded_workspace,
            worker_host: worker_host,
            dynamic_tool_binding: dynamic_tool_binding
@@ -80,6 +82,7 @@ defmodule SymphonyElixir.Codex.AppServer do
           turn_sandbox_policy: turn_sandbox_policy,
           thread_id: thread_id,
           correction_delivery_supported: correction_delivery_supported,
+          correction_recovery_supported: correction_recovery_supported,
           workspace: workspace,
           worker_host: worker_host,
           dynamic_tool_binding: dynamic_tool_binding
@@ -117,7 +120,8 @@ defmodule SymphonyElixir.Codex.AppServer do
             session_id: session_id,
             thread_id: thread_id,
             turn_id: turn_id,
-            correction_delivery_supported: correction_delivery_supported
+            correction_delivery_supported: correction_delivery_supported,
+            correction_recovery_supported: correction_recovery_supported
           },
           metadata
         )
@@ -130,6 +134,7 @@ defmodule SymphonyElixir.Codex.AppServer do
           session_id: session_id,
           worker_pid: Map.get(metadata, :codex_app_server_pid),
           correction_delivery_supported: correction_delivery_supported,
+          correction_recovery_supported: correction_recovery_supported,
           workspace_path: workspace,
           worker_host: worker_host
         }
@@ -175,9 +180,9 @@ defmodule SymphonyElixir.Codex.AppServer do
     stop_detached_omx_sessions(workspace)
   end
 
-  defp validate_workspace_cwd(workspace, nil) when is_binary(workspace) do
+  defp validate_workspace_cwd(workspace, nil, root) when is_binary(workspace) do
     expanded_workspace = Path.expand(workspace)
-    expanded_root = Config.local_workspace_root()
+    expanded_root = root || Config.local_workspace_root()
     expanded_root_prefix = expanded_root <> "/"
 
     with {:ok, canonical_workspace} <- PathSafety.canonicalize(expanded_workspace),
@@ -203,7 +208,7 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp validate_workspace_cwd(workspace, worker_host)
+  defp validate_workspace_cwd(workspace, worker_host, _root)
        when is_binary(workspace) and is_binary(worker_host) do
     cond do
       String.trim(workspace) == "" ->
@@ -330,7 +335,8 @@ defmodule SymphonyElixir.Codex.AppServer do
 
     with {:ok, response} <- await_response(port, @initialize_id) do
       send_message(port, %{"method" => "initialized", "params" => %{}})
-      {:ok, get_in(response, ["capabilities", "symphonyCorrectionDelivery"]) == true}
+      {:ok, get_in(response, ["capabilities", "symphonyCorrectionDelivery"]) == true,
+       get_in(response, ["capabilities", "symphonyCorrectionRecovery"]) == true}
     end
   end
 
@@ -344,9 +350,9 @@ defmodule SymphonyElixir.Codex.AppServer do
 
   defp do_start_session(port, workspace, session_policies, dynamic_tool_binding) do
     case send_initialize(port) do
-      {:ok, correction_delivery_supported} ->
+      {:ok, correction_delivery_supported, correction_recovery_supported} ->
         case start_thread(port, workspace, session_policies, dynamic_tool_binding) do
-          {:ok, thread_id} -> {:ok, thread_id, correction_delivery_supported}
+          {:ok, thread_id} -> {:ok, thread_id, correction_delivery_supported, correction_recovery_supported}
           {:error, reason} -> {:error, reason}
         end
 
@@ -493,6 +499,21 @@ defmodule SymphonyElixir.Codex.AppServer do
           silence_deadline_ms
         )
 
+      {:correction_validation_result, "symphony-recovery-validation-" <> _ = request_id, result}
+      when is_map(result) ->
+        send_message(port, %{"id" => request_id, "result" => result})
+
+        receive_loop(
+          port,
+          on_message,
+          timeout_ms,
+          pending_line,
+          tool_executor,
+          auto_approve_requests,
+          correction_binding,
+          silence_deadline_ms
+        )
+
       {^port, {:exit_status, status}} ->
         {:error, {:port_exit, status}}
     after
@@ -539,6 +560,48 @@ defmodule SymphonyElixir.Codex.AppServer do
         )
 
         {:error, {:turn_cancelled, Map.get(payload, "params")}}
+
+      {:ok,
+       %{
+         "id" => "symphony-recovery-validation-" <> _ = request_id,
+         "method" => "symphony/correction/validate",
+         "params" => params
+       } = payload}
+      when is_map(params) ->
+        # The manager must validate its current source and authorization record;
+        # a bridge request or echoed operator payload is not authority by itself.
+        details = %{
+          instruction_id: Map.get(params, "instructionId"),
+          issue_id: Map.get(params, "issueId"),
+          issue_identifier: Map.get(params, "issueIdentifier"),
+          thread_id: Map.get(params, "threadId"),
+          expected_turn_id: Map.get(params, "expectedTurnId"),
+          session_id: Map.get(params, "sessionId"),
+          workspace_path: Map.get(params, "workspacePath"),
+          worker_pid: Map.get(params, "workerPid"),
+          worker_host: Map.get(params, "workerHost")
+        }
+
+        if correction_status_matches_binding?(details, correction_binding) do
+          emit_message(
+            on_message,
+            :correction_validation_requested,
+            Map.merge(details, %{request_id: request_id, validation: params, reply_to: self()}),
+            metadata_from_message(port, payload)
+          )
+        else
+          send_message(port, %{"id" => request_id, "result" => %{"current" => false}})
+        end
+
+        receive_loop(
+          port,
+          on_message,
+          timeout_ms,
+          "",
+          tool_executor,
+          auto_approve_requests,
+          correction_binding
+        )
 
       {:ok, %{"method" => "symphony/correction/status", "params" => params} = payload} when is_map(params) ->
         emit_correction_status(on_message, params, correction_binding, metadata_from_message(port, payload))
@@ -778,6 +841,14 @@ defmodule SymphonyElixir.Codex.AppServer do
           %{}
         )
 
+      Map.get(correction, :recovery, false) == true and Map.get(binding, :correction_recovery_supported) != true ->
+        emit_message(
+          on_message,
+          :correction_failed,
+          correction_event_details(correction, %{error: "active transport does not advertise explicit recovery"}),
+          %{}
+        )
+
       correction_binding_matches?(correction, binding) ->
         send_message(port, %{
           "id" => "symphony-correction-#{correction.instruction_id}",
@@ -792,7 +863,11 @@ defmodule SymphonyElixir.Codex.AppServer do
             "workspacePath" => correction.workspace_path,
             "workerPid" => correction.worker_pid,
             "workerHost" => correction.worker_host,
-            "text" => correction.text
+            "text" => correction.text,
+            "recovery" => Map.get(correction, :recovery, false),
+            "sourceRevision" => Map.get(correction, :source_revision),
+            "authorizationId" => Map.get(correction, :authorization_id),
+            "cwdRevision" => Map.get(correction, :cwd_revision)
           }
         })
 

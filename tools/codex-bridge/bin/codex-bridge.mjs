@@ -190,6 +190,10 @@ export const bridgeTestHooks = {
   meaningfulStreamingText,
   AppServerProcessManager,
   createAppServerBridgeClientForTest,
+  acceptCorrectionForTarget,
+  createCorrectionTarget,
+  inspectRecoveryIdle,
+  validateRecoveryAuthority,
   correctionBindingMatches,
   correctionCompletionError,
   correctionRunIdForMessage,
@@ -198,6 +202,7 @@ export const bridgeTestHooks = {
   queueDispositionForMessage,
   resolveAppServer,
   submitAndWaitForTurn,
+  submitWorkflowPhase,
 };
 
 if (isMain) {
@@ -212,7 +217,13 @@ function startStdioBridge() {
 
   rl.on("line", (line) => {
     handleLine(line).catch((error) => {
-      emit({ method: "turn/failed", params: { error: formatError(error) } });
+      emit({ method: "turn/failed", params: {
+        error: formatError(error),
+        ...(error.recoveryInstructionId ? {
+          errorCode: "explicit_recovery_handoff",
+          recoveryInstructionId: error.recoveryInstructionId,
+        } : {}),
+      } });
     });
   });
 
@@ -237,6 +248,7 @@ async function handleLine(line) {
       capabilities: {
         experimentalApi: true,
         symphonyCorrectionDelivery: true,
+        symphonyCorrectionRecovery: true,
       },
     });
     return;
@@ -259,7 +271,7 @@ async function handleLine(line) {
   }
 
   if (method === "symphony/correction/deliver") {
-    acceptCorrection(id, params);
+    await acceptCorrection(id, params);
     return;
   }
 
@@ -313,11 +325,9 @@ async function runLettaWorkflow(turnStartResponseId, fallbackTurnId, params) {
 
       for (const phase of phases) {
         emitProgress(turnId, `phase ${phase.name}: starting`);
-        const terminal = await submitAndWaitForTurn(
-          client,
-          runtime,
+        const terminal = await submitWorkflowPhase(
+          correctionTarget,
           phase.prompt,
-          turnId,
           usage,
         );
         if (terminal.stopReason === "requires_approval") {
@@ -333,8 +343,6 @@ async function runLettaWorkflow(turnStartResponseId, fallbackTurnId, params) {
           emitBlockedCompletion(turnId, usage);
           return;
         }
-        const completionError = correctionCompletionError(terminal);
-        if (completionError) throw new Error(completionError);
         phaseReports.push(
           `## ${phase.name}\n${terminal.text || "Completed."}`,
         );
@@ -371,6 +379,42 @@ async function runLettaWorkflow(turnStartResponseId, fallbackTurnId, params) {
   }
 }
 
+async function submitWorkflowPhase(
+  target,
+  prompt,
+  usage,
+  submitTurn = submitAndWaitForTurn,
+) {
+  target.phaseActive = true;
+  target.usage = usage;
+  const localStop = new Promise((resolve) => { target.stopPhaseWait = resolve; });
+  try {
+    const terminal = await submitTurn(
+      target.client, target.runtime, prompt, target.turnId, usage,
+      { clientMessageId: `symphony-phase-${randomUUID()}`, localStop },
+    );
+    if (target.recoveryTakenOver) {
+      throw new Error("Original phase outcome unresolved; explicit recovery is a separate instruction");
+    }
+    // Preserve the workflow's existing approval/input-required completion path.
+    if (terminal.stopReason !== "requires_approval" && !blockedTurns.has(target.turnId)) {
+      const error = correctionCompletionError(terminal);
+      if (error) throw new Error(error);
+    }
+    return terminal;
+  } catch (error) {
+    closeCorrectionTarget(target, "owner turn ended before correction execution");
+    // A separately authorized input must retain its own terminal waiter even
+    // when the original phase times out or its local waiter is relinquished.
+    if (target.drainPromise) await target.drainPromise;
+    if (target.recoveryTakenOver) error.recoveryInstructionId = target.recoveryInstructionId;
+    throw error;
+  } finally {
+    target.phaseActive = false;
+    target.stopPhaseWait = null;
+  }
+}
+
 function createCorrectionTarget(params, turnId, client, runtime) {
   const symphony = params.symphony || {};
   return {
@@ -388,63 +432,143 @@ function createCorrectionTarget(params, turnId, client, runtime) {
     runtime,
     turnId,
     accepting: true,
+    phaseActive: false,
+    recoveryPending: false,
+    validateAuthority: requestRecoveryAuthority,
     queue: [],
     emitStatus: emitCorrectionStatus,
     emitInputRequired,
   };
 }
 
-function acceptCorrection(responseId, params) {
+async function acceptCorrection(responseId, params) {
   const target = activeCorrectionTarget;
-  const instructionId = params.instructionId;
-
-  if (!target || !target.accepting) {
-    respond(responseId, {
-      correction: correctionStatus(params, "failed", {
-        error: "no active correction target",
-      }),
-    });
-    return;
+  const result = await acceptCorrectionForTarget(target, params);
+  respond(responseId, { correction: result });
+  if (result.status === "delivered" && params.recovery === true) {
+    void drainCorrections(target, target.usage || {});
   }
-
-  if (!correctionBindingMatches(params, target.binding)) {
-    respond(responseId, {
-      correction: correctionStatus(params, "failed", {
-        error: "active correction target does not match",
-      }),
-    });
-    return;
-  }
-
-  if (
-    typeof instructionId !== "string" ||
-    !instructionId.trim() ||
-    typeof params.text !== "string" ||
-    !params.text.trim()
-  ) {
-    respond(responseId, {
-      correction: correctionStatus(params, "failed", {
-        error: "invalid correction payload",
-      }),
-    });
-    return;
-  }
-
-  if (acceptedCorrectionIds.has(instructionId)) {
-    respond(responseId, {
-      correction: correctionStatus(params, "failed", {
-        error: "duplicate instruction id",
-      }),
-    });
-    return;
-  }
-
-  acceptedCorrectionIds.add(instructionId);
-  target.queue.push(params);
-  respond(responseId, { correction: correctionStatus(params, "delivered") });
 }
 
-async function drainCorrections(target, usage, submitTurn = submitAndWaitForTurn) {
+async function acceptCorrectionForTarget(target, params, seen = acceptedCorrectionIds) {
+  const fail = (error, status = "failed") => correctionStatus(params, status, { error });
+  if (!target?.accepting) return fail("no active correction target");
+  if (!correctionBindingMatches(params, target.binding)) {
+    return fail("active correction target does not match");
+  }
+  if (typeof params.instructionId !== "string" || !params.instructionId.trim() ||
+      typeof params.text !== "string" || !params.text.trim() ||
+      (params.recovery !== undefined && typeof params.recovery !== "boolean")) {
+    return fail("invalid correction payload");
+  }
+  if (seen.has(params.instructionId)) return fail("duplicate instruction id");
+  // Reserve before any await: even failed recovery must use a NEW instruction ID.
+  seen.add(params.instructionId);
+  if (params.recovery === true) {
+    if (!target.phaseActive || target.recoveryPending || target.drainPromise) {
+      return fail("recovery requires one active phase with no correction drain", "blocked");
+    }
+    target.recoveryPending = true;
+    try {
+      await validateRecoveryAuthority(target, params, "acceptance");
+      if (!target.phaseActive) throw new Error("owner phase is no longer active");
+    } catch (error) {
+      target.recoveryPending = false;
+      return fail(formatError(error), "blocked");
+    }
+    // Older queued inputs are not revived by this authorization.
+    for (const queued of target.queue.splice(0)) {
+      target.emitStatus(queued, "failed", { error: "superseded by explicit recovery; not replayed" });
+    }
+  } else if (target.recoveryPending) {
+    return fail("explicit recovery is already pending", "blocked");
+  }
+  target.queue.push({ ...params });
+  return correctionStatus(params, "delivered");
+}
+
+async function requestRecoveryAuthority(target, correction, stage) {
+  const id = `symphony-recovery-validation-${randomUUID()}`;
+  const response = waitForSymphonyResponse(id, options.requestTimeoutMs);
+  emit({ id, method: "symphony/correction/validate", params: {
+    ...correction, runtime: target.runtime, stage,
+  } });
+  return (await response).result;
+}
+
+function strictRuntime(left, right) {
+  return typeof left?.agent_id === "string" && left.agent_id.length > 0 &&
+    typeof left.conversation_id === "string" && left.conversation_id.length > 0 &&
+    left.agent_id === right?.agent_id && left.conversation_id === right?.conversation_id;
+}
+
+async function validateRecoveryAuthority(target, correction, stage) {
+  if (!target.accepting || !correctionBindingMatches(correction, target.binding)) {
+    throw new Error("recovery owner binding changed");
+  }
+  if (typeof correction.sourceRevision !== "string" || !correction.sourceRevision.trim() ||
+      typeof correction.authorizationId !== "string" || !correction.authorizationId.trim() ||
+      !Number.isSafeInteger(correction.cwdRevision) || correction.cwdRevision < 0 ||
+      !strictRuntime(target.runtime, target.runtime)) {
+    throw new Error("recovery requires source revision, authorization, cwd revision and exact runtime");
+  }
+  const runtime = { ...target.runtime };
+  const authority = await target.validateAuthority(target, correction, stage);
+  if (!target.accepting || !correctionBindingMatches(correction, target.binding) ||
+      !strictRuntime(target.runtime, runtime) || authority?.current !== true ||
+      !correctionBindingMatches(authority, target.binding) ||
+      !strictRuntime(authority.runtime, runtime) ||
+      authority.instructionId !== correction.instructionId || authority.text !== correction.text ||
+      authority.sourceRevision !== correction.sourceRevision ||
+      authority.authorizationId !== correction.authorizationId ||
+      authority.cwdRevision !== correction.cwdRevision) {
+    throw new Error("recovery owner/source revision/authorization is stale or superseded");
+  }
+}
+
+async function inspectRecoveryIdle(target, correction, submit = () => {}) {
+  const runtime = { ...target.runtime };
+  let loop;
+  let device;
+  const detach = target.client.onMessage((message) => {
+    if (!strictRuntime(message.runtime, runtime)) return;
+    if (message.type === "update_loop_status") loop = message.loop_status;
+    if (message.type === "update_device_status") device = message.device_status;
+  });
+  try {
+    const requestId = `symphony-recovery-sync-${randomUUID()}`;
+    const response = await target.client.request("sync", {
+      runtime, request_id: requestId, recover_approvals: false, force_device_status: true,
+    });
+    const assertIdle = () => {
+      if (response?.type !== "sync_response" || response.request_id !== requestId ||
+        response.success !== true || !strictRuntime(response.runtime, runtime) ||
+        !strictRuntime(target.runtime, runtime) ||
+        loop?.status !== "WAITING_ON_INPUT" ||
+        !Array.isArray(loop.executing_tool_call_ids) || loop.executing_tool_call_ids.length !== 0 ||
+        !Array.isArray(loop.active_run_ids) || loop.active_run_ids.length !== 0 ||
+        device?.current_working_directory !== correction.workspacePath ||
+        device.cwd_revision !== correction.cwdRevision ||
+        !Array.isArray(device.background_processes) || device.background_processes.length !== 0) {
+        throw new Error("recovery deferred: fresh safe idle runtime/workspace evidence unavailable");
+      }
+    };
+    assertIdle();
+    return await submit(assertIdle);
+  } finally {
+    detach();
+  }
+}
+
+function drainCorrections(target, usage, submitTurn = submitAndWaitForTurn) {
+  if (target.drainPromise) return target.drainPromise;
+  // Schedule after installing the lock, including when a test submitter resolves synchronously.
+  target.drainPromise = Promise.resolve().then(() => drainCorrectionQueue(target, usage, submitTurn))
+    .finally(() => { target.drainPromise = null; });
+  return target.drainPromise;
+}
+
+async function drainCorrectionQueue(target, usage, submitTurn) {
   while (target.queue.length > 0) {
     const correction = target.queue.shift();
     let executionStarted = false;
@@ -454,25 +578,41 @@ async function drainCorrections(target, usage, submitTurn = submitAndWaitForTurn
       target.emitStatus(correction, "execution_started", { runId });
     };
 
+    let submissionAttempted = false;
     try {
-      const terminal = await submitTurn(
-        target.client,
-        target.runtime,
-        correction.text,
-        target.turnId,
-        usage,
-        {
-          clientMessageId: `symphony-correction-${correction.instructionId}`,
-          onAccepted: (acceptance) => {
-            if (!acceptance.accepted) {
-              throw new Error(acceptance.error || "correction input was rejected");
-            }
+      const submit = () => {
+        submissionAttempted = true;
+        return submitTurn(
+          target.client,
+          target.runtime,
+          correction.text,
+          target.turnId,
+          usage,
+          {
+            clientMessageId: `symphony-correction-${correction.instructionId}`,
+            onAccepted: (acceptance) => {
+              if (!acceptance.accepted) {
+                throw new Error(acceptance.error || "correction input was rejected");
+              }
+            },
+            onExecutionStarted: (runId) => {
+              markExecutionStarted(runId);
+            },
           },
-          onExecutionStarted: (runId) => {
-            markExecutionStarted(runId);
-          },
-        },
-      );
+        );
+      };
+      const terminal = correction.recovery === true
+        ? await inspectRecoveryIdle(target, correction, async (assertIdle) => {
+          await validateRecoveryAuthority(target, correction, "submission");
+          assertIdle();
+          if (!target.phaseActive) throw new Error("owner phase is no longer active");
+          target.recoveryTakenOver = true;
+          target.recoveryInstructionId = correction.instructionId;
+          // Relinquish only the local waiter; never abort a native run or Bash.
+          target.stopPhaseWait?.({ stopReason: "recovery_handoff", text: "" });
+          return submit();
+        })
+        : await submit();
 
       if (
         terminal.stopReason === "input_required" ||
@@ -504,7 +644,7 @@ async function drainCorrections(target, usage, submitTurn = submitAndWaitForTurn
         result: terminal.text || "Completed.",
       });
     } catch (error) {
-      target.emitStatus(correction, "failed", {
+      target.emitStatus(correction, correction.recovery === true && !submissionAttempted ? "blocked" : "failed", {
         error: formatError(error),
       });
       if (error?.correctionOutcomeUnresolved) {
@@ -514,6 +654,8 @@ async function drainCorrections(target, usage, submitTurn = submitAndWaitForTurn
         );
         return { outcomeUnresolved: true };
       }
+    } finally {
+      if (correction.recovery === true) target.recoveryPending = false;
     }
   }
 
@@ -1127,7 +1269,7 @@ async function submitAndWaitForTurn(client, runtime, prompt, turnId, usage, hook
     }
 
     const result = await withTimeout(
-      Promise.race([terminal, client.waitForClose()]),
+      Promise.race([terminal, client.waitForClose(), ...(hooks.localStop ? [hooks.localStop] : [])]),
       options.turnTimeoutMs,
       "Timed out waiting for Letta turn_finished",
     );

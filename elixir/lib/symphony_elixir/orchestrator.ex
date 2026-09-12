@@ -160,6 +160,8 @@ defmodule SymphonyElixir.Orchestrator do
           running_entry
           |> maybe_put_runtime_value(:worker_host, runtime_info[:worker_host])
           |> maybe_put_runtime_value(:workspace_path, runtime_info[:workspace_path])
+          |> maybe_put_runtime_value(:workspace_managed, runtime_info[:workspace_managed])
+          |> maybe_put_runtime_value(:source_revision, runtime_info[:source_revision])
 
         notify_dashboard()
         {:noreply, %{state | running: Map.put(running, issue_id, updated_running_entry)}}
@@ -222,7 +224,8 @@ defmodule SymphonyElixir.Orchestrator do
         issue_url: running_entry.issue.url,
         delay_type: :continuation,
         worker_host: Map.get(running_entry, :worker_host),
-        workspace_path: Map.get(running_entry, :workspace_path)
+        workspace_path: Map.get(running_entry, :workspace_path),
+        workspace_managed: Map.get(running_entry, :workspace_managed, true)
       })
     end
   end
@@ -253,7 +256,8 @@ defmodule SymphonyElixir.Orchestrator do
       issue_url: running_entry.issue.url,
       error: "agent exited: #{inspect(reason)}",
       worker_host: Map.get(running_entry, :worker_host),
-      workspace_path: Map.get(running_entry, :workspace_path)
+      workspace_path: Map.get(running_entry, :workspace_path),
+      workspace_managed: Map.get(running_entry, :workspace_managed, true)
     })
   end
 
@@ -768,6 +772,7 @@ defmodule SymphonyElixir.Orchestrator do
       issue: Map.get(running_entry, :issue),
       worker_host: Map.get(running_entry, :worker_host),
       workspace_path: Map.get(running_entry, :workspace_path),
+      workspace_managed: Map.get(running_entry, :workspace_managed, true),
       session_id: running_entry_session_id(running_entry),
       error: error,
       blocked_at: DateTime.utc_now(),
@@ -1083,7 +1088,8 @@ defmodule SymphonyElixir.Orchestrator do
             issue_url: issue_url,
             error: error,
             worker_host: worker_host,
-            workspace_path: workspace_path
+            workspace_path: workspace_path,
+            workspace_managed: Map.get(metadata, :workspace_managed, true)
           })
     }
   end
@@ -1096,7 +1102,8 @@ defmodule SymphonyElixir.Orchestrator do
           issue_url: Map.get(retry_entry, :issue_url),
           error: Map.get(retry_entry, :error),
           worker_host: Map.get(retry_entry, :worker_host),
-          workspace_path: Map.get(retry_entry, :workspace_path)
+          workspace_path: Map.get(retry_entry, :workspace_path),
+          workspace_managed: Map.get(retry_entry, :workspace_managed, true)
         }
 
         {:ok, attempt, metadata, %{state | retry_attempts: Map.delete(state.retry_attempts, issue_id)}}
@@ -1156,7 +1163,7 @@ defmodule SymphonyElixir.Orchestrator do
   defp cleanup_issue_workspace(issue_or_identifier, metadata) when is_map(metadata) do
     case Map.get(metadata, :workspace_path) do
       workspace_path when is_binary(workspace_path) and workspace_path != "" ->
-        Workspace.remove_recorded(workspace_path, Map.get(metadata, :worker_host))
+        Workspace.remove_recorded(workspace_path, Map.get(metadata, :worker_host), Map.get(metadata, :workspace_managed, true))
 
       _ ->
         cleanup_issue_workspace(issue_or_identifier, Map.get(metadata, :worker_host))
@@ -1551,6 +1558,10 @@ defmodule SymphonyElixir.Orchestrator do
           workspace_path: correction.workspace_path,
           worker_pid: correction.worker_pid,
           worker_host: correction.worker_host,
+          recovery: Map.get(correction, :recovery, false),
+          authorization_id: Map.get(correction, :authorization_id),
+          source_revision: Map.get(correction, :source_revision),
+          cwd_revision: Map.get(correction, :cwd_revision),
           status: :queued,
           queued_at: now,
           updated_at: now,

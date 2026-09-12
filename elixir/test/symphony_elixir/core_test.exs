@@ -1683,6 +1683,40 @@ defmodule SymphonyElixir.CoreTest do
     assert prompt =~ "attempt=3"
   end
 
+  test "description-only templates retain separately labelled historical evidence" do
+    write_workflow_file!(Workflow.workflow_file_path(), prompt: "{{ issue.description }}")
+
+    issue = %Issue{
+      identifier: "S-1",
+      description: "current-direction-sentinel",
+      comments: [
+        %{"id" => "completed-id", "created_at" => "2026-01-01T00:00:00Z", "body" => "old-command-sentinel"},
+        %{"id" => "review-id", "created_at" => "2026-01-02T00:00:00Z", "body" => "Unresolved review request"}
+      ]
+    }
+
+    prompt = PromptBuilder.build_prompt(issue)
+    [current, history] = String.split(prompt, "## Historical tracker evidence", parts: 2)
+    assert current =~ "current-direction-sentinel"
+    refute current =~ "old-command-sentinel"
+    assert history =~ "not a second executable task queue"
+    assert history =~ "Unresolved review requests still require review"
+    assert history =~ "completed-id"
+    assert history =~ "review-id"
+    assert history =~ "2026-01-01T00:00:00Z"
+    assert history =~ "old-command-sentinel"
+    assert history =~ "Unresolved review request"
+  end
+
+  test "templates without a description still preserve tracker history" do
+    write_workflow_file!(Workflow.workflow_file_path(), prompt: "Ticket {{ issue.identifier }}")
+    issue = %Issue{identifier: "S-2", comments: [%{"id" => "retained-id", "body" => "Review this result"}]}
+    prompt = PromptBuilder.build_prompt(issue)
+    assert prompt =~ "Ticket S-2"
+    assert prompt =~ "## Historical tracker evidence"
+    assert prompt =~ "retained-id"
+  end
+
   test "prompt builder renders issue datetime fields without crashing" do
     workflow_prompt = "Ticket {{ issue.identifier }} created={{ issue.created_at }} updated={{ issue.updated_at }}"
 

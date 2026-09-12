@@ -61,39 +61,76 @@ defmodule SymphonyElixirWeb.CorrectionController do
     end
   end
 
-  defp correction_from_params(issue_identifier, %{
-         "instruction_id" => instruction_id,
-         "instruction" => instruction,
-         "target" => %{
-           "issue_id" => issue_id,
-           "session_id" => session_id,
-           "workspace_path" => workspace_path,
-           "worker_pid" => worker_pid,
-           "worker_host" => worker_host
-         }
-       }) do
+  defp correction_from_params(
+         issue_identifier,
+         %{
+           "instruction_id" => instruction_id,
+           "instruction" => instruction,
+           "target" => %{
+             "issue_id" => issue_id,
+             "session_id" => session_id,
+             "workspace_path" => workspace_path,
+             "worker_pid" => worker_pid,
+             "worker_host" => worker_host
+           }
+         } = params
+       ) do
     if valid_identifier?(issue_identifier) and valid_identifier?(instruction_id) and
          valid_identifier?(issue_id) and valid_identifier?(session_id) and
          valid_workspace?(workspace_path) and valid_worker_pid?(worker_pid) and
          valid_worker_host?(worker_host) and
          valid_instruction?(instruction) do
-      {:ok,
-       %{
-         instruction_id: instruction_id,
-         issue_id: issue_id,
-         issue_identifier: issue_identifier,
-         session_id: session_id,
-         workspace_path: workspace_path,
-         worker_pid: worker_pid,
-         worker_host: worker_host,
-         text: instruction
-       }}
+      with {:ok, recovery} <- recovery_from_params(params) do
+        {:ok,
+         Map.merge(
+           %{
+             instruction_id: instruction_id,
+             issue_id: issue_id,
+             issue_identifier: issue_identifier,
+             session_id: session_id,
+             workspace_path: workspace_path,
+             worker_pid: worker_pid,
+             worker_host: worker_host,
+             text: instruction
+           },
+           recovery
+         )}
+      end
     else
       {:error, :invalid_correction}
     end
   end
 
   defp correction_from_params(_issue_identifier, _params), do: {:error, :invalid_correction}
+
+  # This route already requires the manager control credential. Recovery is an
+  # explicit new instruction, not permission to retry a previously queued input.
+  defp recovery_from_params(%{"recovery" => true} = params) do
+    source_revision = Map.get(params, "source_revision")
+    authorization_id = Map.get(params, "authorization_id")
+    cwd_revision = Map.get(params, "cwd_revision")
+
+    if valid_identifier?(source_revision) and valid_identifier?(authorization_id) and
+         is_integer(cwd_revision) and cwd_revision >= 0 and cwd_revision <= 9_007_199_254_740_991 do
+      {:ok,
+       %{
+         recovery: true,
+         source_revision: source_revision,
+         authorization_id: authorization_id,
+         cwd_revision: cwd_revision
+       }}
+    else
+      {:error, :invalid_correction}
+    end
+  end
+
+  defp recovery_from_params(params) do
+    if Map.get(params, "recovery", false) == false do
+      {:ok, %{}}
+    else
+      {:error, :invalid_correction}
+    end
+  end
 
   defp correction_payload(record) do
     %{
@@ -104,6 +141,10 @@ defmodule SymphonyElixirWeb.CorrectionController do
       workspace_path: record.workspace_path,
       worker_pid: record.worker_pid,
       worker_host: record.worker_host,
+      recovery: Map.get(record, :recovery, false),
+      authorization_id: Map.get(record, :authorization_id),
+      source_revision: Map.get(record, :source_revision),
+      cwd_revision: Map.get(record, :cwd_revision),
       status: record.status,
       queued_at: record.queued_at,
       updated_at: record.updated_at,

@@ -517,6 +517,47 @@ defmodule SymphonyElixir.ExtensionsTest do
                       text: "Apply the authorized correction."
                     }}
 
+    recovery = Map.merge(body, %{
+      "instruction_id" => "new-recovery",
+      "recovery" => true,
+      "source_revision" => "source-v2",
+      "authorization_id" => "auth-v2",
+      "cwd_revision" => 4
+    })
+
+    assert %{"error" => %{"code" => "unauthorized"}} =
+             build_conn()
+             |> post("/api/v1/issues/MT-1/corrections", recovery)
+             |> json_response(401)
+
+    build_conn()
+    |> put_req_header("authorization", "Bearer correction-secret")
+    |> post("/api/v1/issues/MT-1/corrections", recovery)
+    |> json_response(202)
+
+    assert_receive {:queued_correction, %{
+      instruction_id: "new-recovery",
+      recovery: true,
+      source_revision: "source-v2",
+      authorization_id: "auth-v2",
+      cwd_revision: 4
+    }}
+
+    for invalid_recovery <- [
+          Map.delete(recovery, "source_revision"),
+          Map.delete(recovery, "authorization_id"),
+          Map.put(recovery, "cwd_revision", -1),
+          Map.put(recovery, "recovery", "true")
+        ] do
+      assert %{"error" => %{"code" => "invalid_correction"}} =
+               build_conn()
+               |> put_req_header("authorization", "Bearer correction-secret")
+               |> post("/api/v1/issues/MT-1/corrections", invalid_recovery)
+               |> json_response(422)
+    end
+
+    refute_receive {:queued_correction, _}
+
     missing_worker_host = update_in(body, ["target"], &Map.delete(&1, "worker_host"))
 
     invalid_conn =

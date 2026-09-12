@@ -310,7 +310,7 @@ defmodule SymphonyElixir.Plane.Client do
         {:ok, issue}
 
       {:ok, comments} ->
-        {:ok, %{issue | comments: comments, description: append_comments(issue.description, comments)}}
+        {:ok, %{issue | comments: comments}}
 
       {:error, reason} ->
         Logger.warning("Plane comment fetch failed issue_id=#{issue_id} reason=#{inspect(reason)}")
@@ -553,28 +553,6 @@ defmodule SymphonyElixir.Plane.Client do
   end
 
   defp normalize_comment(_comment), do: nil
-
-  defp append_comments(description, comments) do
-    comment_text =
-      Enum.map_join(comments, "\n", fn comment ->
-        created_at = Map.get(comment, "created_at", "unknown time")
-        body = Map.get(comment, "body", "")
-        "- #{created_at}: #{body}"
-      end)
-
-    [blank_to_nil(description), "Tracker comments:\n" <> comment_text]
-    |> Enum.reject(&is_nil/1)
-    |> Enum.join("\n\n")
-  end
-
-  defp blank_to_nil(value) when is_binary(value) do
-    case String.trim(value) do
-      "" -> nil
-      trimmed -> trimmed
-    end
-  end
-
-  defp blank_to_nil(_value), do: nil
 
   defp request_with_settings(method, path, params, body, settings, request_fun, allow_not_found) do
     case request_fun.(method, path, params, body, settings) do
