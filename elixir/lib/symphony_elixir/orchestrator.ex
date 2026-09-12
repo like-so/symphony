@@ -158,10 +158,9 @@ defmodule SymphonyElixir.Orchestrator do
       running_entry ->
         updated_running_entry =
           running_entry
-          |> maybe_put_runtime_value(:worker_host, runtime_info[:worker_host])
-          |> maybe_put_runtime_value(:workspace_path, runtime_info[:workspace_path])
           |> maybe_put_runtime_value(:workspace_managed, runtime_info[:workspace_managed])
           |> maybe_put_runtime_value(:source_revision, runtime_info[:source_revision])
+          |> maybe_put_correction_owner_binding(runtime_info)
 
         notify_dashboard()
         {:noreply, %{state | running: Map.put(running, issue_id, updated_running_entry)}}
@@ -1461,6 +1460,21 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp maybe_put_runtime_value(running_entry, key, value) when is_map(running_entry) do
     Map.put(running_entry, key, value)
+  end
+
+  defp maybe_put_correction_owner_binding(
+         %{correction_owner_active: true, codex_app_server_pid: existing} = running_entry,
+         _runtime_info
+       )
+       when not is_nil(existing),
+       do: running_entry
+
+  defp maybe_put_correction_owner_binding(running_entry, runtime_info)
+       when is_map(running_entry) and is_map(runtime_info) do
+    running_entry
+    |> maybe_put_runtime_value(:worker_host, runtime_info[:worker_host])
+    |> maybe_put_runtime_value(:workspace_path, runtime_info[:workspace_path])
+    |> maybe_put_runtime_value(:codex_app_server_pid, runtime_info[:codex_app_server_pid])
   end
 
   defp select_worker_host(%State{} = state, preferred_worker_host) do

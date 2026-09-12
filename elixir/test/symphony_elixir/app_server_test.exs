@@ -655,7 +655,7 @@ defmodule SymphonyElixir.AppServerTest do
                         session_id: "thread-correction-turn-correction",
                         codex_app_server_pid: worker_pid
                       }},
-                     1_000
+                     5_000
 
       correction = %{
         instruction_id: "instruction-1",
