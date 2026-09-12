@@ -1676,6 +1676,109 @@ defmodule SymphonyElixir.CoreTest do
     refute Map.has_key?(updated_state.retry_attempts, issue_id)
   end
 
+  test "letta runtime info binds correction delivery to the active worker process" do
+    issue_id = "issue-letta-binding"
+
+    running_entry = %{
+      pid: self(),
+      identifier: "MT-LETTA-BINDING",
+      session_id: nil,
+      workspace_path: nil,
+      codex_app_server_pid: nil,
+      worker_host: nil,
+      correction_owner_active: false,
+      correction_delivery_supported: false,
+      codex_input_tokens: 0,
+      codex_output_tokens: 0,
+      codex_total_tokens: 0,
+      codex_last_reported_input_tokens: 0,
+      codex_last_reported_output_tokens: 0,
+      codex_last_reported_total_tokens: 0,
+      turn_count: 0
+    }
+
+    state = %Orchestrator.State{
+      running: %{issue_id => running_entry},
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
+    }
+
+    assert {:noreply, bound_state} =
+             Orchestrator.handle_info(
+               {:worker_runtime_info, issue_id,
+                %{
+                  worker_host: nil,
+                  workspace_path: "/workspaces/MT-LETTA-BINDING",
+                  codex_app_server_pid: "4242"
+                }},
+               state
+             )
+
+    assert {:noreply, active_state} =
+             Orchestrator.handle_info(
+               {:codex_worker_update, issue_id,
+                %{
+                  event: :session_started,
+                  timestamp: DateTime.utc_now(),
+                  session_id: "local-letta-turn-9",
+                  correction_delivery_supported: true
+                }},
+               bound_state
+             )
+
+    assert {:noreply, ^active_state} =
+             Orchestrator.handle_info(
+               {:worker_runtime_info, issue_id,
+                %{
+                  worker_host: "stale-worker",
+                  workspace_path: "/workspaces/MT-LETTA-BINDING-STALE",
+                  codex_app_server_pid: "5252"
+                }},
+               active_state
+             )
+
+    correction = %{
+      instruction_id: "correction-letta-binding",
+      issue_id: issue_id,
+      issue_identifier: "MT-LETTA-BINDING",
+      session_id: "local-letta-turn-9",
+      workspace_path: "/workspaces/MT-LETTA-BINDING",
+      worker_pid: "4242",
+      worker_host: nil,
+      text: "Apply the authorized correction."
+    }
+
+    assert {:reply, {:ok, %{status: :queued}}, _queued_state} =
+             Orchestrator.handle_call(
+               {:queue_correction, correction},
+               {self(), make_ref()},
+               active_state
+             )
+
+    assert_receive {:deliver_correction, ^correction}
+
+    stale = %{
+      correction
+      | instruction_id: "correction-letta-stale-session",
+        session_id: "local-letta-turn-old"
+    }
+
+    assert {:reply, {:error, :owner_binding_mismatch}, ^active_state} =
+             Orchestrator.handle_call(
+               {:queue_correction, stale},
+               {self(), make_ref()},
+               active_state
+             )
+
+    mismatched = %{correction | instruction_id: "correction-letta-stale", worker_pid: "5252"}
+
+    assert {:reply, {:error, :owner_binding_mismatch}, ^active_state} =
+             Orchestrator.handle_call(
+               {:queue_correction, mismatched},
+               {self(), make_ref()},
+               active_state
+             )
+  end
+
   test "correction submission waits for the orchestrator's authoritative receipt" do
     server =
       spawn(fn ->
@@ -2412,15 +2515,32 @@ defmodule SymphonyElixir.CoreTest do
                  issue_state_fetcher: fn [_issue_id] -> {:ok, [%{issue | state: "Done"}]} end
                )
 
-      assert_receive {:codex_worker_update, "issue-live-updates",
-                      %{
-                        event: :session_started,
-                        timestamp: %DateTime{},
-                        session_id: session_id
-                      }},
-                     500
+      assert_receive initial_message, 500
+      assert {:worker_runtime_info, "issue-live-updates", initial_runtime_info} = initial_message
+      refute Map.has_key?(initial_runtime_info, :codex_app_server_pid)
+
+      assert_receive binding_message, 500
+
+      assert {:worker_runtime_info, "issue-live-updates",
+              %{
+                codex_app_server_pid: runtime_worker_pid,
+                worker_host: nil
+              }} = binding_message
+
+      assert_receive session_message, 500
+
+      assert {:codex_worker_update, "issue-live-updates",
+              %{
+                event: :session_started,
+                timestamp: %DateTime{},
+                session_id: session_id,
+                codex_app_server_pid: session_worker_pid
+              }} = session_message
 
       assert session_id == "thread-live-turn-live"
+      assert is_binary(runtime_worker_pid)
+      assert runtime_worker_pid != ""
+      assert runtime_worker_pid == session_worker_pid
     after
       File.rm_rf(test_root)
     end

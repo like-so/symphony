@@ -80,15 +80,18 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp send_worker_runtime_info(recipient, %Issue{id: issue_id}, worker_host, context)
        when is_binary(issue_id) and is_pid(recipient) and is_map(context) do
+    runtime_info =
+      %{
+        worker_host: worker_host,
+        workspace_path: context.workspace_path,
+        workspace_managed: context.managed,
+        source_revision: context.source_revision
+      }
+      |> Map.merge(Map.take(context, [:codex_app_server_pid]))
+
     send(
       recipient,
-      {:worker_runtime_info, issue_id,
-       %{
-         worker_host: worker_host,
-         workspace_path: context.workspace_path,
-         workspace_managed: context.managed,
-         source_revision: context.source_revision
-       }}
+      {:worker_runtime_info, issue_id, runtime_info}
     )
 
     :ok
@@ -102,8 +105,14 @@ defmodule SymphonyElixir.AgentRunner do
 
     with {:ok, context} <- Workspace.context_for_issue(issue, worker_host),
          true <- context.workspace_path == workspace,
-         :ok <- send_worker_runtime_info(codex_update_recipient, issue, worker_host, context),
-         {:ok, session} <- AppServer.start_session(workspace, worker_host: worker_host, workspace_root: Map.get(context, :root)) do
+         {:ok, session} <- AppServer.start_session(workspace, worker_host: worker_host, workspace_root: Map.get(context, :root)),
+         :ok <-
+           send_worker_runtime_info(
+             codex_update_recipient,
+             issue,
+             worker_host,
+             Map.put(context, :codex_app_server_pid, session.metadata[:codex_app_server_pid])
+           ) do
       opts = Keyword.put(opts, :workspace_context, context)
 
       try do
