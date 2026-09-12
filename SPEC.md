@@ -275,6 +275,8 @@ Fields:
 - `attempt` (integer, 1-based for retry queue)
 - `due_at_ms` (monotonic clock timestamp)
 - `timer_handle` (runtime-specific timer reference)
+- `retry_token` (runtime-specific identity used to reject stale timer messages)
+- `delay_type` (`continuation`, `capacity`, or null for failure backoff)
 - `error` (string or null)
 
 #### 4.1.8 Orchestrator Runtime State
@@ -725,7 +727,8 @@ Distinct terminal reasons are important because retry logic and logs differ.
 ### 7.4 Idempotency and Recovery Rules
 
 - The orchestrator serializes state mutations through one authority to avoid duplicate dispatch.
-- `claimed` and `running` checks are REQUIRED before launching any worker.
+- Before launching a worker, the issue MUST NOT be running and MUST either be unclaimed or own the
+  validated capacity-only retry entry being admitted.
 - Reconciliation runs before dispatch on every tick.
 - Restart recovery is tracker-driven and filesystem-driven (without a durable orchestrator DB).
 - Startup terminal cleanup removes stale workspaces for issues already in terminal states.
@@ -760,7 +763,7 @@ An issue is dispatch-eligible only if all are true:
 - Its adapter-provided `dispatchable` value is `true`.
 - It contains every label in `tracker.required_labels`.
 - It is not already in `running`.
-- It is not already in `claimed`.
+- It is not already in `claimed`, unless it is claimed and has a capacity-only retry entry.
 - Global concurrency slots are available.
 - Per-state concurrency slots are available.
 
@@ -792,23 +795,32 @@ The runtime counts issues by their current tracked state in the `running` map.
 Retry entry creation:
 
 - Cancel any existing retry timer for the same issue.
-- Store `attempt`, `identifier`, `error`, `due_at_ms`, and new timer handle.
+- Store `attempt`, `identifier`, `error`, `delay_type`, `due_at_ms`, a new timer handle, and a new
+  retry token.
 
 Backoff formula:
 
 - Normal continuation retries after a clean worker exit use a short fixed delay of `1000` ms.
+- Capacity-only waits use the same short fixed delay without incrementing the failure attempt.
 - Failure-driven retries use `delay = min(10000 * 2^(attempt - 1), agent.max_retry_backoff_ms)`.
 - Power is capped by the configured max retry backoff (default `300000` / 5m).
 
-Retry handling behavior:
+Ordinary retry handling behavior:
 
 1. Refresh the specific issue with `fetch_issues_by_ids([issue_id])`.
 2. If not found, release claim.
 3. If found in a terminal state, clean its workspace and release claim.
 4. If found and still active and routable:
    - Dispatch if slots are available.
-   - Otherwise requeue with error `no available orchestrator slots`.
+   - Otherwise requeue with error `no available orchestrator slots` without incrementing the
+     failure attempt.
 5. If found but no longer active or routable, release claim without dispatch.
+
+Capacity-only retry entries participate in the normal sorted candidate poll. When their timer fires,
+the orchestrator revalidates the issue, preserves the attempt, reschedules the capacity wait, and
+requests an immediate poll. Successful dispatch consumes the retry entry, so stale timer messages
+cannot create another owner. Refresh or transport failures clear `delay_type`, increment the
+attempt, and resume failure backoff.
 
 Note:
 
@@ -1866,7 +1878,11 @@ on_tick(state):
       break
 
     if should_dispatch(issue, state):
-      state = dispatch_issue(issue, state, attempt=null)
+      retry_entry = state.retry_attempts.get(issue.id)
+      attempt = null
+      if retry_entry and retry_entry.delay_type == capacity:
+        attempt = retry_entry.attempt
+      state = dispatch_issue(issue, state, attempt=attempt)
 
   notify_observers()
   schedule_tick(state.poll_interval_ms)
@@ -1938,6 +1954,7 @@ function dispatch_issue(issue, state, attempt):
   }
 
   state.claimed.add(issue.id)
+  # Removing the entry makes any already-queued timer token stale.
   state.retry_attempts.remove(issue.id)
   return state
 ```
@@ -2029,16 +2046,43 @@ on_worker_exit(issue_id, reason, state):
 ```
 
 ```text
-on_retry_timer(issue_id, state):
-  retry_entry = state.retry_attempts.pop(issue_id)
-  if missing:
+on_retry_timer(issue_id, retry_token, state):
+  retry_entry = state.retry_attempts.get(issue_id)
+  if missing or retry_entry.retry_token != retry_token:
     return state
+
+  if retry_entry.delay_type == capacity:
+    refreshed = tracker.fetch_issues_by_ids([issue_id])
+    if fetch failed:
+      return schedule_retry(state, issue_id, retry_entry.attempt + 1, {
+        identifier: retry_entry.identifier,
+        error: "retry refresh failed",
+        delay_type: null
+      })
+
+    issue = find_by_id(refreshed, issue_id)
+    if issue is null or not retry_dispatch_allowed(issue, state, ignore_existing_claim=issue_id):
+      clean_terminal_workspace_if_needed(issue, retry_entry)
+      state.claimed.remove(issue_id)
+      state.retry_attempts.remove(issue_id)
+      return state
+
+    state = schedule_retry(state, issue_id, retry_entry.attempt, {
+      identifier: issue.identifier,
+      error: "no available orchestrator slots",
+      delay_type: capacity
+    })
+    request_immediate_poll(state)
+    return state
+
+  retry_entry = state.retry_attempts.pop(issue_id)
 
   refreshed = tracker.fetch_issues_by_ids([issue_id])
   if fetch failed:
     return schedule_retry(state, issue_id, retry_entry.attempt + 1, {
       identifier: retry_entry.identifier,
-      error: "retry refresh failed"
+      error: "retry refresh failed",
+      delay_type: null
     })
 
   issue = find_by_id(refreshed, issue_id)
@@ -2051,9 +2095,10 @@ on_retry_timer(issue_id, state):
     return state
 
   if no_available_slots(state):
-    return schedule_retry(state, issue_id, retry_entry.attempt + 1, {
+    return schedule_retry(state, issue_id, retry_entry.attempt, {
       identifier: issue.identifier,
-      error: "no available orchestrator slots"
+      error: "no available orchestrator slots",
+      delay_type: capacity
     })
 
   return dispatch_issue(issue, state, attempt=retry_entry.attempt)
