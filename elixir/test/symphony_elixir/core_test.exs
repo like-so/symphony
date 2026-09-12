@@ -1350,6 +1350,332 @@ defmodule SymphonyElixir.CoreTest do
              )
   end
 
+  test "capacity-only urgent waiter admission before lower-priority candidate" do
+    suffix = System.unique_integer([:positive])
+    test_root = Path.join(System.tmp_dir!(), "symphony-capacity-admission-#{suffix}")
+    task_supervisor_name = Module.concat(__MODULE__, "CapacityTaskSupervisor#{suffix}")
+    orchestrator_name = Module.concat(__MODULE__, "CapacityOrchestrator#{suffix}")
+    previous_memory_issues = Application.get_env(:symphony_elixir, :memory_tracker_issues)
+
+    urgent_issue = %Issue{
+      id: "issue-urgent-capacity-#{suffix}",
+      identifier: "MT-URGENT-#{suffix}",
+      title: "Urgent capacity waiter",
+      state: "In Progress",
+      priority: 1,
+      created_at: ~U[2026-01-01 00:00:00Z],
+      dispatchable: true
+    }
+
+    same_priority_issue = %Issue{
+      id: "issue-same-priority-#{suffix}",
+      identifier: "MT-SAME-#{suffix}",
+      title: "Same priority candidate",
+      state: "Todo",
+      priority: 1,
+      created_at: ~U[2026-01-02 00:00:00Z],
+      dispatchable: true
+    }
+
+    lower_priority_issue = %Issue{
+      id: "issue-lower-priority-#{suffix}",
+      identifier: "MT-LOWER-#{suffix}",
+      title: "Lower priority candidate",
+      state: "Todo",
+      priority: 2,
+      created_at: ~U[2026-01-01 00:00:00Z],
+      dispatchable: true
+    }
+
+    lower_priority_waiter = %Issue{
+      id: "issue-lower-waiter-#{suffix}",
+      identifier: "MT-LOWER-WAITER-#{suffix}",
+      title: "Lower priority capacity waiter",
+      state: "In Progress",
+      priority: 4,
+      created_at: ~U[2025-12-01 00:00:00Z],
+      dispatchable: true
+    }
+
+    occupied_issue_id = "issue-occupied-#{suffix}"
+    retry_token = make_ref()
+    lower_retry_token = make_ref()
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      workspace_root: test_root,
+      poll_interval_ms: 30_000,
+      max_concurrent_agents: 1,
+      hook_before_run: "sleep 60",
+      hook_timeout_ms: 60_000
+    )
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [])
+    {:ok, task_supervisor_pid} = Task.Supervisor.start_link(name: task_supervisor_name)
+    Process.unlink(task_supervisor_pid)
+
+    {:ok, pid} =
+      Orchestrator.start_link(
+        name: orchestrator_name,
+        task_supervisor: task_supervisor_name
+      )
+
+    Process.unlink(pid)
+
+    on_exit(fn ->
+      restore_app_env(:memory_tracker_issues, previous_memory_issues)
+
+      if Process.alive?(pid), do: GenServer.stop(pid)
+      if Process.alive?(task_supervisor_pid), do: GenServer.stop(task_supervisor_pid)
+
+      File.rm_rf(test_root)
+    end)
+
+    assert eventually_value(fn ->
+             state = :sys.get_state(pid)
+             if state.poll_check_in_progress == false, do: state
+           end)
+
+    initial_state = :sys.get_state(pid)
+
+    :sys.replace_state(pid, fn _ ->
+      %{
+        initial_state
+        | running: %{
+            occupied_issue_id => %{
+              pid: self(),
+              ref: make_ref(),
+              identifier: "MT-OCCUPIED-#{suffix}",
+              issue: %Issue{
+                id: occupied_issue_id,
+                identifier: "MT-OCCUPIED-#{suffix}",
+                state: "In Progress"
+              },
+              started_at: DateTime.utc_now()
+            }
+          },
+          claimed: MapSet.new([occupied_issue_id, urgent_issue.id, lower_priority_waiter.id]),
+          retry_attempts: %{
+            urgent_issue.id => %{
+              attempt: 37,
+              timer_ref: nil,
+              retry_token: retry_token,
+              due_at_ms: System.monotonic_time(:millisecond) + 300_000,
+              identifier: urgent_issue.identifier,
+              error: "no available orchestrator slots",
+              delay_type: :capacity
+            },
+            lower_priority_waiter.id => %{
+              attempt: 5,
+              timer_ref: nil,
+              retry_token: lower_retry_token,
+              due_at_ms: System.monotonic_time(:millisecond),
+              identifier: lower_priority_waiter.identifier,
+              error: "no available orchestrator slots",
+              delay_type: :capacity
+            }
+          }
+      }
+    end)
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [
+      lower_priority_issue,
+      same_priority_issue,
+      lower_priority_waiter,
+      urgent_issue
+    ])
+
+    :sys.replace_state(pid, fn state ->
+      %{
+        state
+        | running: Map.delete(state.running, occupied_issue_id),
+          claimed: MapSet.delete(state.claimed, occupied_issue_id)
+      }
+    end)
+
+    send(pid, {:retry_issue, lower_priority_waiter.id, lower_retry_token})
+    assert %{queued: true} = Orchestrator.request_refresh(orchestrator_name)
+
+    admitted_state =
+      eventually_value(fn ->
+        state = :sys.get_state(pid)
+        if Map.has_key?(state.running, urgent_issue.id), do: state
+      end)
+
+    assert %{retry_attempt: 37} = admitted_state.running[urgent_issue.id]
+    refute Map.has_key?(admitted_state.running, same_priority_issue.id)
+    refute Map.has_key?(admitted_state.running, lower_priority_issue.id)
+    refute Map.has_key?(admitted_state.running, lower_priority_waiter.id)
+    refute Map.has_key?(admitted_state.retry_attempts, urgent_issue.id)
+
+    assert %{attempt: 5, delay_type: :capacity} =
+             admitted_state.retry_attempts[lower_priority_waiter.id]
+
+    assert map_size(admitted_state.running) == 1
+
+    owner_pid = admitted_state.running[urgent_issue.id].pid
+    send(pid, {:retry_issue, urgent_issue.id, retry_token})
+    Process.sleep(50)
+
+    stale_timer_state = :sys.get_state(pid)
+    assert stale_timer_state.running[urgent_issue.id].pid == owner_pid
+    assert stale_timer_state.running[urgent_issue.id].retry_attempt == 37
+    assert map_size(stale_timer_state.running) == 1
+
+    current_lower_retry_token = stale_timer_state.retry_attempts[lower_priority_waiter.id].retry_token
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [urgent_issue])
+    send(pid, {:retry_issue, lower_priority_waiter.id, current_lower_retry_token})
+
+    assert eventually_value(fn ->
+             state = :sys.get_state(pid)
+
+             if !MapSet.member?(state.claimed, lower_priority_waiter.id) and
+                  !Map.has_key?(state.retry_attempts, lower_priority_waiter.id),
+                do: state
+           end)
+  end
+
+  test "repeated capacity-only waits preserve the failure attempt" do
+    issue_id = "issue-capacity-wait"
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-CAPACITY",
+      title: "Capacity waiter",
+      state: "In Progress",
+      dispatchable: true
+    }
+
+    occupied_issue = %Issue{
+      id: "issue-occupied",
+      identifier: "MT-OCCUPIED",
+      title: "Occupied slot",
+      state: "In Progress"
+    }
+
+    state = %Orchestrator.State{
+      max_concurrent_agents: 1,
+      running: %{
+        occupied_issue.id => %{
+          pid: self(),
+          ref: make_ref(),
+          identifier: occupied_issue.identifier,
+          issue: occupied_issue,
+          started_at: DateTime.utc_now()
+        }
+      },
+      claimed: MapSet.new([occupied_issue.id, issue_id]),
+      retry_attempts: %{}
+    }
+
+    first_wait =
+      Orchestrator.handle_retry_issue_lookup_for_test(issue, state, issue_id, 37, %{
+        identifier: issue.identifier,
+        error: "no available orchestrator slots",
+        delay_type: :capacity
+      })
+
+    assert %{attempt: 37, delay_type: :capacity} = first_wait.retry_attempts[issue_id]
+
+    second_wait =
+      Orchestrator.handle_retry_issue_lookup_for_test(issue, first_wait, issue_id, 37, %{
+        identifier: issue.identifier,
+        error: "no available orchestrator slots",
+        delay_type: :capacity
+      })
+
+    assert %{attempt: 37, delay_type: :capacity, timer_ref: timer_ref} =
+             second_wait.retry_attempts[issue_id]
+
+    assert Process.cancel_timer(timer_ref) > 0
+  end
+
+  test "capacity waiter tracker failures resume failure backoff" do
+    issue_id = "issue-capacity-refresh-failure"
+    now_ms = System.monotonic_time(:millisecond)
+
+    retry_entry = %{
+      attempt: 2,
+      timer_ref: nil,
+      retry_token: make_ref(),
+      due_at_ms: now_ms,
+      identifier: "MT-CAPACITY-FAILURE",
+      error: "no available orchestrator slots",
+      delay_type: :capacity
+    }
+
+    state = %Orchestrator.State{
+      claimed: MapSet.new([issue_id]),
+      retry_attempts: %{issue_id => retry_entry}
+    }
+
+    updated_state =
+      Orchestrator.handle_capacity_retry_result_for_test(
+        state,
+        issue_id,
+        retry_entry,
+        {:error, :timeout}
+      )
+
+    assert %{
+             attempt: 3,
+             delay_type: nil,
+             error: "retry poll failed: :timeout",
+             due_at_ms: due_at_ms,
+             timer_ref: timer_ref
+           } = updated_state.retry_attempts[issue_id]
+
+    assert (due_at_ms - now_ms) in 40_000..40_500
+    assert Process.cancel_timer(timer_ref) > 0
+  end
+
+  test "capacity retry timer cleans a terminal issue workspace" do
+    suffix = System.unique_integer([:positive])
+    issue_id = "issue-capacity-terminal-#{suffix}"
+    workspace_path = Path.join(System.tmp_dir!(), "symphony-capacity-terminal-#{suffix}")
+    File.mkdir_p!(workspace_path)
+    File.write!(Path.join(workspace_path, "sentinel"), "retained until cleanup")
+
+    on_exit(fn -> File.rm_rf(workspace_path) end)
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-CAPACITY-TERMINAL-#{suffix}",
+      title: "Terminal capacity waiter",
+      state: "Done",
+      dispatchable: true
+    }
+
+    retry_entry = %{
+      attempt: 37,
+      timer_ref: nil,
+      retry_token: make_ref(),
+      due_at_ms: System.monotonic_time(:millisecond),
+      identifier: issue.identifier,
+      workspace_path: workspace_path,
+      workspace_managed: true,
+      error: "no available orchestrator slots",
+      delay_type: :capacity
+    }
+
+    state = %Orchestrator.State{
+      claimed: MapSet.new([issue_id]),
+      retry_attempts: %{issue_id => retry_entry}
+    }
+
+    updated_state =
+      Orchestrator.handle_capacity_retry_result_for_test(
+        state,
+        issue_id,
+        retry_entry,
+        {:ok, [issue]}
+      )
+
+    refute File.exists?(workspace_path)
+    refute MapSet.member?(updated_state.claimed, issue_id)
+    refute Map.has_key?(updated_state.retry_attempts, issue_id)
+  end
+
   test "correction submission waits for the orchestrator's authoritative receipt" do
     server =
       spawn(fn ->

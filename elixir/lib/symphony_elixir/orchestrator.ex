@@ -195,9 +195,15 @@ defmodule SymphonyElixir.Orchestrator do
 
   def handle_info({:retry_issue, issue_id, retry_token}, state) do
     result =
-      case pop_retry_attempt_state(state, issue_id, retry_token) do
-        {:ok, attempt, metadata, state} -> handle_retry_issue(state, issue_id, attempt, metadata)
-        :missing -> {:noreply, state}
+      case capacity_waiting_retry(state, issue_id) do
+        {:ok, %{retry_token: ^retry_token} = retry_entry} ->
+          handle_capacity_retry_timer(state, issue_id, retry_entry)
+
+        _ ->
+          case pop_retry_attempt_state(state, issue_id, retry_token) do
+            {:ok, attempt, metadata, state} -> handle_retry_issue(state, issue_id, attempt, metadata)
+            :missing -> {:noreply, state}
+          end
       end
 
     notify_dashboard()
@@ -386,6 +392,14 @@ defmodule SymphonyElixir.Orchestrator do
   def handle_retry_issue_lookup_for_test(%Issue{} = issue, %State{} = state, issue_id, attempt, metadata)
       when is_binary(issue_id) and is_integer(attempt) and attempt >= 0 and is_map(metadata) do
     {:noreply, updated_state} = handle_retry_issue_lookup(issue, state, issue_id, attempt, metadata)
+    updated_state
+  end
+
+  @doc false
+  @spec handle_capacity_retry_result_for_test(term(), String.t(), map(), term()) :: term()
+  def handle_capacity_retry_result_for_test(%State{} = state, issue_id, retry_entry, result)
+      when is_binary(issue_id) and is_map(retry_entry) do
+    {:noreply, updated_state} = handle_capacity_retry_result(state, issue_id, retry_entry, result)
     updated_state
   end
 
@@ -832,7 +846,7 @@ defmodule SymphonyElixir.Orchestrator do
          terminal_states
        ) do
     candidate_issue?(issue, active_states, terminal_states) and
-      !MapSet.member?(claimed, issue.id) and
+      (!MapSet.member?(claimed, issue.id) or capacity_waiting_retry?(state, issue.id)) and
       !Map.has_key?(running, issue.id) and
       !Map.has_key?(blocked, issue.id) and
       available_slots(state) > 0 and
@@ -917,6 +931,16 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp dispatch_issue(%State{} = state, issue, attempt \\ nil, preferred_worker_host \\ nil) do
+    case capacity_waiting_retry(state, issue.id) do
+      {:ok, retry_entry} ->
+        dispatch_capacity_waiter(state, issue, retry_entry)
+
+      :missing ->
+        dispatch_unclaimed_issue(state, issue, attempt, preferred_worker_host)
+    end
+  end
+
+  defp dispatch_unclaimed_issue(state, issue, attempt, preferred_worker_host) do
     case refresh_issue_for_dispatch(issue) do
       {:ok, %Issue{} = refreshed_issue} ->
         case Tracker.claim_issue(refreshed_issue) do
@@ -933,6 +957,60 @@ defmodule SymphonyElixir.Orchestrator do
 
       {:error, _reason} ->
         state
+    end
+  end
+
+  defp dispatch_capacity_waiter(state, issue, retry_entry) do
+    case refresh_issue_for_dispatch(issue) do
+      {:ok, %Issue{} = refreshed_issue} ->
+        if dispatch_slots_available?(refreshed_issue, state) and
+             worker_slots_available?(state, Map.get(retry_entry, :worker_host)) do
+          do_dispatch_issue(
+            state,
+            refreshed_issue,
+            retry_entry.attempt,
+            Map.get(retry_entry, :worker_host)
+          )
+        else
+          schedule_issue_retry(
+            state,
+            issue.id,
+            retry_entry.attempt,
+            retry_entry
+            |> retry_metadata()
+            |> Map.merge(%{
+              identifier: refreshed_issue.identifier,
+              error: "no available orchestrator slots",
+              delay_type: :capacity
+            })
+          )
+        end
+
+      {:skip, :missing} ->
+        release_issue_claim(state, issue.id)
+
+      {:skip, %Issue{} = refreshed_issue} ->
+        {:noreply, updated_state} =
+          handle_retry_issue_lookup(
+            refreshed_issue,
+            state,
+            issue.id,
+            retry_entry.attempt,
+            retry_metadata(retry_entry)
+          )
+
+        updated_state
+
+      {:error, reason} ->
+        schedule_issue_retry(
+          state,
+          issue.id,
+          retry_entry.attempt + 1,
+          retry_entry
+          |> retry_metadata()
+          |> Map.delete(:delay_type)
+          |> Map.put(:error, "retry dispatch refresh failed: #{inspect(reason)}")
+        )
     end
   end
 
@@ -1089,7 +1167,8 @@ defmodule SymphonyElixir.Orchestrator do
             error: error,
             worker_host: worker_host,
             workspace_path: workspace_path,
-            workspace_managed: Map.get(metadata, :workspace_managed, true)
+            workspace_managed: Map.get(metadata, :workspace_managed, true),
+            delay_type: Map.get(metadata, :delay_type)
           })
     }
   end
@@ -1097,14 +1176,7 @@ defmodule SymphonyElixir.Orchestrator do
   defp pop_retry_attempt_state(%State{} = state, issue_id, retry_token) when is_reference(retry_token) do
     case Map.get(state.retry_attempts, issue_id) do
       %{attempt: attempt, retry_token: ^retry_token} = retry_entry ->
-        metadata = %{
-          identifier: Map.get(retry_entry, :identifier),
-          issue_url: Map.get(retry_entry, :issue_url),
-          error: Map.get(retry_entry, :error),
-          worker_host: Map.get(retry_entry, :worker_host),
-          workspace_path: Map.get(retry_entry, :workspace_path),
-          workspace_managed: Map.get(retry_entry, :workspace_managed, true)
-        }
+        metadata = retry_metadata(retry_entry)
 
         {:ok, attempt, metadata, %{state | retry_attempts: Map.delete(state.retry_attempts, issue_id)}}
 
@@ -1128,7 +1200,62 @@ defmodule SymphonyElixir.Orchestrator do
            state,
            issue_id,
            attempt + 1,
-           Map.merge(metadata, %{error: "retry poll failed: #{inspect(reason)}"})
+           metadata
+           |> Map.delete(:delay_type)
+           |> Map.put(:error, "retry poll failed: #{inspect(reason)}")
+         )}
+    end
+  end
+
+  defp handle_capacity_retry_timer(%State{} = state, issue_id, retry_entry) do
+    handle_capacity_retry_result(
+      state,
+      issue_id,
+      retry_entry,
+      Tracker.fetch_issues_by_ids([issue_id])
+    )
+  end
+
+  defp handle_capacity_retry_result(state, issue_id, retry_entry, result) do
+    case result do
+      {:ok, issues} ->
+        case find_issue_by_id(issues, issue_id) do
+          %Issue{} = issue ->
+            if retry_candidate_issue?(issue, terminal_state_set()) do
+              state =
+                state
+                |> schedule_issue_retry(
+                  issue_id,
+                  retry_entry.attempt,
+                  retry_metadata(retry_entry)
+                )
+                |> request_poll()
+
+              {:noreply, state}
+            else
+              handle_retry_issue_lookup(
+                issue,
+                state,
+                issue_id,
+                retry_entry.attempt,
+                retry_metadata(retry_entry)
+              )
+            end
+
+          nil ->
+            {:noreply, release_issue_claim(state, issue_id)}
+        end
+
+      {:error, reason} ->
+        {:noreply,
+         schedule_issue_retry(
+           state,
+           issue_id,
+           retry_entry.attempt + 1,
+           retry_entry
+           |> retry_metadata()
+           |> Map.delete(:delay_type)
+           |> Map.put(:error, "retry poll failed: #{inspect(reason)}")
          )}
     end
   end
@@ -1221,23 +1348,26 @@ defmodule SymphonyElixir.Orchestrator do
              state,
              issue.id,
              attempt + 1,
-             Map.merge(metadata, %{
+             metadata
+             |> Map.delete(:delay_type)
+             |> Map.merge(%{
                identifier: issue.identifier,
                error: "retry dispatch refresh failed: #{inspect(reason)}"
              })
            )}
       end
     else
-      Logger.debug("No available slots for retrying #{issue_context(issue)}; retrying again")
+      Logger.debug("No available slots for retrying #{issue_context(issue)}; capacity wait scheduled")
 
       {:noreply,
        schedule_issue_retry(
          state,
          issue.id,
-         attempt + 1,
+         attempt,
          Map.merge(metadata, %{
            identifier: issue.identifier,
-           error: "no available orchestrator slots"
+           error: "no available orchestrator slots",
+           delay_type: :capacity
          })
        )}
     end
@@ -1253,11 +1383,43 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp retry_delay(attempt, metadata) when is_integer(attempt) and attempt > 0 and is_map(metadata) do
-    if metadata[:delay_type] == :continuation and attempt == 1 do
+    if metadata[:delay_type] == :capacity or
+         (metadata[:delay_type] == :continuation and attempt == 1) do
       @continuation_retry_delay_ms
     else
       failure_retry_delay(attempt)
     end
+  end
+
+  defp capacity_waiting_retry?(%State{} = state, issue_id) do
+    match?({:ok, _retry_entry}, capacity_waiting_retry(state, issue_id))
+  end
+
+  defp capacity_waiting_retry(%State{} = state, issue_id) do
+    if MapSet.member?(state.claimed, issue_id) do
+      case Map.get(state.retry_attempts, issue_id) do
+        %{attempt: attempt, delay_type: :capacity} = retry_entry
+        when is_integer(attempt) and attempt > 0 ->
+          {:ok, retry_entry}
+
+        _ ->
+          :missing
+      end
+    else
+      :missing
+    end
+  end
+
+  defp retry_metadata(retry_entry) do
+    %{
+      identifier: Map.get(retry_entry, :identifier),
+      issue_url: Map.get(retry_entry, :issue_url),
+      error: Map.get(retry_entry, :error),
+      worker_host: Map.get(retry_entry, :worker_host),
+      workspace_path: Map.get(retry_entry, :workspace_path),
+      workspace_managed: Map.get(retry_entry, :workspace_managed, true),
+      delay_type: Map.get(retry_entry, :delay_type)
+    }
   end
 
   defp failure_retry_delay(attempt) do
@@ -1895,6 +2057,17 @@ defmodule SymphonyElixir.Orchestrator do
         tick_token: tick_token,
         next_poll_due_at_ms: System.monotonic_time(:millisecond) + delay_ms
     }
+  end
+
+  defp request_poll(%State{} = state) do
+    now_ms = System.monotonic_time(:millisecond)
+    already_due? = is_integer(state.next_poll_due_at_ms) and state.next_poll_due_at_ms <= now_ms
+
+    if state.poll_check_in_progress == true or already_due? do
+      state
+    else
+      schedule_tick(state, 0)
+    end
   end
 
   defp schedule_poll_cycle_start do
