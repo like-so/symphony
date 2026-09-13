@@ -21,7 +21,13 @@ class AppServerProcessManager {
     this.shuttingDown = false;
   }
 
-  async start({ lettaBin, backend, listenUrl, startTimeoutMs }) {
+  async start({
+    lettaBin,
+    backend,
+    listenUrl,
+    startTimeoutMs,
+    startMaxTimeoutMs,
+  }) {
     if (this.shuttingDown)
       throw new Error(
         "Bridge is shutting down; refusing to start a local App Server",
@@ -37,7 +43,11 @@ class AppServerProcessManager {
     });
 
     try {
-      const url = await waitForListeningUrl(child, startTimeoutMs);
+      const url = await waitForListeningUrl(
+        child,
+        startTimeoutMs,
+        startMaxTimeoutMs,
+      );
       return { url, child };
     } catch (error) {
       await this.stop(child);
@@ -199,8 +209,10 @@ export const bridgeTestHooks = {
   correctionRunIdForMessage,
   correctionStatus,
   drainCorrections,
+  isTurnActivityMessage,
   queueDispositionForMessage,
   resolveAppServer,
+  serverStartMaxTimeout,
   submitAndWaitForTurn,
   submitWorkflowPhase,
 };
@@ -998,6 +1010,7 @@ async function submitAndWaitForTurn(client, runtime, prompt, turnId, usage, hook
   let inputSubmissionAttempted = false;
   let terminalOutcomeObserved = false;
   let observedTerminal = null;
+  let refreshTurnTimeout = () => {};
   addTokenUsage(usage, { input: estimateTokens(prompt) });
   emitTokenUsage(usage, turnId);
 
@@ -1064,6 +1077,16 @@ async function submitAndWaitForTurn(client, runtime, prompt, turnId, usage, hook
       ) {
         executionReported = true;
         if (hooks.onExecutionStarted) hooks.onExecutionStarted(correctionRunId);
+      }
+
+      if (
+        isTurnActivityMessage(message, {
+          clientMessageId: hooks.clientMessageId,
+          correctionRunId,
+          runIdsByToolCallId,
+        })
+      ) {
+        refreshTurnTimeout();
       }
 
       if (
@@ -1268,10 +1291,13 @@ async function submitAndWaitForTurn(client, runtime, prompt, turnId, usage, hook
       }
     }
 
-    const result = await withTimeout(
+    const result = await withActivityTimeout(
       Promise.race([terminal, client.waitForClose(), ...(hooks.localStop ? [hooks.localStop] : [])]),
-      options.turnTimeoutMs,
+      hooks.turnTimeoutMs ?? options.turnTimeoutMs,
       "Timed out waiting for Letta turn_finished",
+      (refresh) => {
+        refreshTurnTimeout = refresh;
+      },
     );
     terminalOutcomeObserved = true;
 
@@ -1301,6 +1327,54 @@ async function submitAndWaitForTurn(client, runtime, prompt, turnId, usage, hook
   } finally {
     detach();
   }
+}
+
+function isTurnActivityMessage(
+  message,
+  { clientMessageId, correctionRunId, runIdsByToolCallId },
+) {
+  if (!clientMessageId) {
+    return (
+      message?.type === "stream_delta" ||
+      message?.type === "external_tool_call_request" ||
+      message?.type === "control_request" ||
+      message?.type === "turn_finished" ||
+      (message?.type === "update_loop_status" &&
+        message.loop_status?.active_run_ids?.length > 0) ||
+      (message?.type === "update_queue" && message.removed?.length > 0)
+    );
+  }
+
+  if (message?.type === "update_loop_status") {
+    const activeRunIds = message.loop_status?.active_run_ids;
+    const clientMessageIds =
+      message.loop_status?.client_message_ids_by_run_id?.[correctionRunId];
+    return (
+      Array.isArray(activeRunIds) &&
+      activeRunIds.includes(correctionRunId) &&
+      Array.isArray(clientMessageIds) &&
+      clientMessageIds.includes(clientMessageId)
+    );
+  }
+  if (message?.type === "update_queue") {
+    return message.removed?.some(
+      (item) => item?.client_message_id === clientMessageId,
+    );
+  }
+  if (
+    message?.type === "stream_delta" ||
+    message?.type === "turn_finished"
+  ) {
+    return runIdForMessage(message) === correctionRunId;
+  }
+  if (
+    message?.type === "external_tool_call_request" ||
+    message?.type === "control_request"
+  ) {
+    const toolCallId = toolCallIdForControlMessage(message);
+    return runIdsByToolCallId.get(toolCallId) === correctionRunId;
+  }
+  return false;
 }
 
 function recordToolRunCorrelations(message, runIdsByToolCallId) {
@@ -1450,18 +1524,39 @@ async function resolveAppServer({
   backend = options.backend,
   listenUrl = options.listenUrl,
   startTimeoutMs = options.serverStartTimeoutMs,
+  startMaxTimeoutMs = options.serverStartMaxTimeoutMs,
 } = {}) {
   if (appServerUrl) return { url: appServerUrl, child: null };
-  return manager.start({ lettaBin, backend, listenUrl, startTimeoutMs });
+  return manager.start({
+    lettaBin,
+    backend,
+    listenUrl,
+    startTimeoutMs,
+    startMaxTimeoutMs,
+  });
 }
 
-function waitForListeningUrl(child, timeoutMs) {
+function waitForListeningUrl(
+  child,
+  timeoutMs,
+  maxTimeoutMs = timeoutMs * 4,
+) {
   return new Promise((resolve, reject) => {
     let output = "";
     let settled = false;
+    let timer;
+    let maxTimer;
+    let timerGeneration = 0;
+    const maxDeadline = Date.now() + maxTimeoutMs;
+    const timeoutError = () =>
+      new Error(
+        `Timed out waiting for letta server to listen. Output:\n${output}`,
+      );
 
     const cleanup = () => {
+      timerGeneration += 1;
       clearTimeout(timer);
+      clearTimeout(maxTimer);
       child.stdout.off("data", onData);
       child.stderr.off("data", onData);
       child.off("error", onError);
@@ -1475,12 +1570,18 @@ function waitForListeningUrl(child, timeoutMs) {
     };
     const onData = (chunk) => {
       output += chunk.toString();
+      if (Date.now() >= maxDeadline) {
+        settle(reject, timeoutError());
+        return;
+      }
       const match = output.match(/Listening on (ws:\/\/[^\s]+)/);
       if (match) {
         settle(resolve, match[1]);
         child.stdout.resume();
         child.stderr.resume();
+        return;
       }
+      resetTimeout();
     };
     const onError = (error) => settle(reject, error);
     const onExit = (status) =>
@@ -1490,21 +1591,27 @@ function waitForListeningUrl(child, timeoutMs) {
           `letta server exited before listening with status ${status}. Output:\n${output}`,
         ),
       );
-    const timer = setTimeout(
-      () =>
-        settle(
-          reject,
-          new Error(
-            `Timed out waiting for letta server to listen. Output:\n${output}`,
-          ),
-        ),
-      timeoutMs,
-    );
+    const resetTimeout = () => {
+      clearTimeout(timer);
+      const generation = ++timerGeneration;
+      timer = setTimeout(
+        () => setImmediate(() => {
+          if (generation !== timerGeneration) return;
+          settle(reject, timeoutError());
+        }),
+        timeoutMs,
+      );
+    };
 
     child.stdout.on("data", onData);
     child.stderr.on("data", onData);
     child.once("error", onError);
     child.once("exit", onExit);
+    resetTimeout();
+    maxTimer = setTimeout(
+      () => setImmediate(() => settle(reject, timeoutError())),
+      maxTimeoutMs,
+    );
   });
 }
 
@@ -2024,7 +2131,51 @@ function withTimeout(promise, timeoutMs, message) {
   return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
 }
 
+function withActivityTimeout(promise, timeoutMs, message, registerRefresh) {
+  let timer;
+  let settled = false;
+  let timerGeneration = 0;
+
+  return new Promise((resolve, reject) => {
+    const finish = (callback, value) => {
+      if (settled) return;
+      settled = true;
+      timerGeneration += 1;
+      clearTimeout(timer);
+      registerRefresh(() => {});
+      callback(value);
+    };
+    const refresh = () => {
+      if (settled) return;
+      clearTimeout(timer);
+      const generation = ++timerGeneration;
+      timer = setTimeout(
+        () => setImmediate(() => {
+          if (generation !== timerGeneration) return;
+          finish(reject, new Error(message));
+        }),
+        timeoutMs,
+      );
+    };
+
+    registerRefresh(refresh);
+    refresh();
+    Promise.resolve(promise).then(
+      (value) => finish(resolve, value),
+      (error) => finish(reject, error),
+    );
+  });
+}
+
+function serverStartMaxTimeout(startTimeoutMs, configuredValue) {
+  if (!configuredValue) return Math.max(600_000, startTimeoutMs * 4);
+  return Number(configuredValue);
+}
+
 function parseArgs(args) {
+  const serverStartTimeoutMs = Number(
+    process.env.LETTA_CODEX_BRIDGE_SERVER_START_TIMEOUT_MS || 120_000,
+  );
   const parsed = {
     lettaBin: process.env.LETTA_BIN || "letta",
     backend: process.env.LETTA_BACKEND || "local",
@@ -2044,8 +2195,10 @@ function parseArgs(args) {
     turnTimeoutMs: Number(
       process.env.LETTA_CODEX_BRIDGE_TURN_TIMEOUT_MS || 1_800_000,
     ),
-    serverStartTimeoutMs: Number(
-      process.env.LETTA_CODEX_BRIDGE_SERVER_START_TIMEOUT_MS || 30_000,
+    serverStartTimeoutMs,
+    serverStartMaxTimeoutMs: serverStartMaxTimeout(
+      serverStartTimeoutMs,
+      process.env.LETTA_CODEX_BRIDGE_SERVER_START_MAX_TIMEOUT_MS,
     ),
     serverShutdownTimeoutMs: Number(
       process.env.LETTA_CODEX_BRIDGE_SERVER_SHUTDOWN_TIMEOUT_MS || 5_000,

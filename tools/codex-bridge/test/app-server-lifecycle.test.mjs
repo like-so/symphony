@@ -8,7 +8,11 @@ import { test } from "node:test";
 
 import { bridgeTestHooks } from "../bin/codex-bridge.mjs";
 
-const { AppServerProcessManager, resolveAppServer } = bridgeTestHooks;
+const {
+  AppServerProcessManager,
+  resolveAppServer,
+  serverStartMaxTimeout,
+} = bridgeTestHooks;
 
 class FakeChild extends EventEmitter {
   constructor({ exitOnTerm = true, exitOnKill = true } = {}) {
@@ -135,6 +139,117 @@ test("startup timeout terminates the spawned App Server", async () => {
 
   assert.deepEqual(child.kills, ["SIGTERM"]);
   assert.equal(manager.size, 0);
+});
+
+test("startup progress extends the listener wait", async () => {
+  const child = new FakeChild();
+  const manager = new AppServerProcessManager({
+    isProcessGroupAlive: (child) =>
+      Boolean(child.pid) &&
+      child.exitCode === null &&
+      child.signalCode === null,
+    spawnProcess: () => {
+      setTimeout(() => child.stderr.write("Loading backend\n"), 20);
+      setTimeout(() => child.stdout.write("Loading agent\n"), 50);
+      setTimeout(
+        () => child.stdout.write("Listening on ws://127.0.0.1:45557\n"),
+        80,
+      );
+      return child;
+    },
+    signalProcess: (target, signal) => target.kill(signal),
+    shutdownTimeoutMs: 20,
+  });
+
+  const server = await manager.start({
+    lettaBin: "letta",
+    backend: "local",
+    listenUrl: "ws://127.0.0.1:0",
+    startTimeoutMs: 40,
+  });
+
+  assert.equal(server.url, "ws://127.0.0.1:45557");
+  assert.deepEqual(child.kills, []);
+  await manager.stop(server.child);
+});
+
+test("startup output cannot extend the absolute listener deadline", async () => {
+  const child = new FakeChild();
+  let progressTimer;
+  const manager = new AppServerProcessManager({
+    isProcessGroupAlive: (child) =>
+      Boolean(child.pid) &&
+      child.exitCode === null &&
+      child.signalCode === null,
+    spawnProcess: () => {
+      progressTimer = setInterval(
+        () => child.stderr.write("Still loading\n"),
+        10,
+      );
+      return child;
+    },
+    signalProcess: (target, signal) => target.kill(signal),
+    shutdownTimeoutMs: 20,
+  });
+
+  try {
+    await assert.rejects(
+      manager.start({
+        lettaBin: "letta",
+        backend: "local",
+        listenUrl: "ws://127.0.0.1:0",
+        startTimeoutMs: 25,
+        startMaxTimeoutMs: 70,
+      }),
+      /Timed out waiting/,
+    );
+  } finally {
+    clearInterval(progressTimer);
+  }
+
+  assert.deepEqual(child.kills, ["SIGTERM"]);
+  assert.equal(manager.size, 0);
+});
+
+test("listener readiness after an event-loop stall cannot exceed the absolute deadline", async () => {
+  const child = new FakeChild();
+  const manager = new AppServerProcessManager({
+    isProcessGroupAlive: (child) =>
+      Boolean(child.pid) &&
+      child.exitCode === null &&
+      child.signalCode === null,
+    spawnProcess: () => {
+      setTimeout(() => {
+        const stallUntil = Date.now() + 60;
+        while (Date.now() < stallUntil) {
+          // Simulate machine load delaying both output and timeout callbacks.
+        }
+        child.stdout.write("Listening on ws://127.0.0.1:45558\n");
+      }, 10);
+      return child;
+    },
+    signalProcess: (target, signal) => target.kill(signal),
+    shutdownTimeoutMs: 20,
+  });
+
+  await assert.rejects(
+    manager.start({
+      lettaBin: "letta",
+      backend: "local",
+      listenUrl: "ws://127.0.0.1:0",
+      startTimeoutMs: 200,
+      startMaxTimeoutMs: 40,
+    }),
+    /Timed out waiting/,
+  );
+
+  assert.deepEqual(child.kills, ["SIGTERM"]);
+  assert.equal(manager.size, 0);
+});
+
+test("default startup maximum scales with a larger inactivity timeout", () => {
+  assert.equal(serverStartMaxTimeout(900_000), 3_600_000);
+  assert.equal(serverStartMaxTimeout(120_000, "900000"), 900_000);
 });
 
 test("shutdown escalates from SIGTERM to SIGKILL", async () => {
@@ -381,7 +496,7 @@ setInterval(() => {}, 60000);
         lettaBin: fixturePath,
         backend: "local",
         listenUrl: "ws://127.0.0.1:0",
-        startTimeoutMs: 1_000,
+        startTimeoutMs: 5_000,
       });
       grandchildPid = Number(await readFile(grandchildPidPath, "utf8"));
 
