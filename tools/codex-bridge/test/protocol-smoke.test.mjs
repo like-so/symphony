@@ -20,25 +20,30 @@ test("responds to Symphony initialize and thread start messages", async () => {
   child.stderr.on("data", (chunk) => {
     stderr += chunk.toString();
   });
-
-  child.stdin.write(JSON.stringify({ id: 1, method: "initialize", params: {} }) + "\n");
-  child.stdin.write(JSON.stringify({ method: "initialized", params: {} }) + "\n");
-  child.stdin.write(JSON.stringify({ id: 2, method: "thread/start", params: { cwd: process.cwd() } }) + "\n");
-  await waitFor(() => lines.length >= 2, 2_000, () => stderr);
-  child.stdin.end();
-
-  assert.equal(lines[0].id, 1);
-  assert.equal(
-    lines[0].result.capabilities.symphonyCorrectionDelivery,
-    true,
-  );
-  assert.equal(lines[1].result.thread.id, "local");
-
-  child.kill("SIGTERM");
-  await new Promise((resolve, reject) => {
+  const closed = new Promise((resolve, reject) => {
     child.on("close", resolve);
     child.on("error", reject);
   });
+
+  try {
+    child.stdin.write(JSON.stringify({ id: 1, method: "initialize", params: {} }) + "\n");
+    child.stdin.write(JSON.stringify({ method: "initialized", params: {} }) + "\n");
+    child.stdin.write(JSON.stringify({ id: 2, method: "thread/start", params: { cwd: process.cwd() } }) + "\n");
+    await waitFor(() => lines.length >= 2, 5_000, () => stderr);
+
+    assert.equal(lines[0].id, 1);
+    assert.equal(
+      lines[0].result.capabilities.symphonyCorrectionDelivery,
+      true,
+    );
+    assert.equal(lines[1].result.thread.id, "local");
+  } finally {
+    child.stdin.end();
+    if (child.exitCode === null && child.signalCode === null) {
+      child.kill("SIGTERM");
+    }
+    await closed;
+  }
 });
 
 test("emits progress as directly rendered Codex update text", async () => {
@@ -983,6 +988,240 @@ test("accepted correction transport loss is marked unresolved", async () => {
       return true;
     },
   );
+});
+
+test("active correction activity extends the terminal wait", async () => {
+  const runtime = { agent_id: "agent-1", conversation_id: "conversation-1" };
+  const clientMessageId = "symphony-correction-instruction-active";
+  let onMessage;
+  let resolveClose;
+  const client = {
+    onMessage: (handler) => {
+      onMessage = handler;
+      return () => {};
+    },
+    submitInput: async () => {
+      setTimeout(() => {
+        onMessage({
+          type: "update_loop_status",
+          runtime,
+          loop_status: {
+            active_run_ids: ["run-correction"],
+            client_message_ids_by_run_id: {
+              "run-correction": [clientMessageId],
+            },
+          },
+        });
+      }, 20);
+      setTimeout(() => {
+        onMessage({
+          type: "stream_delta",
+          runtime,
+          delta: {
+            type: "message",
+            message_type: "assistant_message",
+            run_id: "run-correction",
+            content: "Still working",
+          },
+        });
+      }, 50);
+      setTimeout(() => {
+        onMessage({
+          type: "turn_finished",
+          runtime,
+          run_id: "run-correction",
+          turn_id: "turn-correction",
+          stop_reason: "end_turn",
+        });
+      }, 80);
+      return { accepted: true, disposition: "started" };
+    },
+    waitForClose: () =>
+      new Promise((resolve) => {
+        resolveClose = resolve;
+      }),
+  };
+
+  const terminal = await bridgeTestHooks.submitAndWaitForTurn(
+    client,
+    runtime,
+    "Apply the authorized correction.",
+    "letta-turn-active",
+    { input_tokens: 0, output_tokens: 0, total_tokens: 0 },
+    { clientMessageId, turnTimeoutMs: 40 },
+  );
+
+  assert.equal(terminal.runId, "run-correction");
+  assert.equal(terminal.turnId, "turn-correction");
+  assert.equal(terminal.stopReason, "end_turn");
+  assert.equal(terminal.text, "Still working");
+  resolveClose?.();
+});
+
+test("correction activity excludes unrelated same-runtime events", () => {
+  const clientMessageId = "symphony-correction-instruction-stalled";
+  const context = {
+    clientMessageId,
+    correctionRunId: "run-correction",
+    runIdsByToolCallId: new Map([
+      ["tool-correction", "run-correction"],
+      ["tool-unrelated", "run-unrelated"],
+    ]),
+  };
+
+  assert.equal(
+    bridgeTestHooks.isTurnActivityMessage(
+      { type: "stream_delta", delta: { run_id: "run-unrelated" } },
+      context,
+    ),
+    false,
+  );
+  assert.equal(
+    bridgeTestHooks.isTurnActivityMessage(
+      {
+        type: "update_loop_status",
+        loop_status: {
+          active_run_ids: ["run-unrelated"],
+          client_message_ids_by_run_id: {
+            "run-unrelated": ["another-message"],
+          },
+        },
+      },
+      context,
+    ),
+    false,
+  );
+  assert.equal(
+    bridgeTestHooks.isTurnActivityMessage(
+      {
+        type: "update_queue",
+        removed: [{ client_message_id: "another-message" }],
+      },
+      context,
+    ),
+    false,
+  );
+  assert.equal(
+    bridgeTestHooks.isTurnActivityMessage(
+      {
+        type: "external_tool_call_request",
+        tool_call_id: "tool-unrelated",
+      },
+      context,
+    ),
+    false,
+  );
+  assert.equal(
+    bridgeTestHooks.isTurnActivityMessage(
+      { type: "stream_delta", delta: { run_id: "run-correction" } },
+      context,
+    ),
+    true,
+  );
+  assert.equal(
+    bridgeTestHooks.isTurnActivityMessage(
+      {
+        type: "update_loop_status",
+        loop_status: {
+          active_run_ids: ["run-correction"],
+          client_message_ids_by_run_id: {
+            "run-correction": [clientMessageId],
+          },
+        },
+      },
+      context,
+    ),
+    true,
+  );
+});
+
+test("unrelated activity does not extend a stalled correction wait", async () => {
+  const runtime = { agent_id: "agent-1", conversation_id: "conversation-1" };
+  const clientMessageId = "symphony-correction-instruction-idle";
+  let onMessage;
+  let correctionStatusTimer;
+  let correctionStarted = false;
+  let unrelatedEventCount = 0;
+  let unrelatedTimer;
+  const client = {
+    onMessage: (handler) => {
+      onMessage = handler;
+      return () => {};
+    },
+    submitInput: async () => {
+      correctionStatusTimer = setTimeout(() => {
+        onMessage({
+          type: "update_loop_status",
+          runtime,
+          loop_status: {
+            active_run_ids: ["run-correction"],
+            client_message_ids_by_run_id: {
+              "run-correction": [clientMessageId],
+            },
+          },
+        });
+      }, 20);
+      unrelatedTimer = setInterval(() => {
+        unrelatedEventCount += 1;
+        onMessage({
+          type: "stream_delta",
+          runtime,
+          delta: {
+            type: "message",
+            message_type: "assistant_message",
+            run_id: "run-unrelated",
+            content: "Unrelated activity",
+          },
+        });
+      }, 20);
+      return { accepted: true, disposition: "started" };
+    },
+    waitForClose: () => new Promise(() => {}),
+  };
+
+  let assertionDeadline;
+  try {
+    await Promise.race([
+      assert.rejects(
+        bridgeTestHooks.submitAndWaitForTurn(
+          client,
+          runtime,
+          "Apply the authorized correction.",
+          "letta-turn-idle",
+          { input_tokens: 0, output_tokens: 0, total_tokens: 0 },
+          {
+            clientMessageId,
+            turnTimeoutMs: 60,
+            onExecutionStarted: () => {
+              correctionStarted = true;
+            },
+          },
+        ),
+        (error) => {
+          assert.equal(error.correctionOutcomeUnresolved, true);
+          assert.match(
+            error.cause?.message,
+            /Timed out waiting for Letta turn_finished/,
+          );
+          assert.equal(correctionStarted, true);
+          assert.ok(unrelatedEventCount > 0);
+          return true;
+        },
+      ),
+      new Promise((_, reject) => {
+        assertionDeadline = setTimeout(
+          () => setImmediate(() =>
+            reject(new Error("Unrelated activity extended the turn timeout")),
+          ),
+          180,
+        );
+      }),
+    ]);
+  } finally {
+    clearTimeout(correctionStatusTimer);
+    clearInterval(unrelatedTimer);
+    clearTimeout(assertionDeadline);
+  }
 });
 
 test("correction acceptance timeout is marked unresolved", async () => {
