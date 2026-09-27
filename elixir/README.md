@@ -167,6 +167,11 @@ Notes:
   invocation when a turn completes normally but the issue is still in an active state. Default: `20`.
 - If the Markdown body is blank, Symphony uses a default prompt template that includes the issue
   identifier, title, and body.
+- Tracker comments are retained separately from the issue description. When comments exist,
+  the prompt renderer appends a labelled historical-evidence section with their full bodies,
+  IDs, and timestamps, including for description-only custom templates. Dated commands are
+  not a second execution queue; unresolved reviews and unsuperseded user restrictions remain
+  visible. Custom templates need not append the comments themselves.
 - Use `hooks.after_create` to bootstrap a fresh workspace. For a Git-backed repo, you can run
   `git clone ... .` there, along with any other setup commands you need.
 - If a hook needs `mise exec` inside a freshly cloned workspace, trust the repo config and fetch
@@ -199,6 +204,11 @@ codex:
   reload error until the file is fixed.
 - `server.port` or CLI `--port` enables the optional Phoenix LiveView dashboard and JSON API at
   `/`, `/api/v1/state`, `/api/v1/<issue_identifier>`, and `/api/v1/refresh`.
+- `server.correction_token` enables the authenticated correction API and must be configured through a
+  host-side environment reference such as `$SYMPHONY_CORRECTION_TOKEN`; Symphony removes that
+  environment variable from local and SSH worker child processes. Changing this token requires a
+  service restart so every active worker is launched with the current secret removed. Correction
+  requests must originate from loopback; remote callers need a same-host TLS proxy.
 
 ### Linear adapter profile
 
@@ -296,6 +306,28 @@ The observability UI now runs on a minimal Phoenix stack:
 - Bandit as the HTTP server
 - Phoenix dependency static assets for the LiveView client bootstrap
 - Tracker issue identifiers link to the tracker-provided URL when it uses `http` or `https`
+
+The correction control surface is separate from the unauthenticated observability routes:
+
+- `POST /api/v1/issues/<issue_identifier>/corrections` requires a bearer token and an exact
+  `issue_id`, `session_id`, `workspace_path`, `worker_pid`, and `worker_host` binding. It returns
+  `202` only after the orchestrator records the instruction as `queued` and routes it to that active
+  worker.
+- `GET /api/v1/corrections/<instruction_id>` requires the same bearer token and reports `queued`,
+  `delivered`, `execution_started`, `completed`, `blocked`, or `failed` without returning the
+  instruction text.
+- An instruction ID is single-use for the current orchestrator lifetime. A stale owner, changed
+  session/workspace/PID/host, or duplicate ID is rejected without starting another worker.
+- The active app-server peer must advertise `symphonyCorrectionDelivery`; otherwise the request is
+  rejected instead of treating an unsupported transport write as queued delivery.
+
+The bundled `codex-bridge` acknowledges `delivered` when it accepts a correction into the active
+bound turn. It submits corrections serially on the same Letta runtime and conversation between
+workflow phases, reports `execution_started` after the exact correction message is correlated to a
+run with accepted or dequeued execution evidence, and reports `completed` only after that run
+finishes successfully.
+Input-required outcomes are reported as `blocked`; other non-success terminal outcomes are reported
+as `failed`. Runtime activation and the actual correction request remain separate operator actions.
 
 ## Project Layout
 

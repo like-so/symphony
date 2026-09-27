@@ -1,6 +1,7 @@
 defmodule SymphonyElixir.ExtensionsTest do
   use SymphonyElixir.TestSupport
 
+  import Plug.Conn, only: [get_resp_header: 2, put_req_header: 3]
   import Phoenix.ConnTest
   import Phoenix.LiveViewTest
 
@@ -57,6 +58,16 @@ defmodule SymphonyElixir.ExtensionsTest do
     def handle_call(:request_refresh, _from, state) do
       {:reply, Keyword.get(state, :refresh, :unavailable), state}
     end
+
+    def handle_call({:queue_correction, correction}, _from, state) do
+      if test_pid = Keyword.get(state, :test_pid), do: send(test_pid, {:queued_correction, correction})
+      {:reply, Keyword.get(state, :correction_reply, {:error, :unavailable}), state}
+    end
+
+    def handle_call({:correction_status, instruction_id}, _from, state) do
+      if test_pid = Keyword.get(state, :test_pid), do: send(test_pid, {:correction_status, instruction_id})
+      {:reply, Keyword.get(state, :correction_status_reply, {:error, :not_found}), state}
+    end
   end
 
   setup do
@@ -75,9 +86,16 @@ defmodule SymphonyElixir.ExtensionsTest do
 
   setup do
     endpoint_config = Application.get_env(:symphony_elixir, SymphonyElixirWeb.Endpoint, [])
+    correction_control_startup = Application.get_env(:symphony_elixir, :correction_control_startup)
 
     on_exit(fn ->
       Application.put_env(:symphony_elixir, SymphonyElixirWeb.Endpoint, endpoint_config)
+
+      if correction_control_startup do
+        Application.put_env(:symphony_elixir, :correction_control_startup, correction_control_startup)
+      else
+        Application.delete_env(:symphony_elixir, :correction_control_startup)
+      end
     end)
 
     :ok
@@ -171,24 +189,30 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert Process.alive?(manual_pid)
 
     state = :sys.get_state(manual_pid)
-    File.write!(manual_path, "---\ntracker: [\n---\nBroken prompt\n")
-    assert {:noreply, returned_state} = WorkflowStore.handle_info(:poll, state)
-    assert returned_state.workflow.prompt == "Manual workflow prompt"
-    refute returned_state.stamp == nil
-    assert_receive :poll, 1_100
-
-    Workflow.set_workflow_file_path(missing_path)
-    assert {:noreply, path_error_state} = WorkflowStore.handle_info(:poll, returned_state)
-    assert path_error_state.workflow.prompt == "Manual workflow prompt"
-    assert_receive :poll, 1_100
-
-    Workflow.set_workflow_file_path(manual_path)
-    File.rm!(manual_path)
-    assert {:noreply, removed_state} = WorkflowStore.handle_info(:poll, path_error_state)
-    assert removed_state.workflow.prompt == "Manual workflow prompt"
-    assert_receive :poll, 1_100
-
     assert :ok = GenServer.stop(manual_pid)
+
+    tracer = start_timer_call_tracer()
+
+    try do
+      File.write!(manual_path, "---\ntracker: [\n---\nBroken prompt\n")
+      assert {:noreply, returned_state} = WorkflowStore.handle_info(:poll, state)
+      assert returned_state.workflow.prompt == "Manual workflow prompt"
+      refute returned_state.stamp == nil
+      assert_poll_timer_scheduled()
+
+      Workflow.set_workflow_file_path(missing_path)
+      assert {:noreply, path_error_state} = WorkflowStore.handle_info(:poll, returned_state)
+      assert path_error_state.workflow.prompt == "Manual workflow prompt"
+      assert_poll_timer_scheduled()
+
+      Workflow.set_workflow_file_path(manual_path)
+      File.rm!(manual_path)
+      assert {:noreply, removed_state} = WorkflowStore.handle_info(:poll, path_error_state)
+      assert removed_state.workflow.prompt == "Manual workflow prompt"
+      assert_poll_timer_scheduled()
+    after
+      stop_timer_call_tracer(tracer)
+    end
 
     Workflow.set_workflow_file_path(existing_path)
 
@@ -412,6 +436,166 @@ defmodule SymphonyElixir.ExtensionsTest do
                  "message" => "Orchestrator is unavailable"
                }
              }
+  end
+
+  test "correction control authenticates and keeps receipt separate from execution" do
+    orchestrator_name = {:global, Module.concat(__MODULE__, :CorrectionApiOrchestrator)}
+    now = DateTime.utc_now()
+
+    record = %{
+      instruction_id: "instruction-1",
+      issue_id: "issue-1",
+      issue_identifier: "MT-1",
+      session_id: "local-letta-turn-1",
+      workspace_path: "/workspaces/MT-1",
+      worker_pid: "4242",
+      worker_host: nil,
+      status: :queued,
+      queued_at: now,
+      updated_at: now,
+      result: nil,
+      error: nil
+    }
+
+    {:ok, _pid} =
+      StaticOrchestrator.start_link(
+        name: orchestrator_name,
+        snapshot: static_snapshot(),
+        test_pid: self(),
+        correction_reply: {:ok, record},
+        correction_status_reply: {:ok, %{record | status: :delivered}}
+      )
+
+    start_test_endpoint(
+      orchestrator: orchestrator_name,
+      snapshot_timeout_ms: 50,
+      correction_token: "correction-secret"
+    )
+
+    body = %{
+      "instruction_id" => "instruction-1",
+      "instruction" => "Apply the authorized correction.",
+      "target" => %{
+        "issue_id" => "issue-1",
+        "session_id" => "local-letta-turn-1",
+        "workspace_path" => "/workspaces/MT-1",
+        "worker_pid" => "4242",
+        "worker_host" => nil
+      }
+    }
+
+    assert json_response(post(build_conn(), "/api/v1/issues/MT-1/corrections", body), 401) ==
+             %{"error" => %{"code" => "unauthorized", "message" => "Unauthorized"}}
+
+    assert %{"error" => %{"code" => "unauthorized"}} =
+             build_conn()
+             |> put_req_header("authorization", "Bearer wrong-secret")
+             |> get("/api/v1/corrections/instruction-1")
+             |> json_response(401)
+
+    assert %{"error" => %{"code" => "correction_control_requires_local_transport"}} =
+             build_conn()
+             |> Map.put(:remote_ip, {192, 0, 2, 10})
+             |> put_req_header("authorization", "Bearer correction-secret")
+             |> post("/api/v1/issues/MT-1/corrections", body)
+             |> json_response(403)
+
+    conn =
+      build_conn()
+      |> put_req_header("authorization", "Bearer correction-secret")
+      |> post("/api/v1/issues/MT-1/corrections", body)
+
+    assert %{"instruction_id" => "instruction-1", "status" => "queued", "result" => nil} =
+             json_response(conn, 202)
+
+    assert get_resp_header(conn, "location") == ["/api/v1/corrections/instruction-1"]
+
+    assert_receive {:queued_correction,
+                    %{
+                      issue_identifier: "MT-1",
+                      session_id: "local-letta-turn-1",
+                      text: "Apply the authorized correction."
+                    }}
+
+    recovery = Map.merge(body, %{
+      "instruction_id" => "new-recovery",
+      "recovery" => true,
+      "source_revision" => "source-v2",
+      "authorization_id" => "auth-v2",
+      "cwd_revision" => 4
+    })
+
+    assert %{"error" => %{"code" => "unauthorized"}} =
+             build_conn()
+             |> post("/api/v1/issues/MT-1/corrections", recovery)
+             |> json_response(401)
+
+    build_conn()
+    |> put_req_header("authorization", "Bearer correction-secret")
+    |> post("/api/v1/issues/MT-1/corrections", recovery)
+    |> json_response(202)
+
+    assert_receive {:queued_correction, %{
+      instruction_id: "new-recovery",
+      recovery: true,
+      source_revision: "source-v2",
+      authorization_id: "auth-v2",
+      cwd_revision: 4
+    }}
+
+    for invalid_recovery <- [
+          Map.delete(recovery, "source_revision"),
+          Map.delete(recovery, "authorization_id"),
+          Map.put(recovery, "cwd_revision", -1),
+          Map.put(recovery, "recovery", "true")
+        ] do
+      assert %{"error" => %{"code" => "invalid_correction"}} =
+               build_conn()
+               |> put_req_header("authorization", "Bearer correction-secret")
+               |> post("/api/v1/issues/MT-1/corrections", invalid_recovery)
+               |> json_response(422)
+    end
+
+    refute_receive {:queued_correction, _}
+
+    missing_worker_host = update_in(body, ["target"], &Map.delete(&1, "worker_host"))
+
+    invalid_conn =
+      build_conn()
+      |> put_req_header("authorization", "Bearer correction-secret")
+      |> post("/api/v1/issues/MT-1/corrections", missing_worker_host)
+
+    assert %{"error" => %{"code" => "invalid_correction"}} = json_response(invalid_conn, 422)
+
+    status_conn =
+      build_conn()
+      |> put_req_header("authorization", "Bearer correction-secret")
+      |> get("/api/v1/corrections/instruction-1")
+
+    assert %{"status" => "delivered", "result" => nil} = json_response(status_conn, 200)
+    assert_receive {:correction_status, "instruction-1"}
+
+    mapped_loopback_status =
+      build_conn()
+      |> Map.put(:remote_ip, {0, 0, 0, 0, 0, 65_535, 0x7F00, 1})
+      |> put_req_header("authorization", "Bearer correction-secret")
+      |> get("/api/v1/corrections/instruction-1")
+
+    assert %{"status" => "delivered"} = json_response(mapped_loopback_status, 200)
+    assert_receive {:correction_status, "instruction-1"}
+  end
+
+  test "correction control is unavailable without a configured token" do
+    start_test_endpoint(correction_token: nil)
+
+    conn = post(build_conn(), "/api/v1/issues/MT-1/corrections", %{})
+
+    assert json_response(conn, 503) == %{
+             "error" => %{
+               "code" => "correction_control_unavailable",
+               "message" => "Correction control is not configured"
+             }
+           }
   end
 
   test "phoenix observability api preserves snapshot timeout behavior" do
@@ -641,6 +825,21 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert {:error, _reason} = HttpServer.start_link(host: "bad host", port: 0)
   end
 
+  test "http server keeps the service-start correction credential across child restarts" do
+    Application.put_env(:symphony_elixir, :correction_control_startup, %{
+      token: "service-start-token",
+      secret_environment_names: ["SERVICE_START_TOKEN"]
+    })
+
+    start_supervised!({HttpServer, host: "127.0.0.1", port: 0})
+
+    assert SymphonyElixirWeb.Endpoint.config(:correction_token) == "service-start-token"
+
+    assert SymphonyElixirWeb.Endpoint.config(:correction_secret_environment_names) == [
+             "SERVICE_START_TOKEN"
+           ]
+  end
+
   defp start_test_endpoint(overrides) do
     endpoint_config =
       :symphony_elixir
@@ -727,6 +926,51 @@ defmodule SymphonyElixir.ExtensionsTest do
   end
 
   defp assert_eventually(_fun, 0), do: flunk("condition not met in time")
+
+  defp start_timer_call_tracer do
+    test_pid = self()
+    tracer_pid = spawn(fn -> forward_trace_events(test_pid) end)
+    session = :trace.session_create(__MODULE__, tracer_pid, [])
+
+    assert 1 ==
+             :trace.function(
+               session,
+               {:erlang, :send_after, 3},
+               [{:_, [], [{:return_trace}]}],
+               []
+             )
+
+    assert 1 == :trace.process(session, test_pid, true, [:call])
+    %{session: session, tracer_pid: tracer_pid}
+  end
+
+  defp stop_timer_call_tracer(%{session: session, tracer_pid: tracer_pid}) do
+    assert :trace.session_destroy(session)
+    monitor_ref = Process.monitor(tracer_pid)
+    send(tracer_pid, :stop)
+    assert_receive {:DOWN, ^monitor_ref, :process, ^tracer_pid, :normal}
+  end
+
+  defp forward_trace_events(test_pid) do
+    receive do
+      :stop ->
+        :ok
+
+      event ->
+        send(test_pid, event)
+        forward_trace_events(test_pid)
+    end
+  end
+
+  defp assert_poll_timer_scheduled do
+    test_pid = self()
+
+    assert_receive {:trace, ^test_pid, :call, {:erlang, :send_after, [1_000, ^test_pid, :poll]}}
+
+    assert_receive {:trace, ^test_pid, :return_from, {:erlang, :send_after, 3}, timer_ref}
+    assert is_reference(timer_ref)
+    assert Process.cancel_timer(timer_ref) > 0
+  end
 
   defp ensure_workflow_store_running do
     if Process.whereis(WorkflowStore) do

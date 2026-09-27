@@ -16,17 +16,20 @@ defmodule SymphonyElixir.Tracker do
     "gitlab" => SymphonyElixir.GitLab.Adapter,
     "jira" => SymphonyElixir.Jira.Adapter,
     "linear" => SymphonyElixir.Linear.Adapter,
-    "memory" => SymphonyElixir.Tracker.Memory
+    "memory" => SymphonyElixir.Tracker.Memory,
+    "plane" => SymphonyElixir.Plane.Adapter
   }
 
   @callback fetch_issues_by_states([String.t()]) :: {:ok, [Issue.t()]} | {:error, term()}
   @callback fetch_issues_by_ids([String.t()]) :: {:ok, [Issue.t()]} | {:error, term()}
+  @callback claim_issue(Issue.t()) :: {:ok, Issue.t()} | {:error, term()}
   @callback agent_tool_specs() :: [map()]
   @callback execute_agent_tool(String.t(), term(), keyword()) :: map()
   @callback secret_environment_names(map()) :: [String.t()]
   @callback validate_config(map()) :: :ok | {:error, term()}
 
   @optional_callbacks agent_tool_specs: 0,
+                      claim_issue: 1,
                       execute_agent_tool: 3,
                       validate_config: 1
 
@@ -38,6 +41,17 @@ defmodule SymphonyElixir.Tracker do
   @spec fetch_issues_by_ids([String.t()]) :: {:ok, [Issue.t()]} | {:error, term()}
   def fetch_issues_by_ids(issue_ids) do
     adapter().fetch_issues_by_ids(issue_ids)
+  end
+
+  @spec claim_issue(Issue.t()) :: {:ok, Issue.t()} | {:error, term()}
+  def claim_issue(%Issue{} = issue) do
+    selected_adapter = adapter()
+
+    if Code.ensure_loaded?(selected_adapter) and function_exported?(selected_adapter, :claim_issue, 1) do
+      selected_adapter.claim_issue(issue)
+    else
+      {:ok, issue}
+    end
   end
 
   @doc """

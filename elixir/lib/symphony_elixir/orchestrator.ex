@@ -38,6 +38,7 @@ defmodule SymphonyElixir.Orchestrator do
       completed: MapSet.new(),
       claimed: MapSet.new(),
       blocked: %{},
+      corrections: %{},
       retry_attempts: %{},
       codex_totals: nil,
       codex_rate_limits: nil
@@ -135,6 +136,7 @@ defmodule SymphonyElixir.Orchestrator do
 
       issue_id ->
         {running_entry, state} = pop_running_entry(state, issue_id)
+        state = fail_pending_corrections(state, issue_id, running_entry, "owner process ended")
         state = record_session_completion_totals(state, running_entry)
         session_id = running_entry_session_id(running_entry)
 
@@ -156,8 +158,9 @@ defmodule SymphonyElixir.Orchestrator do
       running_entry ->
         updated_running_entry =
           running_entry
-          |> maybe_put_runtime_value(:worker_host, runtime_info[:worker_host])
-          |> maybe_put_runtime_value(:workspace_path, runtime_info[:workspace_path])
+          |> maybe_put_runtime_value(:workspace_managed, runtime_info[:workspace_managed])
+          |> maybe_put_runtime_value(:source_revision, runtime_info[:source_revision])
+          |> maybe_put_correction_owner_binding(runtime_info)
 
         notify_dashboard()
         {:noreply, %{state | running: Map.put(running, issue_id, updated_running_entry)}}
@@ -179,6 +182,8 @@ defmodule SymphonyElixir.Orchestrator do
           state
           |> apply_codex_token_delta(token_delta)
           |> apply_codex_rate_limits(update)
+          |> integrate_correction_update(issue_id, running_entry, update)
+          |> maybe_fail_ended_owner_corrections(issue_id, running_entry, updated_running_entry, update)
 
         notify_dashboard()
         {:noreply, %{state | running: Map.put(running, issue_id, updated_running_entry)}}
@@ -189,9 +194,15 @@ defmodule SymphonyElixir.Orchestrator do
 
   def handle_info({:retry_issue, issue_id, retry_token}, state) do
     result =
-      case pop_retry_attempt_state(state, issue_id, retry_token) do
-        {:ok, attempt, metadata, state} -> handle_retry_issue(state, issue_id, attempt, metadata)
-        :missing -> {:noreply, state}
+      case capacity_waiting_retry(state, issue_id) do
+        {:ok, %{retry_token: ^retry_token} = retry_entry} ->
+          handle_capacity_retry_timer(state, issue_id, retry_entry)
+
+        _ ->
+          case pop_retry_attempt_state(state, issue_id, retry_token) do
+            {:ok, attempt, metadata, state} -> handle_retry_issue(state, issue_id, attempt, metadata)
+            :missing -> {:noreply, state}
+          end
       end
 
     notify_dashboard()
@@ -218,7 +229,8 @@ defmodule SymphonyElixir.Orchestrator do
         issue_url: running_entry.issue.url,
         delay_type: :continuation,
         worker_host: Map.get(running_entry, :worker_host),
-        workspace_path: Map.get(running_entry, :workspace_path)
+        workspace_path: Map.get(running_entry, :workspace_path),
+        workspace_managed: Map.get(running_entry, :workspace_managed, true)
       })
     end
   end
@@ -249,7 +261,8 @@ defmodule SymphonyElixir.Orchestrator do
       issue_url: running_entry.issue.url,
       error: "agent exited: #{inspect(reason)}",
       worker_host: Map.get(running_entry, :worker_host),
-      workspace_path: Map.get(running_entry, :workspace_path)
+      workspace_path: Map.get(running_entry, :workspace_path),
+      workspace_managed: Map.get(running_entry, :workspace_managed, true)
     })
   end
 
@@ -378,6 +391,14 @@ defmodule SymphonyElixir.Orchestrator do
   def handle_retry_issue_lookup_for_test(%Issue{} = issue, %State{} = state, issue_id, attempt, metadata)
       when is_binary(issue_id) and is_integer(attempt) and attempt >= 0 and is_map(metadata) do
     {:noreply, updated_state} = handle_retry_issue_lookup(issue, state, issue_id, attempt, metadata)
+    updated_state
+  end
+
+  @doc false
+  @spec handle_capacity_retry_result_for_test(term(), String.t(), map(), term()) :: term()
+  def handle_capacity_retry_result_for_test(%State{} = state, issue_id, retry_entry, result)
+      when is_binary(issue_id) and is_map(retry_entry) do
+    {:noreply, updated_state} = handle_capacity_retry_result(state, issue_id, retry_entry, result)
     updated_state
   end
 
@@ -557,6 +578,7 @@ defmodule SymphonyElixir.Orchestrator do
         release_issue_claim(state, issue_id)
 
       %{pid: pid, ref: ref, identifier: identifier} = running_entry ->
+        state = fail_pending_corrections(state, issue_id, running_entry, "owner process stopped")
         state = record_session_completion_totals(state, running_entry)
 
         stop_running_task(pid, ref, state.task_supervisor)
@@ -751,7 +773,9 @@ defmodule SymphonyElixir.Orchestrator do
       state.task_supervisor
     )
 
-    block_issue_from_entry(state, issue_id, running_entry, error)
+    state
+    |> fail_pending_corrections(issue_id, running_entry, error)
+    |> block_issue_from_entry(issue_id, running_entry, error)
   end
 
   defp block_issue_from_entry(%State{} = state, issue_id, running_entry, error) do
@@ -761,6 +785,7 @@ defmodule SymphonyElixir.Orchestrator do
       issue: Map.get(running_entry, :issue),
       worker_host: Map.get(running_entry, :worker_host),
       workspace_path: Map.get(running_entry, :workspace_path),
+      workspace_managed: Map.get(running_entry, :workspace_managed, true),
       session_id: running_entry_session_id(running_entry),
       error: error,
       blocked_at: DateTime.utc_now(),
@@ -820,7 +845,7 @@ defmodule SymphonyElixir.Orchestrator do
          terminal_states
        ) do
     candidate_issue?(issue, active_states, terminal_states) and
-      !MapSet.member?(claimed, issue.id) and
+      (!MapSet.member?(claimed, issue.id) or capacity_waiting_retry?(state, issue.id)) and
       !Map.has_key?(running, issue.id) and
       !Map.has_key?(blocked, issue.id) and
       available_slots(state) > 0 and
@@ -905,15 +930,86 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp dispatch_issue(%State{} = state, issue, attempt \\ nil, preferred_worker_host \\ nil) do
+    case capacity_waiting_retry(state, issue.id) do
+      {:ok, retry_entry} ->
+        dispatch_capacity_waiter(state, issue, retry_entry)
+
+      :missing ->
+        dispatch_unclaimed_issue(state, issue, attempt, preferred_worker_host)
+    end
+  end
+
+  defp dispatch_unclaimed_issue(state, issue, attempt, preferred_worker_host) do
     case refresh_issue_for_dispatch(issue) do
       {:ok, %Issue{} = refreshed_issue} ->
-        do_dispatch_issue(state, refreshed_issue, attempt, preferred_worker_host)
+        case Tracker.claim_issue(refreshed_issue) do
+          {:ok, %Issue{} = claimed_issue} ->
+            do_dispatch_issue(state, claimed_issue, attempt, preferred_worker_host)
+
+          {:error, reason} ->
+            Logger.warning("Skipping dispatch; issue claim failed for #{issue_context(refreshed_issue)}: #{inspect(reason)}")
+            state
+        end
 
       {:skip, _reason} ->
         state
 
       {:error, _reason} ->
         state
+    end
+  end
+
+  defp dispatch_capacity_waiter(state, issue, retry_entry) do
+    case refresh_issue_for_dispatch(issue) do
+      {:ok, %Issue{} = refreshed_issue} ->
+        if dispatch_slots_available?(refreshed_issue, state) and
+             worker_slots_available?(state, Map.get(retry_entry, :worker_host)) do
+          do_dispatch_issue(
+            state,
+            refreshed_issue,
+            retry_entry.attempt,
+            Map.get(retry_entry, :worker_host)
+          )
+        else
+          schedule_issue_retry(
+            state,
+            issue.id,
+            retry_entry.attempt,
+            retry_entry
+            |> retry_metadata()
+            |> Map.merge(%{
+              identifier: refreshed_issue.identifier,
+              error: "no available orchestrator slots",
+              delay_type: :capacity
+            })
+          )
+        end
+
+      {:skip, :missing} ->
+        release_issue_claim(state, issue.id)
+
+      {:skip, %Issue{} = refreshed_issue} ->
+        {:noreply, updated_state} =
+          handle_retry_issue_lookup(
+            refreshed_issue,
+            state,
+            issue.id,
+            retry_entry.attempt,
+            retry_metadata(retry_entry)
+          )
+
+        updated_state
+
+      {:error, reason} ->
+        schedule_issue_retry(
+          state,
+          issue.id,
+          retry_entry.attempt + 1,
+          retry_entry
+          |> retry_metadata()
+          |> Map.delete(:delay_type)
+          |> Map.put(:error, "retry dispatch refresh failed: #{inspect(reason)}")
+        )
     end
   end
 
@@ -968,6 +1064,8 @@ defmodule SymphonyElixir.Orchestrator do
             worker_host: worker_host,
             workspace_path: nil,
             session_id: nil,
+            correction_owner_active: false,
+            correction_delivery_supported: false,
             last_codex_message: nil,
             last_codex_timestamp: nil,
             last_codex_event: nil,
@@ -1067,7 +1165,9 @@ defmodule SymphonyElixir.Orchestrator do
             issue_url: issue_url,
             error: error,
             worker_host: worker_host,
-            workspace_path: workspace_path
+            workspace_path: workspace_path,
+            workspace_managed: Map.get(metadata, :workspace_managed, true),
+            delay_type: Map.get(metadata, :delay_type)
           })
     }
   end
@@ -1075,13 +1175,7 @@ defmodule SymphonyElixir.Orchestrator do
   defp pop_retry_attempt_state(%State{} = state, issue_id, retry_token) when is_reference(retry_token) do
     case Map.get(state.retry_attempts, issue_id) do
       %{attempt: attempt, retry_token: ^retry_token} = retry_entry ->
-        metadata = %{
-          identifier: Map.get(retry_entry, :identifier),
-          issue_url: Map.get(retry_entry, :issue_url),
-          error: Map.get(retry_entry, :error),
-          worker_host: Map.get(retry_entry, :worker_host),
-          workspace_path: Map.get(retry_entry, :workspace_path)
-        }
+        metadata = retry_metadata(retry_entry)
 
         {:ok, attempt, metadata, %{state | retry_attempts: Map.delete(state.retry_attempts, issue_id)}}
 
@@ -1105,7 +1199,62 @@ defmodule SymphonyElixir.Orchestrator do
            state,
            issue_id,
            attempt + 1,
-           Map.merge(metadata, %{error: "retry poll failed: #{inspect(reason)}"})
+           metadata
+           |> Map.delete(:delay_type)
+           |> Map.put(:error, "retry poll failed: #{inspect(reason)}")
+         )}
+    end
+  end
+
+  defp handle_capacity_retry_timer(%State{} = state, issue_id, retry_entry) do
+    handle_capacity_retry_result(
+      state,
+      issue_id,
+      retry_entry,
+      Tracker.fetch_issues_by_ids([issue_id])
+    )
+  end
+
+  defp handle_capacity_retry_result(state, issue_id, retry_entry, result) do
+    case result do
+      {:ok, issues} ->
+        case find_issue_by_id(issues, issue_id) do
+          %Issue{} = issue ->
+            if retry_candidate_issue?(issue, terminal_state_set()) do
+              state =
+                state
+                |> schedule_issue_retry(
+                  issue_id,
+                  retry_entry.attempt,
+                  retry_metadata(retry_entry)
+                )
+                |> request_poll()
+
+              {:noreply, state}
+            else
+              handle_retry_issue_lookup(
+                issue,
+                state,
+                issue_id,
+                retry_entry.attempt,
+                retry_metadata(retry_entry)
+              )
+            end
+
+          nil ->
+            {:noreply, release_issue_claim(state, issue_id)}
+        end
+
+      {:error, reason} ->
+        {:noreply,
+         schedule_issue_retry(
+           state,
+           issue_id,
+           retry_entry.attempt + 1,
+           retry_entry
+           |> retry_metadata()
+           |> Map.delete(:delay_type)
+           |> Map.put(:error, "retry poll failed: #{inspect(reason)}")
          )}
     end
   end
@@ -1140,7 +1289,7 @@ defmodule SymphonyElixir.Orchestrator do
   defp cleanup_issue_workspace(issue_or_identifier, metadata) when is_map(metadata) do
     case Map.get(metadata, :workspace_path) do
       workspace_path when is_binary(workspace_path) and workspace_path != "" ->
-        Workspace.remove_recorded(workspace_path, Map.get(metadata, :worker_host))
+        Workspace.remove_recorded(workspace_path, Map.get(metadata, :worker_host), Map.get(metadata, :workspace_managed, true))
 
       _ ->
         cleanup_issue_workspace(issue_or_identifier, Map.get(metadata, :worker_host))
@@ -1198,23 +1347,26 @@ defmodule SymphonyElixir.Orchestrator do
              state,
              issue.id,
              attempt + 1,
-             Map.merge(metadata, %{
+             metadata
+             |> Map.delete(:delay_type)
+             |> Map.merge(%{
                identifier: issue.identifier,
                error: "retry dispatch refresh failed: #{inspect(reason)}"
              })
            )}
       end
     else
-      Logger.debug("No available slots for retrying #{issue_context(issue)}; retrying again")
+      Logger.debug("No available slots for retrying #{issue_context(issue)}; capacity wait scheduled")
 
       {:noreply,
        schedule_issue_retry(
          state,
          issue.id,
-         attempt + 1,
+         attempt,
          Map.merge(metadata, %{
            identifier: issue.identifier,
-           error: "no available orchestrator slots"
+           error: "no available orchestrator slots",
+           delay_type: :capacity
          })
        )}
     end
@@ -1230,11 +1382,43 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp retry_delay(attempt, metadata) when is_integer(attempt) and attempt > 0 and is_map(metadata) do
-    if metadata[:delay_type] == :continuation and attempt == 1 do
+    if metadata[:delay_type] == :capacity or
+         (metadata[:delay_type] == :continuation and attempt == 1) do
       @continuation_retry_delay_ms
     else
       failure_retry_delay(attempt)
     end
+  end
+
+  defp capacity_waiting_retry?(%State{} = state, issue_id) do
+    match?({:ok, _retry_entry}, capacity_waiting_retry(state, issue_id))
+  end
+
+  defp capacity_waiting_retry(%State{} = state, issue_id) do
+    if MapSet.member?(state.claimed, issue_id) do
+      case Map.get(state.retry_attempts, issue_id) do
+        %{attempt: attempt, delay_type: :capacity} = retry_entry
+        when is_integer(attempt) and attempt > 0 ->
+          {:ok, retry_entry}
+
+        _ ->
+          :missing
+      end
+    else
+      :missing
+    end
+  end
+
+  defp retry_metadata(retry_entry) do
+    %{
+      identifier: Map.get(retry_entry, :identifier),
+      issue_url: Map.get(retry_entry, :issue_url),
+      error: Map.get(retry_entry, :error),
+      worker_host: Map.get(retry_entry, :worker_host),
+      workspace_path: Map.get(retry_entry, :workspace_path),
+      workspace_managed: Map.get(retry_entry, :workspace_managed, true),
+      delay_type: Map.get(retry_entry, :delay_type)
+    }
   end
 
   defp failure_retry_delay(attempt) do
@@ -1276,6 +1460,21 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp maybe_put_runtime_value(running_entry, key, value) when is_map(running_entry) do
     Map.put(running_entry, key, value)
+  end
+
+  defp maybe_put_correction_owner_binding(
+         %{correction_owner_active: true, codex_app_server_pid: existing} = running_entry,
+         _runtime_info
+       )
+       when not is_nil(existing),
+       do: running_entry
+
+  defp maybe_put_correction_owner_binding(running_entry, runtime_info)
+       when is_map(running_entry) and is_map(runtime_info) do
+    running_entry
+    |> maybe_put_runtime_value(:worker_host, runtime_info[:worker_host])
+    |> maybe_put_runtime_value(:workspace_path, runtime_info[:workspace_path])
+    |> maybe_put_runtime_value(:codex_app_server_pid, runtime_info[:codex_app_server_pid])
   end
 
   defp select_worker_host(%State{} = state, preferred_worker_host) do
@@ -1381,11 +1580,34 @@ defmodule SymphonyElixir.Orchestrator do
 
   @spec request_refresh(GenServer.server()) :: map() | :unavailable
   def request_refresh(server) do
-    if Process.whereis(server) do
+    if server_available?(server) do
       GenServer.call(server, :request_refresh)
     else
       :unavailable
     end
+  end
+
+  @spec queue_correction(GenServer.server(), map()) :: {:ok, map()} | {:error, term()}
+  def queue_correction(server, correction) when is_map(correction) do
+    if server_available?(server) do
+      GenServer.call(server, {:queue_correction, correction}, :infinity)
+    else
+      {:error, :unavailable}
+    end
+  catch
+    :exit, _reason -> {:error, :unavailable}
+  end
+
+  @spec correction_status(GenServer.server(), String.t()) ::
+          {:ok, map()} | {:error, :not_found | :unavailable}
+  def correction_status(server, instruction_id) when is_binary(instruction_id) do
+    if server_available?(server) do
+      GenServer.call(server, {:correction_status, instruction_id})
+    else
+      {:error, :unavailable}
+    end
+  catch
+    :exit, _reason -> {:error, :unavailable}
   end
 
   @spec snapshot() :: map() | :timeout | :unavailable
@@ -1499,6 +1721,234 @@ defmodule SymphonyElixir.Orchestrator do
      }, state}
   end
 
+  def handle_call({:queue_correction, correction}, _from, state) do
+    case validate_correction_binding(state, correction) do
+      {:ok, running_entry} ->
+        now = DateTime.utc_now()
+
+        record = %{
+          instruction_id: correction.instruction_id,
+          issue_id: correction.issue_id,
+          issue_identifier: correction.issue_identifier,
+          session_id: correction.session_id,
+          workspace_path: correction.workspace_path,
+          worker_pid: correction.worker_pid,
+          worker_host: correction.worker_host,
+          recovery: Map.get(correction, :recovery, false),
+          authorization_id: Map.get(correction, :authorization_id),
+          source_revision: Map.get(correction, :source_revision),
+          cwd_revision: Map.get(correction, :cwd_revision),
+          status: :queued,
+          queued_at: now,
+          updated_at: now,
+          result: nil,
+          error: nil
+        }
+
+        send(running_entry.pid, {:deliver_correction, correction})
+
+        {:reply, {:ok, record}, %{state | corrections: Map.put(state.corrections, correction.instruction_id, record)}}
+
+      {:error, reason} ->
+        {:reply, {:error, reason}, state}
+    end
+  end
+
+  def handle_call({:correction_status, instruction_id}, _from, state) do
+    case Map.fetch(state.corrections, instruction_id) do
+      {:ok, record} -> {:reply, {:ok, record}, state}
+      :error -> {:reply, {:error, :not_found}, state}
+    end
+  end
+
+  defp validate_correction_binding(%State{} = state, correction) do
+    required = [
+      :instruction_id,
+      :issue_id,
+      :issue_identifier,
+      :session_id,
+      :workspace_path,
+      :worker_pid,
+      :text
+    ]
+
+    cond do
+      not Enum.all?(required, &present_string?(Map.get(correction, &1))) ->
+        {:error, :invalid_correction}
+
+      not Map.has_key?(correction, :worker_host) ->
+        {:error, :invalid_correction}
+
+      Map.has_key?(state.corrections, correction.instruction_id) ->
+        {:error, :duplicate_instruction_id}
+
+      true ->
+        validate_running_correction_binding(Map.get(state.running, correction.issue_id), correction)
+    end
+  end
+
+  defp validate_running_correction_binding(nil, _correction), do: {:error, :stale_owner}
+
+  defp validate_running_correction_binding(running_entry, correction) do
+    binding_matches? =
+      running_entry.identifier == correction.issue_identifier and
+        running_entry.session_id == correction.session_id and
+        Map.get(running_entry, :workspace_path) == correction.workspace_path and
+        Map.get(running_entry, :codex_app_server_pid) == correction.worker_pid and
+        Map.get(running_entry, :worker_host) == correction.worker_host
+
+    cond do
+      not is_pid(Map.get(running_entry, :pid)) or not Process.alive?(running_entry.pid) ->
+        {:error, :stale_owner}
+
+      not binding_matches? ->
+        {:error, :owner_binding_mismatch}
+
+      Map.get(running_entry, :correction_owner_active) != true ->
+        {:error, :stale_owner}
+
+      true ->
+        if Map.get(running_entry, :correction_delivery_supported) == true do
+          {:ok, running_entry}
+        else
+          {:error, :unsupported_correction_transport}
+        end
+    end
+  end
+
+  defp integrate_correction_update(state, issue_id, running_entry, update) do
+    with status when not is_nil(status) <- correction_status_for_event(update.event),
+         instruction_id when is_binary(instruction_id) <- Map.get(update, :instruction_id),
+         %{issue_id: ^issue_id} = correction <- Map.get(state.corrections, instruction_id),
+         true <- correction_update_matches?(correction, running_entry, update, status) do
+      updated = transition_correction(correction, status, update)
+      %{state | corrections: Map.put(state.corrections, instruction_id, updated)}
+    else
+      _ -> state
+    end
+  end
+
+  defp correction_update_matches?(correction, running_entry, update, status) do
+    update_matches? =
+      correction.session_id == Map.get(update, :session_id) and
+        correction.workspace_path == Map.get(update, :workspace_path) and
+        correction.worker_pid == Map.get(update, :worker_pid) and
+        correction.worker_host == Map.get(update, :worker_host)
+
+    current_owner_matches? =
+      correction.session_id == running_entry.session_id and
+        correction.workspace_path == Map.get(running_entry, :workspace_path) and
+        correction.worker_pid == Map.get(running_entry, :codex_app_server_pid) and
+        correction.worker_host == Map.get(running_entry, :worker_host)
+
+    update_matches? and correction_run_evidence?(status, update) and
+      (status == :failed or current_owner_matches?)
+  end
+
+  defp correction_run_evidence?(status, update)
+       when status in [:execution_started, :completed, :blocked],
+       do: present_string?(Map.get(update, :run_id))
+
+  defp correction_run_evidence?(_status, _update), do: true
+
+  defp correction_status_for_event(:correction_delivered), do: :delivered
+  defp correction_status_for_event(:correction_execution_started), do: :execution_started
+  defp correction_status_for_event(:correction_completed), do: :completed
+  defp correction_status_for_event(:correction_blocked), do: :blocked
+  defp correction_status_for_event(:correction_failed), do: :failed
+  defp correction_status_for_event(_event), do: nil
+
+  defp transition_correction(correction, status, update) do
+    if correction_transition_allowed?(correction.status, status) do
+      correction
+      |> Map.put(:status, status)
+      |> Map.put(:updated_at, DateTime.utc_now())
+      |> maybe_put_runtime_value(:result, Map.get(update, :result))
+      |> maybe_put_runtime_value(:error, Map.get(update, :error))
+      |> maybe_put_runtime_value(:run_id, Map.get(update, :run_id))
+    else
+      correction
+    end
+  end
+
+  defp correction_transition_allowed?(:queued, status), do: status in [:delivered, :failed]
+
+  defp correction_transition_allowed?(:delivered, status),
+    do: status in [:execution_started, :failed]
+
+  defp correction_transition_allowed?(:execution_started, status),
+    do: status in [:completed, :blocked, :failed]
+
+  defp correction_transition_allowed?(_current, _status), do: false
+
+  defp fail_pending_corrections(state, issue_id, running_entry, error) do
+    corrections =
+      Map.new(state.corrections, fn {instruction_id, correction} ->
+        matches_owner? =
+          correction_matches_owner?(correction, issue_id, running_entry) and
+            correction.status not in [:completed, :blocked, :failed]
+
+        updated =
+          if matches_owner? do
+            correction
+            |> Map.put(:status, :failed)
+            |> Map.put(:error, error)
+            |> Map.put(:updated_at, DateTime.utc_now())
+          else
+            correction
+          end
+
+        {instruction_id, updated}
+      end)
+
+    %{state | corrections: corrections}
+  end
+
+  defp correction_matches_owner?(correction, issue_id, running_entry) when is_map(running_entry) do
+    correction.issue_id == issue_id and
+      correction.issue_identifier == Map.get(running_entry, :identifier) and
+      correction.session_id == Map.get(running_entry, :session_id) and
+      correction.workspace_path == Map.get(running_entry, :workspace_path) and
+      correction.worker_pid == Map.get(running_entry, :codex_app_server_pid) and
+      correction.worker_host == Map.get(running_entry, :worker_host)
+  end
+
+  defp correction_matches_owner?(_correction, _issue_id, _running_entry), do: false
+
+  defp maybe_fail_ended_owner_corrections(
+         state,
+         issue_id,
+         running_entry,
+         updated_running_entry,
+         %{event: event}
+       )
+       when event in [
+              :turn_completed,
+              :turn_failed,
+              :turn_cancelled,
+              :turn_input_required,
+              :approval_required,
+              :turn_ended_with_error
+            ] do
+    if Map.get(running_entry, :correction_owner_active) == true and
+         Map.get(updated_running_entry, :correction_owner_active) != true do
+      fail_pending_corrections(state, issue_id, running_entry, "owner turn ended")
+    else
+      state
+    end
+  end
+
+  defp maybe_fail_ended_owner_corrections(
+         state,
+         _issue_id,
+         _running_entry,
+         _updated_running_entry,
+         _update
+       ),
+       do: state
+
+  defp server_available?(server), do: not is_nil(GenServer.whereis(server))
+
   defp blocked_issue_state(%{issue: %Issue{state: state}}), do: state
   defp blocked_issue_state(_metadata), do: nil
 
@@ -1521,6 +1971,8 @@ defmodule SymphonyElixir.Orchestrator do
         last_codex_timestamp: timestamp,
         last_codex_message: summarize_codex_update(update),
         session_id: session_id_for_update(running_entry.session_id, update),
+        correction_owner_active: correction_owner_active_for_update(running_entry, update),
+        correction_delivery_supported: correction_delivery_supported_for_update(running_entry, update),
         last_codex_event: event,
         codex_app_server_pid: codex_app_server_pid_for_update(codex_app_server_pid, update),
         codex_input_tokens: codex_input_tokens + token_delta.input_tokens,
@@ -1552,6 +2004,32 @@ defmodule SymphonyElixir.Orchestrator do
     do: session_id
 
   defp session_id_for_update(existing, _update), do: existing
+
+  defp correction_owner_active_for_update(_running_entry, %{event: :session_started}), do: true
+
+  defp correction_owner_active_for_update(_running_entry, %{event: event})
+       when event in [
+              :turn_completed,
+              :turn_failed,
+              :turn_cancelled,
+              :turn_input_required,
+              :approval_required,
+              :turn_ended_with_error
+            ],
+       do: false
+
+  defp correction_owner_active_for_update(running_entry, _update),
+    do: Map.get(running_entry, :correction_owner_active, false)
+
+  defp correction_delivery_supported_for_update(_running_entry, %{
+         event: :session_started,
+         correction_delivery_supported: supported
+       })
+       when is_boolean(supported),
+       do: supported
+
+  defp correction_delivery_supported_for_update(running_entry, _update),
+    do: Map.get(running_entry, :correction_delivery_supported, false)
 
   defp turn_count_for_update(existing_count, existing_session_id, %{
          event: :session_started,
@@ -1593,6 +2071,17 @@ defmodule SymphonyElixir.Orchestrator do
         tick_token: tick_token,
         next_poll_due_at_ms: System.monotonic_time(:millisecond) + delay_ms
     }
+  end
+
+  defp request_poll(%State{} = state) do
+    now_ms = System.monotonic_time(:millisecond)
+    already_due? = is_integer(state.next_poll_due_at_ms) and state.next_poll_due_at_ms <= now_ms
+
+    if state.poll_check_in_progress == true or already_due? do
+      state
+    else
+      schedule_tick(state, 0)
+    end
   end
 
   defp schedule_poll_cycle_start do

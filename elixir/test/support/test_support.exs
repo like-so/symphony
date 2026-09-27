@@ -101,6 +101,7 @@ defmodule SymphonyElixir.TestSupport do
           tracker_terminal_states: ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"],
           poll_interval_ms: 30_000,
           workspace_root: Path.join(System.tmp_dir!(), "symphony_workspaces"),
+          workspace_bindings: %{},
           worker_ssh_hosts: [],
           worker_max_concurrent_agents_per_host: nil,
           max_concurrent_agents: 10,
@@ -124,6 +125,7 @@ defmodule SymphonyElixir.TestSupport do
           observability_render_interval_ms: 16,
           server_port: nil,
           server_host: nil,
+          server_correction_token: nil,
           prompt: @workflow_prompt
         ],
         overrides
@@ -139,6 +141,7 @@ defmodule SymphonyElixir.TestSupport do
     tracker_terminal_states = Keyword.get(config, :tracker_terminal_states)
     poll_interval_ms = Keyword.get(config, :poll_interval_ms)
     workspace_root = Keyword.get(config, :workspace_root)
+    workspace_bindings = Keyword.get(config, :workspace_bindings)
     worker_ssh_hosts = Keyword.get(config, :worker_ssh_hosts)
     worker_max_concurrent_agents_per_host = Keyword.get(config, :worker_max_concurrent_agents_per_host)
     max_concurrent_agents = Keyword.get(config, :max_concurrent_agents)
@@ -162,6 +165,7 @@ defmodule SymphonyElixir.TestSupport do
     observability_render_interval_ms = Keyword.get(config, :observability_render_interval_ms)
     server_port = Keyword.get(config, :server_port)
     server_host = Keyword.get(config, :server_host)
+    server_correction_token = Keyword.get(config, :server_correction_token)
     prompt = Keyword.get(config, :prompt)
 
     sections =
@@ -180,6 +184,7 @@ defmodule SymphonyElixir.TestSupport do
         "  interval_ms: #{yaml_value(poll_interval_ms)}",
         "workspace:",
         "  root: #{yaml_value(workspace_root)}",
+        "  bindings: #{Jason.encode!(workspace_bindings)}",
         worker_yaml(worker_ssh_hosts, worker_max_concurrent_agents_per_host),
         "agent:",
         "  max_concurrent_agents: #{yaml_value(max_concurrent_agents)}",
@@ -196,7 +201,7 @@ defmodule SymphonyElixir.TestSupport do
         "  stall_timeout_ms: #{yaml_value(codex_stall_timeout_ms)}",
         hooks_yaml(hook_after_create, hook_before_run, hook_after_run, hook_before_remove, hook_timeout_ms),
         observability_yaml(observability_enabled, observability_refresh_ms, observability_render_interval_ms),
-        server_yaml(server_port, server_host),
+        server_yaml(server_port, server_host, server_correction_token),
         "---",
         prompt
       ]
@@ -267,13 +272,14 @@ defmodule SymphonyElixir.TestSupport do
     |> Enum.join("\n")
   end
 
-  defp server_yaml(nil, nil), do: nil
+  defp server_yaml(nil, nil, nil), do: nil
 
-  defp server_yaml(port, host) do
+  defp server_yaml(port, host, correction_token) do
     [
       "server:",
       port && "  port: #{yaml_value(port)}",
-      host && "  host: #{yaml_value(host)}"
+      host && "  host: #{yaml_value(host)}",
+      correction_token && "  correction_token: #{yaml_value(correction_token)}"
     ]
     |> Enum.reject(&is_nil/1)
     |> Enum.join("\n")

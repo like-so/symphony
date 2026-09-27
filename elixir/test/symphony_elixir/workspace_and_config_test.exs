@@ -5,6 +5,41 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
   alias SymphonyElixir.Config.Schema.{Codex, StringOrMap}
   alias SymphonyElixir.Linear.Client
 
+  test "explicit directory binding reuses and protects an existing operations workspace" do
+    root = Path.join(System.tmp_dir!(), "symphony-bound-directory-#{System.unique_integer([:positive])}")
+    path = Path.join(root, "operations")
+    File.mkdir_p!(path)
+    on_exit(fn -> File.rm_rf!(root) end)
+    File.write!(Path.join(path, "keep.txt"), "existing data")
+    binding = %{"root" => root, "path" => "operations", "kind" => "directory"}
+    write_workflow_file!(Workflow.workflow_file_path(),
+      workspace_bindings: %{"OPS-1" => binding}, hook_after_create: "exit 99")
+    issue = %Issue{id: "ops-1", identifier: "OPS-1", description: "Inspect the service"}
+    assert {:ok, context} = Workspace.context_for_issue(issue)
+    refute context.managed
+    assert {:ok, canonical} = SymphonyElixir.PathSafety.canonicalize(path)
+    assert context.workspace_path == canonical
+    assert {:ok, ^canonical} = Workspace.create_for_issue(issue)
+    refute File.exists?(Path.join(path, ".git"))
+    assert {:ok, []} = Workspace.remove(canonical)
+    assert {:ok, []} = Workspace.remove_recorded(canonical, nil, false)
+    assert File.read!(Path.join(path, "keep.txt")) == "existing data"
+    assert {:ok, changed} = Workspace.context_for_issue(%{issue | description: "New direction"})
+    refute changed.source_revision == context.source_revision
+  end
+
+  test "missing explicit directory fails without falling back to the default workspace" do
+    root = Path.join(System.tmp_dir!(), "symphony-missing-binding-#{System.unique_integer([:positive])}")
+    File.mkdir_p!(root)
+    on_exit(fn -> File.rm_rf!(root) end)
+    write_workflow_file!(Workflow.workflow_file_path(),
+      workspace_root: Path.join(root, "default"),
+      workspace_bindings: %{"OPS-2" => %{"root" => root, "path" => "missing", "kind" => "directory"}})
+    assert {:error, _reason} = Workspace.create_for_issue("OPS-2")
+    refute File.exists?(Path.join(root, "default"))
+    refute File.exists?(Path.join(root, "missing"))
+  end
+
   test "workspace bootstrap can be implemented in after_create hook" do
     test_root =
       Path.join(
@@ -35,6 +70,79 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       assert File.exists?(Path.join(workspace, ".git"))
       assert File.read!(Path.join(workspace, "README.md")) == "hook clone\n"
       assert File.read!(Path.join([workspace, "keep", "file.txt"])) == "keep me"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "workspace hooks do not inherit the correction control token" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-workspace-correction-secret-#{System.unique_integer([:positive])}"
+      )
+
+    startup_secret_name =
+      "SYMPHONY_WORKSPACE_STARTUP_CORRECTION_SECRET_#{System.unique_integer([:positive])}"
+
+    current_secret_name =
+      "SYMPHONY_WORKSPACE_CURRENT_CORRECTION_SECRET_#{System.unique_integer([:positive])}"
+
+    previous_startup_secret = System.get_env(startup_secret_name)
+    previous_current_secret = System.get_env(current_secret_name)
+    previous_path = System.get_env("PATH")
+
+    previous_correction_control_startup =
+      Application.get_env(:symphony_elixir, :correction_control_startup)
+
+    on_exit(fn ->
+      restore_env(startup_secret_name, previous_startup_secret)
+      restore_env(current_secret_name, previous_current_secret)
+      restore_env("PATH", previous_path)
+
+      if previous_correction_control_startup do
+        Application.put_env(
+          :symphony_elixir,
+          :correction_control_startup,
+          previous_correction_control_startup
+        )
+      else
+        Application.delete_env(:symphony_elixir, :correction_control_startup)
+      end
+    end)
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      fake_bin = Path.join(test_root, "bin")
+      fake_sh = Path.join(fake_bin, "sh")
+
+      File.mkdir_p!(fake_bin)
+
+      File.write!(fake_sh, """
+      #!/bin/sh
+      export #{startup_secret_name}=reintroduced-by-shell-startup
+      export #{current_secret_name}=reintroduced-by-shell-startup
+      exec /bin/sh "$@"
+      """)
+
+      File.chmod!(fake_sh, 0o755)
+      System.put_env(startup_secret_name, "startup-secret")
+      System.put_env(current_secret_name, "current-secret")
+      System.put_env("PATH", fake_bin <> ":" <> (previous_path || ""))
+
+      Application.put_env(:symphony_elixir, :correction_control_startup, %{
+        token: "startup-secret",
+        secret_environment_names: [startup_secret_name]
+      })
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        server_correction_token: "$#{current_secret_name}",
+        hook_after_create: "if [ -z \"${#{startup_secret_name}+x}\" ] && [ -z \"${#{current_secret_name}+x}\" ]; then printf absent > correction-secret; else printf present > correction-secret; fi"
+      )
+
+      assert {:ok, workspace} = Workspace.create_for_issue("MT-CORRECTION-SECRET")
+      assert File.read!(Path.join(workspace, "correction-secret")) == "absent"
     after
       File.rm_rf(test_root)
     end
@@ -1226,6 +1334,63 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
            }
   end
 
+  test "schema applies plane provider defaults and resolves api token env references" do
+    api_key_env_var = "SYMPHONY_PLANE_TOKEN_#{System.unique_integer([:positive])}"
+    previous_api_key = System.get_env(api_key_env_var)
+    api_key = "plane-api-token"
+    System.put_env(api_key_env_var, api_key)
+
+    on_exit(fn -> restore_env(api_key_env_var, previous_api_key) end)
+
+    assert {:ok, settings} =
+             Schema.parse(%{
+               tracker: %{
+                 kind: "plane",
+                 provider: %{
+                   base_url: "http://plane.local/",
+                   api_key: "$#{api_key_env_var}",
+                   workspace_slug: "plane",
+                   project_identifier: "NAUTILUS",
+                   claim_state: "In Progress"
+                 }
+               }
+             })
+
+    assert settings.tracker.kind == "plane"
+    assert settings.tracker.api_key == api_key
+    assert settings.tracker.active_states == ["Todo", "In Progress"]
+    assert settings.tracker.terminal_states == ["Done", "Cancelled", "Canceled"]
+    assert settings.tracker.secret_environment_names == ["PLANE_API_KEY", api_key_env_var]
+
+    assert settings.tracker.provider == %{
+             "base_url" => "http://plane.local/",
+             "api_key" => "$#{api_key_env_var}",
+             "workspace_slug" => "plane",
+             "project_identifier" => "NAUTILUS",
+             "claim_state" => "In Progress"
+           }
+  end
+
+  test "schema preserves explicit plane active and terminal states" do
+    assert {:ok, settings} =
+             Schema.parse(%{
+               tracker: %{
+                 kind: "plane",
+                 active_states: ["Ready", "Doing"],
+                 terminal_states: ["Shipped"],
+                 provider: %{
+                   base_url: "http://plane.local",
+                   api_key: "plane-token",
+                   workspace_slug: "plane",
+                   project_identifier: "NAUTILUS"
+                 }
+               }
+             })
+
+    assert settings.tracker.active_states == ["Ready", "Doing"]
+    assert settings.tracker.terminal_states == ["Shipped"]
+  end
+
   test "linear adapter rejects invalid provider values without crashing config parsing" do
     assert {:ok, invalid_secret_settings} =
              Schema.parse(%{
@@ -1607,10 +1772,13 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
     previous_path = System.get_env("PATH")
     previous_trace = System.get_env("SYMP_TEST_SSH_TRACE")
+    secret_name = "SYMPHONY_REMOTE_CORRECTION_SECRET_#{System.unique_integer([:positive])}"
+    previous_secret = System.get_env(secret_name)
 
     on_exit(fn ->
       restore_env("PATH", previous_path)
       restore_env("SYMP_TEST_SSH_TRACE", previous_trace)
+      restore_env(secret_name, previous_secret)
     end)
 
     try do
@@ -1621,12 +1789,14 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
       File.mkdir_p!(test_root)
       System.put_env("SYMP_TEST_SSH_TRACE", trace_file)
+      System.put_env(secret_name, "configured-secret")
       System.put_env("PATH", test_root <> ":" <> (previous_path || ""))
 
       File.write!(fake_ssh, """
       #!/bin/sh
       trace_file="${SYMP_TEST_SSH_TRACE:-/tmp/symphony-fake-ssh.trace}"
       printf 'ARGV:%s\\n' "$*" >> "$trace_file"
+      if [ -z "${#{secret_name}+x}" ]; then printf 'ENV:absent\\n' >> "$trace_file"; else printf 'ENV:present\\n' >> "$trace_file"; fi
 
       case "$*" in
         *"__SYMPHONY_WORKSPACE__"*)
@@ -1642,6 +1812,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       write_workflow_file!(Workflow.workflow_file_path(),
         workspace_root: workspace_root,
         worker_ssh_hosts: ["worker-01:2200"],
+        server_correction_token: "$#{secret_name}",
         hook_before_run: "echo before-run",
         hook_after_run: "echo after-run",
         hook_before_remove: "echo before-remove"
@@ -1656,6 +1827,8 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
       trace = File.read!(trace_file)
       assert trace =~ "-p 2200 worker-01 bash -lc"
+      assert trace =~ "ENV:absent"
+      assert trace =~ "unset #{secret_name}"
       assert trace =~ "__SYMPHONY_WORKSPACE__"
       assert trace =~ "~/.symphony-remote-workspaces/MT-SSH-WS"
       assert trace =~ "${workspace#\\~/}"

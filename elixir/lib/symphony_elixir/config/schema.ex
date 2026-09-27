@@ -11,6 +11,8 @@ defmodule SymphonyElixir.Config.Schema do
   @linear_endpoint "https://api.linear.app/graphql"
   @linear_active_states ["Todo", "In Progress"]
   @linear_terminal_states ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"]
+  @plane_active_states ["Todo", "In Progress"]
+  @plane_terminal_states ["Done", "Cancelled", "Canceled"]
 
   @type t :: %__MODULE__{}
 
@@ -112,12 +114,29 @@ defmodule SymphonyElixir.Config.Schema do
     @primary_key false
     embedded_schema do
       field(:root, :string, default: Path.join(System.tmp_dir!(), "symphony_workspaces"))
+      field(:bindings, :map, default: %{})
     end
 
     @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
     def changeset(schema, attrs) do
       schema
-      |> cast(attrs, [:root], empty_values: [])
+      |> cast(attrs, [:root, :bindings], empty_values: [])
+      |> validate_required([:bindings])
+      |> update_change(:bindings, fn bindings ->
+        Map.new(bindings || %{}, fn {identifier, binding} ->
+          {identifier, SymphonyElixir.Config.Schema.resolve_workspace_binding(binding)}
+        end)
+      end)
+      |> validate_change(:bindings, fn :bindings, bindings ->
+        if Enum.all?(bindings, fn {identifier, binding} ->
+             is_binary(identifier) and String.trim(identifier) != "" and
+               SymphonyElixir.Config.Schema.valid_workspace_binding?(binding)
+           end) do
+          []
+        else
+          [bindings: "must contain exact identifiers and valid root/path/kind/origin/revision bindings"]
+        end
+      end)
     end
   end
 
@@ -279,12 +298,14 @@ defmodule SymphonyElixir.Config.Schema do
     embedded_schema do
       field(:port, :integer)
       field(:host, :string, default: "127.0.0.1")
+      field(:correction_token, :string)
+      field(:secret_environment_names, {:array, :string}, default: [])
     end
 
     @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
     def changeset(schema, attrs) do
       schema
-      |> cast(attrs, [:port, :host], empty_values: [])
+      |> cast(attrs, [:port, :host, :correction_token], empty_values: [])
       |> validate_number(:port, greater_than_or_equal_to: 0)
     end
   end
@@ -381,6 +402,42 @@ defmodule SymphonyElixir.Config.Schema do
     end)
   end
 
+  @doc false
+  @spec resolve_workspace_binding(term()) :: term()
+  def resolve_workspace_binding(binding) when is_map(binding) do
+    Map.new(binding, fn
+      {key, value} when key in ["root", "path", "origin", "revision"] and is_binary(value) ->
+        {key, resolve_env_value(value, nil)}
+
+      pair ->
+        pair
+    end)
+  end
+
+  def resolve_workspace_binding(binding), do: binding
+
+  @doc false
+  @spec valid_workspace_binding?(term()) :: boolean()
+  def valid_workspace_binding?(binding) when is_map(binding) do
+    text? = fn value ->
+      is_binary(value) and String.trim(value) != "" and
+        not String.contains?(value, ["\n", "\r", <<0>>])
+    end
+
+    Enum.all?(Map.keys(binding), &(&1 in ["root", "path", "kind", "origin", "revision"])) and
+      text?.(binding["root"]) and text?.(binding["path"]) and
+      case binding["kind"] do
+        "directory" -> not Map.has_key?(binding, "origin") and not Map.has_key?(binding, "revision")
+        "repository" ->
+          text?.(binding["origin"]) and
+            (not Map.has_key?(binding, "revision") or
+               (is_binary(binding["revision"]) and Regex.match?(~r/\A(?:[0-9a-f]{40}|[0-9a-f]{64})\z/, binding["revision"])))
+        _ -> false
+      end
+  end
+
+  def valid_workspace_binding?(_binding), do: false
+
   defp changeset(attrs) do
     %__MODULE__{}
     |> cast(attrs, [])
@@ -398,44 +455,8 @@ defmodule SymphonyElixir.Config.Schema do
   defp finalize_settings(settings) do
     provider = normalize_optional_map(settings.tracker.provider) || %{}
 
-    {api_key, assignee, provider, secret_environment_names} =
-      case settings.tracker.kind do
-        "linear" ->
-          linear_provider =
-            provider
-            |> Map.put_new("endpoint", settings.tracker.endpoint || @linear_endpoint)
-            |> Map.put_new("api_key", settings.tracker.api_key)
-            |> Map.put_new("project_slug", settings.tracker.project_slug)
-            |> Map.put_new("assignee", settings.tracker.assignee)
-
-          resolved_api_key =
-            resolve_secret_setting(linear_provider["api_key"], System.get_env("LINEAR_API_KEY"))
-
-          resolved_assignee =
-            resolve_secret_setting(linear_provider["assignee"], System.get_env("LINEAR_ASSIGNEE"))
-
-          {
-            resolved_api_key,
-            resolved_assignee,
-            linear_provider,
-            ["LINEAR_API_KEY" | env_reference_names([linear_provider["api_key"]])]
-          }
-
-        _ ->
-          {settings.tracker.api_key, settings.tracker.assignee, provider, []}
-      end
-
-    {active_states, terminal_states} =
-      case settings.tracker.kind do
-        kind when kind in ["linear", "memory"] ->
-          {
-            settings.tracker.active_states || @linear_active_states,
-            settings.tracker.terminal_states || @linear_terminal_states
-          }
-
-        _ ->
-          {settings.tracker.active_states, settings.tracker.terminal_states}
-      end
+    {api_key, assignee, provider, secret_environment_names} = tracker_auth_settings(settings, provider)
+    {active_states, terminal_states} = tracker_state_settings(settings)
 
     tracker = %{
       settings.tracker
@@ -460,7 +481,66 @@ defmodule SymphonyElixir.Config.Schema do
         turn_sandbox_policy: normalize_optional_map(settings.codex.turn_sandbox_policy)
     }
 
-    %{settings | tracker: tracker, workspace: workspace, codex: codex}
+    server = %{
+      settings.server
+      | correction_token: resolve_secret_setting(settings.server.correction_token, nil),
+        secret_environment_names: env_reference_names([settings.server.correction_token])
+    }
+
+    %{settings | tracker: tracker, workspace: workspace, codex: codex, server: server}
+  end
+
+  defp tracker_auth_settings(%{tracker: %{kind: "linear"} = tracker}, provider) do
+    linear_provider =
+      provider
+      |> Map.put_new("endpoint", tracker.endpoint || @linear_endpoint)
+      |> Map.put_new("api_key", tracker.api_key)
+      |> Map.put_new("project_slug", tracker.project_slug)
+      |> Map.put_new("assignee", tracker.assignee)
+
+    resolved_api_key = resolve_secret_setting(linear_provider["api_key"], System.get_env("LINEAR_API_KEY"))
+    resolved_assignee = resolve_secret_setting(linear_provider["assignee"], System.get_env("LINEAR_ASSIGNEE"))
+
+    {
+      resolved_api_key,
+      resolved_assignee,
+      linear_provider,
+      ["LINEAR_API_KEY" | env_reference_names([linear_provider["api_key"]])]
+    }
+  end
+
+  defp tracker_auth_settings(%{tracker: %{kind: "plane"} = tracker}, provider) do
+    plane_provider = Map.put_new(provider, "api_key", tracker.api_key)
+    resolved_api_key = resolve_secret_setting(plane_provider["api_key"], System.get_env("PLANE_API_KEY"))
+
+    {
+      resolved_api_key,
+      tracker.assignee,
+      plane_provider,
+      ["PLANE_API_KEY" | env_reference_names([plane_provider["api_key"]])]
+    }
+  end
+
+  defp tracker_auth_settings(%{tracker: tracker}, provider) do
+    {tracker.api_key, tracker.assignee, provider, []}
+  end
+
+  defp tracker_state_settings(%{tracker: %{kind: kind} = tracker}) when kind in ["linear", "memory"] do
+    {
+      tracker.active_states || @linear_active_states,
+      tracker.terminal_states || @linear_terminal_states
+    }
+  end
+
+  defp tracker_state_settings(%{tracker: %{kind: "plane"} = tracker}) do
+    {
+      tracker.active_states || @plane_active_states,
+      tracker.terminal_states || @plane_terminal_states
+    }
+  end
+
+  defp tracker_state_settings(%{tracker: tracker}) do
+    {tracker.active_states, tracker.terminal_states}
   end
 
   defp normalize_keys(value) when is_map(value) do
@@ -477,6 +557,11 @@ defmodule SymphonyElixir.Config.Schema do
 
   defp normalize_key(value) when is_atom(value), do: Atom.to_string(value)
   defp normalize_key(value), do: to_string(value)
+
+  # Binding nulls are errors, not absent configuration (which would enable fallback).
+  defp drop_nil_values(%{"bindings" => bindings} = value) do
+    value |> Map.delete("bindings") |> drop_nil_values() |> Map.put("bindings", bindings)
+  end
 
   defp drop_nil_values(value) when is_map(value) do
     Enum.reduce(value, %{}, fn {key, nested}, acc ->

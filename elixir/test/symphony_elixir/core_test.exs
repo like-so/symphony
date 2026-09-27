@@ -150,6 +150,26 @@ defmodule SymphonyElixir.CoreTest do
     assert :ok = Config.validate!()
   end
 
+  test "correction control token resolves from an environment reference" do
+    env_name = "SYMPHONY_CORRECTION_TOKEN_TEST_#{System.unique_integer([:positive])}"
+    previous = System.get_env(env_name)
+    System.put_env(env_name, "configured-token")
+    on_exit(fn -> restore_env(env_name, previous) end)
+
+    write_workflow_file!(Workflow.workflow_file_path(), server_correction_token: "$#{env_name}")
+
+    settings = Config.settings!()
+    assert settings.server.correction_token == "configured-token"
+    assert settings.server.secret_environment_names == [env_name]
+  end
+
+  test "correction control token rejects a literal workflow secret" do
+    write_workflow_file!(Workflow.workflow_file_path(), server_correction_token: "literal-token")
+
+    assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
+    assert message =~ "server.correction_token must use a host environment reference"
+  end
+
   test "linear assignee resolves from LINEAR_ASSIGNEE env var" do
     previous_linear_assignee = System.get_env("LINEAR_ASSIGNEE")
     env_assignee = "dev@example.com"
@@ -1048,15 +1068,21 @@ defmodule SymphonyElixir.CoreTest do
       |> Map.put(:retry_attempts, %{})
     end)
 
+    down_sent_at_ms = System.monotonic_time(:millisecond)
     send(pid, {:DOWN, ref, :process, self(), :normal})
-    Process.sleep(50)
+
+    assert %{attempt: 1, due_at_ms: due_at_ms, identifier: "MT-558", timer_ref: timer_ref} =
+             eventually_value(fn -> :sys.get_state(pid).retry_attempts[issue_id] end)
+
+    down_observed_at_ms = System.monotonic_time(:millisecond)
     state = :sys.get_state(pid)
 
     refute Map.has_key?(state.running, issue_id)
     assert MapSet.member?(state.completed, issue_id)
-    assert %{attempt: 1, due_at_ms: due_at_ms} = state.retry_attempts[issue_id]
     assert is_integer(due_at_ms)
-    assert_due_in_range(due_at_ms, 500, 1_100)
+    assert due_at_ms >= down_sent_at_ms + 1_000
+    assert due_at_ms <= down_observed_at_ms + 1_000
+    assert Process.cancel_timer(timer_ref) > 0
   end
 
   test "abnormal worker exit increments retry attempt progressively" do
@@ -1089,14 +1115,15 @@ defmodule SymphonyElixir.CoreTest do
       |> Map.put(:retry_attempts, %{})
     end)
 
+    down_sent_at_ms = System.monotonic_time(:millisecond)
     send(pid, {:DOWN, ref, :process, self(), :boom})
-    Process.sleep(50)
-    state = :sys.get_state(pid)
 
     assert %{attempt: 3, due_at_ms: due_at_ms, identifier: "MT-559", error: "agent exited: :boom"} =
-             state.retry_attempts[issue_id]
+             eventually_value(fn -> :sys.get_state(pid).retry_attempts[issue_id] end)
 
-    assert_due_in_range(due_at_ms, 39_500, 40_500)
+    retry_delay_ms = due_at_ms - down_sent_at_ms
+    assert retry_delay_ms >= 40_000
+    assert retry_delay_ms <= 40_500
   end
 
   test "first abnormal worker exit waits before retrying" do
@@ -1206,6 +1233,767 @@ defmodule SymphonyElixir.CoreTest do
 
     assert coalesced_state.tick_token == refreshed_state.tick_token
     assert {:noreply, ^coalesced_state} = Orchestrator.handle_info({:tick, stale_tick_token}, coalesced_state)
+  end
+
+  test "correction delivery requires the exact active owner and rejects duplicate instruction IDs" do
+    issue_id = "issue-correction"
+
+    running_entry = %{
+      pid: self(),
+      identifier: "MT-CORRECTION",
+      session_id: "local-letta-turn-7",
+      workspace_path: "/workspaces/MT-CORRECTION",
+      codex_app_server_pid: "4242",
+      worker_host: nil,
+      correction_owner_active: true,
+      correction_delivery_supported: true
+    }
+
+    correction = %{
+      instruction_id: "correction-1",
+      issue_id: issue_id,
+      issue_identifier: "MT-CORRECTION",
+      session_id: "local-letta-turn-7",
+      workspace_path: "/workspaces/MT-CORRECTION",
+      worker_pid: "4242",
+      worker_host: nil,
+      text: "Apply the authorized correction."
+    }
+
+    state = %Orchestrator.State{running: %{issue_id => running_entry}}
+
+    assert {:reply, {:ok, %{status: :queued}}, queued_state} =
+             Orchestrator.handle_call({:queue_correction, correction}, {self(), make_ref()}, state)
+
+    assert_receive {:deliver_correction, ^correction}
+
+    unrelated_correction = %{
+      queued_state.corrections[correction.instruction_id]
+      | instruction_id: "correction-other-owner",
+        workspace_path: "/workspaces/MT-ENDED-OTHER"
+    }
+
+    queued_state = %{
+      queued_state
+      | corrections:
+          Map.put(
+            queued_state.corrections,
+            unrelated_correction.instruction_id,
+            unrelated_correction
+          )
+    }
+
+    assert {:reply, {:error, :duplicate_instruction_id}, ^queued_state} =
+             Orchestrator.handle_call({:queue_correction, correction}, {self(), make_ref()}, queued_state)
+
+    refute_receive {:deliver_correction, _correction}
+
+    missing_worker_host = correction |> Map.delete(:worker_host) |> Map.put(:instruction_id, "correction-missing-host")
+
+    assert {:reply, {:error, :invalid_correction}, ^state} =
+             Orchestrator.handle_call(
+               {:queue_correction, missing_worker_host},
+               {self(), make_ref()},
+               state
+             )
+
+    stale_state = %Orchestrator.State{}
+
+    assert {:reply, {:error, :stale_owner}, ^stale_state} =
+             Orchestrator.handle_call({:queue_correction, correction}, {self(), make_ref()}, stale_state)
+
+    mismatched = %{correction | instruction_id: "correction-2", session_id: "local-letta-turn-old"}
+
+    assert {:reply, {:error, :owner_binding_mismatch}, ^state} =
+             Orchestrator.handle_call({:queue_correction, mismatched}, {self(), make_ref()}, state)
+
+    for {field, value} <- [
+          {:issue_identifier, "MT-OTHER"},
+          {:workspace_path, "/workspaces/MT-OTHER"},
+          {:worker_host, "worker-b"}
+        ] do
+      changed = correction |> Map.put(:instruction_id, "correction-changed-#{field}") |> Map.put(field, value)
+
+      assert {:reply, {:error, :owner_binding_mismatch}, ^state} =
+               Orchestrator.handle_call({:queue_correction, changed}, {self(), make_ref()}, state)
+    end
+
+    replaced = %{correction | instruction_id: "correction-replaced", worker_pid: "5252"}
+
+    assert {:reply, {:error, :owner_binding_mismatch}, ^state} =
+             Orchestrator.handle_call({:queue_correction, replaced}, {self(), make_ref()}, state)
+
+    ended_state = put_in(state.running[issue_id].correction_owner_active, false)
+    ended = %{correction | instruction_id: "correction-ended"}
+
+    assert {:reply, {:error, :stale_owner}, ^ended_state} =
+             Orchestrator.handle_call({:queue_correction, ended}, {self(), make_ref()}, ended_state)
+
+    dead_pid = spawn(fn -> receive do: (:stop -> :ok) end)
+    dead_ref = Process.monitor(dead_pid)
+    send(dead_pid, :stop)
+    assert_receive {:DOWN, ^dead_ref, :process, ^dead_pid, :normal}
+    dead_state = put_in(state.running[issue_id].pid, dead_pid)
+    dead = %{correction | instruction_id: "correction-dead"}
+
+    assert {:reply, {:error, :stale_owner}, ^dead_state} =
+             Orchestrator.handle_call({:queue_correction, dead}, {self(), make_ref()}, dead_state)
+
+    unsupported_state = put_in(state.running[issue_id].correction_delivery_supported, false)
+    unsupported = %{correction | instruction_id: "correction-3"}
+
+    assert {:reply, {:error, :unsupported_correction_transport}, ^unsupported_state} =
+             Orchestrator.handle_call(
+               {:queue_correction, unsupported},
+               {self(), make_ref()},
+               unsupported_state
+             )
+  end
+
+  test "capacity-only urgent waiter admission before lower-priority candidate" do
+    suffix = System.unique_integer([:positive])
+    test_root = Path.join(System.tmp_dir!(), "symphony-capacity-admission-#{suffix}")
+    task_supervisor_name = Module.concat(__MODULE__, "CapacityTaskSupervisor#{suffix}")
+    orchestrator_name = Module.concat(__MODULE__, "CapacityOrchestrator#{suffix}")
+    previous_memory_issues = Application.get_env(:symphony_elixir, :memory_tracker_issues)
+
+    urgent_issue = %Issue{
+      id: "issue-urgent-capacity-#{suffix}",
+      identifier: "MT-URGENT-#{suffix}",
+      title: "Urgent capacity waiter",
+      state: "In Progress",
+      priority: 1,
+      created_at: ~U[2026-01-01 00:00:00Z],
+      dispatchable: true
+    }
+
+    same_priority_issue = %Issue{
+      id: "issue-same-priority-#{suffix}",
+      identifier: "MT-SAME-#{suffix}",
+      title: "Same priority candidate",
+      state: "Todo",
+      priority: 1,
+      created_at: ~U[2026-01-02 00:00:00Z],
+      dispatchable: true
+    }
+
+    lower_priority_issue = %Issue{
+      id: "issue-lower-priority-#{suffix}",
+      identifier: "MT-LOWER-#{suffix}",
+      title: "Lower priority candidate",
+      state: "Todo",
+      priority: 2,
+      created_at: ~U[2026-01-01 00:00:00Z],
+      dispatchable: true
+    }
+
+    lower_priority_waiter = %Issue{
+      id: "issue-lower-waiter-#{suffix}",
+      identifier: "MT-LOWER-WAITER-#{suffix}",
+      title: "Lower priority capacity waiter",
+      state: "In Progress",
+      priority: 4,
+      created_at: ~U[2025-12-01 00:00:00Z],
+      dispatchable: true
+    }
+
+    occupied_issue_id = "issue-occupied-#{suffix}"
+    retry_token = make_ref()
+    lower_retry_token = make_ref()
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      workspace_root: test_root,
+      poll_interval_ms: 30_000,
+      max_concurrent_agents: 1,
+      hook_before_run: "sleep 60",
+      hook_timeout_ms: 60_000
+    )
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [])
+    {:ok, task_supervisor_pid} = Task.Supervisor.start_link(name: task_supervisor_name)
+    Process.unlink(task_supervisor_pid)
+
+    {:ok, pid} =
+      Orchestrator.start_link(
+        name: orchestrator_name,
+        task_supervisor: task_supervisor_name
+      )
+
+    Process.unlink(pid)
+
+    on_exit(fn ->
+      restore_app_env(:memory_tracker_issues, previous_memory_issues)
+
+      if Process.alive?(pid), do: GenServer.stop(pid)
+      if Process.alive?(task_supervisor_pid), do: GenServer.stop(task_supervisor_pid)
+
+      File.rm_rf(test_root)
+    end)
+
+    assert eventually_value(fn ->
+             state = :sys.get_state(pid)
+             if state.poll_check_in_progress == false, do: state
+           end)
+
+    initial_state = :sys.get_state(pid)
+
+    :sys.replace_state(pid, fn _ ->
+      %{
+        initial_state
+        | running: %{
+            occupied_issue_id => %{
+              pid: self(),
+              ref: make_ref(),
+              identifier: "MT-OCCUPIED-#{suffix}",
+              issue: %Issue{
+                id: occupied_issue_id,
+                identifier: "MT-OCCUPIED-#{suffix}",
+                state: "In Progress"
+              },
+              started_at: DateTime.utc_now()
+            }
+          },
+          claimed: MapSet.new([occupied_issue_id, urgent_issue.id, lower_priority_waiter.id]),
+          retry_attempts: %{
+            urgent_issue.id => %{
+              attempt: 37,
+              timer_ref: nil,
+              retry_token: retry_token,
+              due_at_ms: System.monotonic_time(:millisecond) + 300_000,
+              identifier: urgent_issue.identifier,
+              error: "no available orchestrator slots",
+              delay_type: :capacity
+            },
+            lower_priority_waiter.id => %{
+              attempt: 5,
+              timer_ref: nil,
+              retry_token: lower_retry_token,
+              due_at_ms: System.monotonic_time(:millisecond),
+              identifier: lower_priority_waiter.identifier,
+              error: "no available orchestrator slots",
+              delay_type: :capacity
+            }
+          }
+      }
+    end)
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [
+      lower_priority_issue,
+      same_priority_issue,
+      lower_priority_waiter,
+      urgent_issue
+    ])
+
+    :sys.replace_state(pid, fn state ->
+      %{
+        state
+        | running: Map.delete(state.running, occupied_issue_id),
+          claimed: MapSet.delete(state.claimed, occupied_issue_id)
+      }
+    end)
+
+    send(pid, {:retry_issue, lower_priority_waiter.id, lower_retry_token})
+    assert %{queued: true} = Orchestrator.request_refresh(orchestrator_name)
+
+    admitted_state =
+      eventually_value(fn ->
+        state = :sys.get_state(pid)
+        if Map.has_key?(state.running, urgent_issue.id), do: state
+      end)
+
+    assert %{retry_attempt: 37} = admitted_state.running[urgent_issue.id]
+    refute Map.has_key?(admitted_state.running, same_priority_issue.id)
+    refute Map.has_key?(admitted_state.running, lower_priority_issue.id)
+    refute Map.has_key?(admitted_state.running, lower_priority_waiter.id)
+    refute Map.has_key?(admitted_state.retry_attempts, urgent_issue.id)
+
+    assert %{attempt: 5, delay_type: :capacity} =
+             admitted_state.retry_attempts[lower_priority_waiter.id]
+
+    assert map_size(admitted_state.running) == 1
+
+    owner_pid = admitted_state.running[urgent_issue.id].pid
+    send(pid, {:retry_issue, urgent_issue.id, retry_token})
+    Process.sleep(50)
+
+    stale_timer_state = :sys.get_state(pid)
+    assert stale_timer_state.running[urgent_issue.id].pid == owner_pid
+    assert stale_timer_state.running[urgent_issue.id].retry_attempt == 37
+    assert map_size(stale_timer_state.running) == 1
+
+    current_lower_retry_token = stale_timer_state.retry_attempts[lower_priority_waiter.id].retry_token
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [urgent_issue])
+    send(pid, {:retry_issue, lower_priority_waiter.id, current_lower_retry_token})
+
+    assert eventually_value(fn ->
+             state = :sys.get_state(pid)
+
+             if !MapSet.member?(state.claimed, lower_priority_waiter.id) and
+                  !Map.has_key?(state.retry_attempts, lower_priority_waiter.id),
+                do: state
+           end)
+  end
+
+  test "repeated capacity-only waits preserve the failure attempt" do
+    issue_id = "issue-capacity-wait"
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-CAPACITY",
+      title: "Capacity waiter",
+      state: "In Progress",
+      dispatchable: true
+    }
+
+    occupied_issue = %Issue{
+      id: "issue-occupied",
+      identifier: "MT-OCCUPIED",
+      title: "Occupied slot",
+      state: "In Progress"
+    }
+
+    state = %Orchestrator.State{
+      max_concurrent_agents: 1,
+      running: %{
+        occupied_issue.id => %{
+          pid: self(),
+          ref: make_ref(),
+          identifier: occupied_issue.identifier,
+          issue: occupied_issue,
+          started_at: DateTime.utc_now()
+        }
+      },
+      claimed: MapSet.new([occupied_issue.id, issue_id]),
+      retry_attempts: %{}
+    }
+
+    first_wait =
+      Orchestrator.handle_retry_issue_lookup_for_test(issue, state, issue_id, 37, %{
+        identifier: issue.identifier,
+        error: "no available orchestrator slots",
+        delay_type: :capacity
+      })
+
+    assert %{attempt: 37, delay_type: :capacity} = first_wait.retry_attempts[issue_id]
+
+    second_wait =
+      Orchestrator.handle_retry_issue_lookup_for_test(issue, first_wait, issue_id, 37, %{
+        identifier: issue.identifier,
+        error: "no available orchestrator slots",
+        delay_type: :capacity
+      })
+
+    assert %{attempt: 37, delay_type: :capacity, timer_ref: timer_ref} =
+             second_wait.retry_attempts[issue_id]
+
+    assert Process.cancel_timer(timer_ref) > 0
+  end
+
+  test "capacity waiter tracker failures resume failure backoff" do
+    issue_id = "issue-capacity-refresh-failure"
+    now_ms = System.monotonic_time(:millisecond)
+
+    retry_entry = %{
+      attempt: 2,
+      timer_ref: nil,
+      retry_token: make_ref(),
+      due_at_ms: now_ms,
+      identifier: "MT-CAPACITY-FAILURE",
+      error: "no available orchestrator slots",
+      delay_type: :capacity
+    }
+
+    state = %Orchestrator.State{
+      claimed: MapSet.new([issue_id]),
+      retry_attempts: %{issue_id => retry_entry}
+    }
+
+    updated_state =
+      Orchestrator.handle_capacity_retry_result_for_test(
+        state,
+        issue_id,
+        retry_entry,
+        {:error, :timeout}
+      )
+
+    assert %{
+             attempt: 3,
+             delay_type: nil,
+             error: "retry poll failed: :timeout",
+             due_at_ms: due_at_ms,
+             timer_ref: timer_ref
+           } = updated_state.retry_attempts[issue_id]
+
+    assert (due_at_ms - now_ms) in 40_000..40_500
+    assert Process.cancel_timer(timer_ref) > 0
+  end
+
+  test "capacity retry timer cleans a terminal issue workspace" do
+    suffix = System.unique_integer([:positive])
+    issue_id = "issue-capacity-terminal-#{suffix}"
+    workspace_path = Path.join(System.tmp_dir!(), "symphony-capacity-terminal-#{suffix}")
+    File.mkdir_p!(workspace_path)
+    File.write!(Path.join(workspace_path, "sentinel"), "retained until cleanup")
+
+    on_exit(fn -> File.rm_rf(workspace_path) end)
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-CAPACITY-TERMINAL-#{suffix}",
+      title: "Terminal capacity waiter",
+      state: "Done",
+      dispatchable: true
+    }
+
+    retry_entry = %{
+      attempt: 37,
+      timer_ref: nil,
+      retry_token: make_ref(),
+      due_at_ms: System.monotonic_time(:millisecond),
+      identifier: issue.identifier,
+      workspace_path: workspace_path,
+      workspace_managed: true,
+      error: "no available orchestrator slots",
+      delay_type: :capacity
+    }
+
+    state = %Orchestrator.State{
+      claimed: MapSet.new([issue_id]),
+      retry_attempts: %{issue_id => retry_entry}
+    }
+
+    updated_state =
+      Orchestrator.handle_capacity_retry_result_for_test(
+        state,
+        issue_id,
+        retry_entry,
+        {:ok, [issue]}
+      )
+
+    refute File.exists?(workspace_path)
+    refute MapSet.member?(updated_state.claimed, issue_id)
+    refute Map.has_key?(updated_state.retry_attempts, issue_id)
+  end
+
+  test "letta runtime info binds correction delivery to the active worker process" do
+    issue_id = "issue-letta-binding"
+
+    running_entry = %{
+      pid: self(),
+      identifier: "MT-LETTA-BINDING",
+      session_id: nil,
+      workspace_path: nil,
+      codex_app_server_pid: nil,
+      worker_host: nil,
+      correction_owner_active: false,
+      correction_delivery_supported: false,
+      codex_input_tokens: 0,
+      codex_output_tokens: 0,
+      codex_total_tokens: 0,
+      codex_last_reported_input_tokens: 0,
+      codex_last_reported_output_tokens: 0,
+      codex_last_reported_total_tokens: 0,
+      turn_count: 0
+    }
+
+    state = %Orchestrator.State{
+      running: %{issue_id => running_entry},
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
+    }
+
+    assert {:noreply, bound_state} =
+             Orchestrator.handle_info(
+               {:worker_runtime_info, issue_id,
+                %{
+                  worker_host: nil,
+                  workspace_path: "/workspaces/MT-LETTA-BINDING",
+                  codex_app_server_pid: "4242"
+                }},
+               state
+             )
+
+    assert {:noreply, active_state} =
+             Orchestrator.handle_info(
+               {:codex_worker_update, issue_id,
+                %{
+                  event: :session_started,
+                  timestamp: DateTime.utc_now(),
+                  session_id: "local-letta-turn-9",
+                  correction_delivery_supported: true
+                }},
+               bound_state
+             )
+
+    assert {:noreply, ^active_state} =
+             Orchestrator.handle_info(
+               {:worker_runtime_info, issue_id,
+                %{
+                  worker_host: "stale-worker",
+                  workspace_path: "/workspaces/MT-LETTA-BINDING-STALE",
+                  codex_app_server_pid: "5252"
+                }},
+               active_state
+             )
+
+    correction = %{
+      instruction_id: "correction-letta-binding",
+      issue_id: issue_id,
+      issue_identifier: "MT-LETTA-BINDING",
+      session_id: "local-letta-turn-9",
+      workspace_path: "/workspaces/MT-LETTA-BINDING",
+      worker_pid: "4242",
+      worker_host: nil,
+      text: "Apply the authorized correction."
+    }
+
+    assert {:reply, {:ok, %{status: :queued}}, _queued_state} =
+             Orchestrator.handle_call(
+               {:queue_correction, correction},
+               {self(), make_ref()},
+               active_state
+             )
+
+    assert_receive {:deliver_correction, ^correction}
+
+    stale = %{
+      correction
+      | instruction_id: "correction-letta-stale-session",
+        session_id: "local-letta-turn-old"
+    }
+
+    assert {:reply, {:error, :owner_binding_mismatch}, ^active_state} =
+             Orchestrator.handle_call(
+               {:queue_correction, stale},
+               {self(), make_ref()},
+               active_state
+             )
+
+    mismatched = %{correction | instruction_id: "correction-letta-stale", worker_pid: "5252"}
+
+    assert {:reply, {:error, :owner_binding_mismatch}, ^active_state} =
+             Orchestrator.handle_call(
+               {:queue_correction, mismatched},
+               {self(), make_ref()},
+               active_state
+             )
+  end
+
+  test "correction submission waits for the orchestrator's authoritative receipt" do
+    server =
+      spawn(fn ->
+        receive do
+          {:"$gen_call", from, {:queue_correction, %{instruction_id: "correction-delayed"}}} ->
+            Process.sleep(5_010)
+            GenServer.reply(from, {:ok, %{status: :queued}})
+        end
+      end)
+
+    assert {:ok, %{status: :queued}} =
+             Orchestrator.queue_correction(server, %{instruction_id: "correction-delayed"})
+  end
+
+  test "correction receipt does not skip execution-started before completion" do
+    issue_id = "issue-correction-lifecycle"
+    issue = %Issue{id: issue_id, identifier: "MT-LIFECYCLE", title: "Lifecycle", state: "In Progress"}
+
+    running_entry = %{
+      pid: self(),
+      ref: make_ref(),
+      identifier: issue.identifier,
+      issue: issue,
+      session_id: "local-letta-turn-8",
+      workspace_path: "/workspaces/MT-LIFECYCLE",
+      codex_app_server_pid: "4343",
+      worker_host: "worker-a",
+      correction_owner_active: true,
+      correction_delivery_supported: true,
+      started_at: DateTime.utc_now()
+    }
+
+    correction = %{
+      instruction_id: "correction-lifecycle",
+      issue_id: issue_id,
+      issue_identifier: issue.identifier,
+      session_id: running_entry.session_id,
+      workspace_path: running_entry.workspace_path,
+      worker_pid: running_entry.codex_app_server_pid,
+      worker_host: running_entry.worker_host,
+      text: "Apply the authorized correction."
+    }
+
+    state = %Orchestrator.State{
+      running: %{issue_id => running_entry},
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
+    }
+
+    assert {:reply, {:ok, _record}, queued_state} =
+             Orchestrator.handle_call({:queue_correction, correction}, {self(), make_ref()}, state)
+
+    assert_receive {:deliver_correction, ^correction}
+
+    update = fn event, extra ->
+      Map.merge(
+        %{
+          event: event,
+          timestamp: DateTime.utc_now(),
+          instruction_id: correction.instruction_id,
+          session_id: correction.session_id,
+          workspace_path: correction.workspace_path,
+          worker_pid: correction.worker_pid,
+          worker_host: correction.worker_host
+        },
+        extra
+      )
+    end
+
+    assert {:noreply, delivered_state} =
+             Orchestrator.handle_info(
+               {:codex_worker_update, issue_id, update.(:correction_delivered, %{})},
+               queued_state
+             )
+
+    assert delivered_state.corrections[correction.instruction_id].status == :delivered
+
+    assert {:noreply, still_delivered_state} =
+             Orchestrator.handle_info(
+               {:codex_worker_update, issue_id, update.(:correction_completed, %{result: "too early"})},
+               delivered_state
+             )
+
+    assert still_delivered_state.corrections[correction.instruction_id].status == :delivered
+
+    assert {:noreply, still_without_run_state} =
+             Orchestrator.handle_info(
+               {:codex_worker_update, issue_id, update.(:correction_execution_started, %{})},
+               still_delivered_state
+             )
+
+    assert still_without_run_state.corrections[correction.instruction_id].status == :delivered
+
+    assert {:noreply, started_state} =
+             Orchestrator.handle_info(
+               {:codex_worker_update, issue_id, update.(:correction_execution_started, %{run_id: "run-1"})},
+               still_without_run_state
+             )
+
+    assert {:noreply, still_started_state} =
+             Orchestrator.handle_info(
+               {:codex_worker_update, issue_id, update.(:correction_blocked, %{error: "missing run"})},
+               started_state
+             )
+
+    assert still_started_state.corrections[correction.instruction_id].status == :execution_started
+
+    assert {:noreply, still_started_state} =
+             Orchestrator.handle_info(
+               {:codex_worker_update, issue_id, update.(:correction_completed, %{result: "missing run"})},
+               still_started_state
+             )
+
+    assert {:noreply, completed_state} =
+             Orchestrator.handle_info(
+               {:codex_worker_update, issue_id, update.(:correction_completed, %{run_id: "run-2", result: "revision abc"})},
+               still_started_state
+             )
+
+    record = completed_state.corrections[correction.instruction_id]
+    assert record.status == :completed
+    assert record.run_id == "run-2"
+    assert record.result == "revision abc"
+  end
+
+  test "ending an owner turn fails a correction that has not executed" do
+    issue_id = "issue-correction-ended"
+    issue = %Issue{id: issue_id, identifier: "MT-ENDED", title: "Ended", state: "In Progress"}
+
+    running_entry = %{
+      pid: self(),
+      ref: make_ref(),
+      identifier: issue.identifier,
+      issue: issue,
+      session_id: "local-letta-turn-ended",
+      workspace_path: "/workspaces/MT-ENDED",
+      codex_app_server_pid: "4444",
+      worker_host: nil,
+      correction_owner_active: true,
+      correction_delivery_supported: true,
+      started_at: DateTime.utc_now()
+    }
+
+    correction = %{
+      instruction_id: "correction-ended-before-execution",
+      issue_id: issue_id,
+      issue_identifier: issue.identifier,
+      session_id: running_entry.session_id,
+      workspace_path: running_entry.workspace_path,
+      worker_pid: running_entry.codex_app_server_pid,
+      worker_host: nil,
+      text: "Apply the authorized correction."
+    }
+
+    state = %Orchestrator.State{
+      running: %{issue_id => running_entry},
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
+    }
+
+    assert {:reply, {:ok, _record}, queued_state} =
+             Orchestrator.handle_call({:queue_correction, correction}, {self(), make_ref()}, state)
+
+    assert_receive {:deliver_correction, ^correction}
+
+    unrelated_correction = %{
+      queued_state.corrections[correction.instruction_id]
+      | instruction_id: "correction-ended-other-owner",
+        workspace_path: "/workspaces/MT-ENDED-OTHER"
+    }
+
+    queued_state = %{
+      queued_state
+      | corrections:
+          Map.put(
+            queued_state.corrections,
+            unrelated_correction.instruction_id,
+            unrelated_correction
+          )
+    }
+
+    update = %{
+      event: :turn_completed,
+      timestamp: DateTime.utc_now(),
+      codex_input_tokens: 0,
+      codex_output_tokens: 0,
+      codex_total_tokens: 0
+    }
+
+    assert {:noreply, ended_state} =
+             Orchestrator.handle_info({:codex_worker_update, issue_id, update}, queued_state)
+
+    record = ended_state.corrections[correction.instruction_id]
+    assert record.status == :failed
+    assert record.error == "owner turn ended"
+    assert ended_state.corrections[unrelated_correction.instruction_id].status == :queued
+    refute ended_state.running[issue_id].correction_owner_active
+
+    active_again_state = %{
+      queued_state
+      | running: %{issue_id => %{running_entry | correction_owner_active: true}}
+    }
+
+    error_update = %{
+      event: :turn_ended_with_error,
+      timestamp: DateTime.utc_now(),
+      reason: :turn_timeout
+    }
+
+    assert {:noreply, errored_state} =
+             Orchestrator.handle_info(
+               {:codex_worker_update, issue_id, error_update},
+               active_again_state
+             )
+
+    assert errored_state.corrections[correction.instruction_id].status == :failed
+    refute errored_state.running[issue_id].correction_owner_active
   end
 
   test "select_worker_host_for_test skips full ssh hosts under the shared per-host cap" do
@@ -1322,6 +2110,40 @@ defmodule SymphonyElixir.CoreTest do
     assert prompt =~ "Ticket S-1 Refactor backend request path"
     assert prompt =~ "labels=backend"
     assert prompt =~ "attempt=3"
+  end
+
+  test "description-only templates retain separately labelled historical evidence" do
+    write_workflow_file!(Workflow.workflow_file_path(), prompt: "{{ issue.description }}")
+
+    issue = %Issue{
+      identifier: "S-1",
+      description: "current-direction-sentinel",
+      comments: [
+        %{"id" => "completed-id", "created_at" => "2026-01-01T00:00:00Z", "body" => "old-command-sentinel"},
+        %{"id" => "review-id", "created_at" => "2026-01-02T00:00:00Z", "body" => "Unresolved review request"}
+      ]
+    }
+
+    prompt = PromptBuilder.build_prompt(issue)
+    [current, history] = String.split(prompt, "## Historical tracker evidence", parts: 2)
+    assert current =~ "current-direction-sentinel"
+    refute current =~ "old-command-sentinel"
+    assert history =~ "not a second executable task queue"
+    assert history =~ "Unresolved review requests still require review"
+    assert history =~ "completed-id"
+    assert history =~ "review-id"
+    assert history =~ "2026-01-01T00:00:00Z"
+    assert history =~ "old-command-sentinel"
+    assert history =~ "Unresolved review request"
+  end
+
+  test "templates without a description still preserve tracker history" do
+    write_workflow_file!(Workflow.workflow_file_path(), prompt: "Ticket {{ issue.identifier }}")
+    issue = %Issue{identifier: "S-2", comments: [%{"id" => "retained-id", "body" => "Review this result"}]}
+    prompt = PromptBuilder.build_prompt(issue)
+    assert prompt =~ "Ticket S-2"
+    assert prompt =~ "## Historical tracker evidence"
+    assert prompt =~ "retained-id"
   end
 
   test "prompt builder renders issue datetime fields without crashing" do
@@ -1693,15 +2515,32 @@ defmodule SymphonyElixir.CoreTest do
                  issue_state_fetcher: fn [_issue_id] -> {:ok, [%{issue | state: "Done"}]} end
                )
 
-      assert_receive {:codex_worker_update, "issue-live-updates",
-                      %{
-                        event: :session_started,
-                        timestamp: %DateTime{},
-                        session_id: session_id
-                      }},
-                     500
+      assert_receive initial_message, 500
+      assert {:worker_runtime_info, "issue-live-updates", initial_runtime_info} = initial_message
+      refute Map.has_key?(initial_runtime_info, :codex_app_server_pid)
+
+      assert_receive binding_message, 500
+
+      assert {:worker_runtime_info, "issue-live-updates",
+              %{
+                codex_app_server_pid: runtime_worker_pid,
+                worker_host: nil
+              }} = binding_message
+
+      assert_receive session_message, 500
+
+      assert {:codex_worker_update, "issue-live-updates",
+              %{
+                event: :session_started,
+                timestamp: %DateTime{},
+                session_id: session_id,
+                codex_app_server_pid: session_worker_pid
+              }} = session_message
 
       assert session_id == "thread-live-turn-live"
+      assert is_binary(runtime_worker_pid)
+      assert runtime_worker_pid != ""
+      assert runtime_worker_pid == session_worker_pid
     after
       File.rm_rf(test_root)
     end
@@ -1900,9 +2739,10 @@ defmodule SymphonyElixir.CoreTest do
 
       assert length(turn_texts) == 2
       assert Enum.at(turn_texts, 0) =~ "You are an agent for this repository."
-      refute Enum.at(turn_texts, 1) =~ "You are an agent for this repository."
       assert Enum.at(turn_texts, 1) =~ "Continuation guidance:"
       assert Enum.at(turn_texts, 1) =~ "continuation turn #2 of 3"
+      assert Enum.at(turn_texts, 1) =~ "Current tracker context:"
+      assert Enum.at(turn_texts, 1) =~ "You are an agent for this repository."
     after
       System.delete_env("SYMP_TEST_CODEx_TRACE")
       File.rm_rf(test_root)

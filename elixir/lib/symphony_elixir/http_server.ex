@@ -20,7 +20,9 @@ defmodule SymphonyElixir.HttpServer do
   def start_link(opts \\ []) do
     case Keyword.get(opts, :port, Config.server_port()) do
       port when is_integer(port) and port >= 0 ->
-        host = Keyword.get(opts, :host, Config.settings!().server.host)
+        settings = Config.settings!()
+        correction_control = correction_control_settings(settings.server)
+        host = Keyword.get(opts, :host, settings.server.host)
         orchestrator = Keyword.get(opts, :orchestrator, Orchestrator)
         snapshot_timeout_ms = Keyword.get(opts, :snapshot_timeout_ms, 15_000)
 
@@ -31,6 +33,8 @@ defmodule SymphonyElixir.HttpServer do
             url: [host: normalize_host(host)],
             orchestrator: orchestrator,
             snapshot_timeout_ms: snapshot_timeout_ms,
+            correction_token: correction_control.token,
+            correction_secret_environment_names: correction_control.secret_environment_names,
             secret_key_base: secret_key_base()
           ]
 
@@ -58,6 +62,14 @@ defmodule SymphonyElixir.HttpServer do
     _error -> nil
   catch
     :exit, _reason -> nil
+  end
+
+  defp correction_control_settings(server_settings) do
+    Application.get_env(:symphony_elixir, :correction_control_startup) ||
+      %{
+        token: server_settings.correction_token,
+        secret_environment_names: server_settings.secret_environment_names
+      }
   end
 
   defp parse_host({_, _, _, _} = ip), do: {:ok, ip}

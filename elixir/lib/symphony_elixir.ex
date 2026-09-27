@@ -34,6 +34,12 @@ defmodule SymphonyElixir.Application do
   @spec start_runtime() :: Supervisor.on_start()
   def start_runtime do
     :ok = SymphonyElixir.LogFile.configure()
+    settings = SymphonyElixir.Config.settings!()
+
+    Application.put_env(:symphony_elixir, :correction_control_startup, %{
+      token: settings.server.correction_token,
+      secret_environment_names: settings.server.secret_environment_names
+    })
 
     children = [
       {Phoenix.PubSub, name: SymphonyElixir.PubSub},

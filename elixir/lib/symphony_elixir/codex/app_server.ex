@@ -19,6 +19,8 @@ defmodule SymphonyElixir.Codex.AppServer do
           thread_sandbox: String.t(),
           turn_sandbox_policy: map(),
           thread_id: String.t(),
+          correction_delivery_supported: boolean(),
+          correction_recovery_supported: boolean(),
           workspace: Path.t(),
           worker_host: String.t() | nil,
           dynamic_tool_binding: map()
@@ -40,12 +42,12 @@ defmodule SymphonyElixir.Codex.AppServer do
     worker_host = Keyword.get(opts, :worker_host)
     dynamic_tool_binding = DynamicTool.bind()
 
-    with {:ok, expanded_workspace} <- validate_workspace_cwd(workspace, worker_host),
+    with {:ok, expanded_workspace} <- validate_workspace_cwd(workspace, worker_host, Keyword.get(opts, :workspace_root)),
          {:ok, port} <- start_port(expanded_workspace, worker_host, dynamic_tool_binding) do
       metadata = port_metadata(port, worker_host)
 
       with {:ok, session_policies} <- session_policies(expanded_workspace, worker_host),
-           {:ok, thread_id} <-
+           {:ok, thread_id, correction_delivery_supported, correction_recovery_supported} <-
              do_start_session(port, expanded_workspace, session_policies, dynamic_tool_binding) do
         {:ok,
          %{
@@ -56,6 +58,8 @@ defmodule SymphonyElixir.Codex.AppServer do
            thread_sandbox: session_policies.thread_sandbox,
            turn_sandbox_policy: session_policies.turn_sandbox_policy,
            thread_id: thread_id,
+           correction_delivery_supported: correction_delivery_supported,
+           correction_recovery_supported: correction_recovery_supported,
            workspace: expanded_workspace,
            worker_host: worker_host,
            dynamic_tool_binding: dynamic_tool_binding
@@ -77,7 +81,10 @@ defmodule SymphonyElixir.Codex.AppServer do
           auto_approve_requests: auto_approve_requests,
           turn_sandbox_policy: turn_sandbox_policy,
           thread_id: thread_id,
+          correction_delivery_supported: correction_delivery_supported,
+          correction_recovery_supported: correction_recovery_supported,
           workspace: workspace,
+          worker_host: worker_host,
           dynamic_tool_binding: dynamic_tool_binding
         },
         prompt,
@@ -91,7 +98,17 @@ defmodule SymphonyElixir.Codex.AppServer do
         DynamicTool.execute(tool, arguments, dynamic_tool_binding, issue: issue)
       end)
 
-    case start_turn(port, thread_id, prompt, issue, workspace, approval_policy, turn_sandbox_policy) do
+    case start_turn(
+           port,
+           thread_id,
+           prompt,
+           issue,
+           workspace,
+           Map.get(metadata, :codex_app_server_pid),
+           worker_host,
+           approval_policy,
+           turn_sandbox_policy
+         ) do
       {:ok, turn_id} ->
         session_id = "#{thread_id}-#{turn_id}"
         Logger.info("Codex session started for #{issue_context(issue)} session_id=#{session_id}")
@@ -102,12 +119,27 @@ defmodule SymphonyElixir.Codex.AppServer do
           %{
             session_id: session_id,
             thread_id: thread_id,
-            turn_id: turn_id
+            turn_id: turn_id,
+            correction_delivery_supported: correction_delivery_supported,
+            correction_recovery_supported: correction_recovery_supported
           },
           metadata
         )
 
-        case await_turn_completion(port, on_message, tool_executor, auto_approve_requests) do
+        correction_binding = %{
+          issue_id: issue.id,
+          issue_identifier: issue.identifier,
+          thread_id: thread_id,
+          turn_id: turn_id,
+          session_id: session_id,
+          worker_pid: Map.get(metadata, :codex_app_server_pid),
+          correction_delivery_supported: correction_delivery_supported,
+          correction_recovery_supported: correction_recovery_supported,
+          workspace_path: workspace,
+          worker_host: worker_host
+        }
+
+        case await_turn_completion(port, on_message, tool_executor, auto_approve_requests, correction_binding) do
           {:ok, result} ->
             Logger.info("Codex session completed for #{issue_context(issue)} session_id=#{session_id}")
 
@@ -143,13 +175,14 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   @spec stop_session(session()) :: :ok
-  def stop_session(%{port: port}) when is_port(port) do
+  def stop_session(%{port: port, workspace: workspace}) when is_port(port) do
     stop_port(port)
+    stop_detached_omx_sessions(workspace)
   end
 
-  defp validate_workspace_cwd(workspace, nil) when is_binary(workspace) do
+  defp validate_workspace_cwd(workspace, nil, root) when is_binary(workspace) do
     expanded_workspace = Path.expand(workspace)
-    expanded_root = Config.local_workspace_root()
+    expanded_root = root || Config.local_workspace_root()
     expanded_root_prefix = expanded_root <> "/"
 
     with {:ok, canonical_workspace} <- PathSafety.canonicalize(expanded_workspace),
@@ -175,7 +208,7 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp validate_workspace_cwd(workspace, worker_host)
+  defp validate_workspace_cwd(workspace, worker_host, _root)
        when is_binary(workspace) and is_binary(worker_host) do
     cond do
       String.trim(workspace) == "" ->
@@ -215,12 +248,16 @@ defmodule SymphonyElixir.Codex.AppServer do
 
   defp start_port(workspace, worker_host, dynamic_tool_binding) when is_binary(worker_host) do
     remote_command = remote_launch_command(workspace, dynamic_tool_binding)
-    SSH.start_port(worker_host, remote_command, line: @port_line_bytes)
+
+    SSH.start_port(worker_host, remote_command,
+      env: tracker_secret_port_env(dynamic_tool_binding),
+      line: @port_line_bytes
+    )
   end
 
   defp local_launch_command(dynamic_tool_binding) do
     [
-      tracker_secret_unset_command(dynamic_tool_binding),
+      secret_unset_command(dynamic_tool_binding),
       "exec #{Config.settings!().codex.command}"
     ]
     |> Enum.reject(&is_nil/1)
@@ -230,7 +267,7 @@ defmodule SymphonyElixir.Codex.AppServer do
   defp remote_launch_command(workspace, dynamic_tool_binding) when is_binary(workspace) do
     [
       "cd #{shell_escape(workspace)}",
-      tracker_secret_unset_command(dynamic_tool_binding),
+      secret_unset_command(dynamic_tool_binding),
       "exec #{Config.settings!().codex.command}"
     ]
     |> Enum.reject(&is_nil/1)
@@ -238,16 +275,22 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp tracker_secret_port_env(dynamic_tool_binding) do
-    dynamic_tool_binding.secret_environment_names
+    dynamic_tool_binding
+    |> secret_environment_names()
     |> valid_environment_names()
     |> Enum.map(fn name -> {String.to_charlist(name), false} end)
   end
 
-  defp tracker_secret_unset_command(dynamic_tool_binding) do
-    case dynamic_tool_binding.secret_environment_names |> valid_environment_names() do
+  defp secret_unset_command(dynamic_tool_binding) do
+    case dynamic_tool_binding |> secret_environment_names() |> valid_environment_names() do
       [] -> nil
       names -> "unset " <> Enum.join(names, " ")
     end
+  end
+
+  defp secret_environment_names(dynamic_tool_binding) do
+    dynamic_tool_binding.secret_environment_names ++
+      Config.correction_secret_environment_names()
   end
 
   defp valid_environment_names(names) do
@@ -290,9 +333,10 @@ defmodule SymphonyElixir.Codex.AppServer do
 
     send_message(port, payload)
 
-    with {:ok, _} <- await_response(port, @initialize_id) do
+    with {:ok, response} <- await_response(port, @initialize_id) do
       send_message(port, %{"method" => "initialized", "params" => %{}})
-      :ok
+      {:ok, get_in(response, ["capabilities", "symphonyCorrectionDelivery"]) == true,
+       get_in(response, ["capabilities", "symphonyCorrectionRecovery"]) == true}
     end
   end
 
@@ -306,8 +350,14 @@ defmodule SymphonyElixir.Codex.AppServer do
 
   defp do_start_session(port, workspace, session_policies, dynamic_tool_binding) do
     case send_initialize(port) do
-      :ok -> start_thread(port, workspace, session_policies, dynamic_tool_binding)
-      {:error, reason} -> {:error, reason}
+      {:ok, correction_delivery_supported, correction_recovery_supported} ->
+        case start_thread(port, workspace, session_policies, dynamic_tool_binding) do
+          {:ok, thread_id} -> {:ok, thread_id, correction_delivery_supported, correction_recovery_supported}
+          {:error, reason} -> {:error, reason}
+        end
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 
@@ -340,7 +390,17 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp start_turn(port, thread_id, prompt, issue, workspace, approval_policy, turn_sandbox_policy) do
+  defp start_turn(
+         port,
+         thread_id,
+         prompt,
+         issue,
+         workspace,
+         worker_pid,
+         worker_host,
+         approval_policy,
+         turn_sandbox_policy
+       ) do
     send_message(port, %{
       "method" => "turn/start",
       "id" => @turn_start_id,
@@ -354,6 +414,13 @@ defmodule SymphonyElixir.Codex.AppServer do
         ],
         "cwd" => workspace,
         "title" => "#{issue.identifier}: #{issue.title}",
+        "symphony" => %{
+          "issueId" => issue.id,
+          "issueIdentifier" => issue.identifier,
+          "workspacePath" => workspace,
+          "workerPid" => worker_pid,
+          "workerHost" => worker_host
+        },
         "approvalPolicy" => approval_policy,
         "sandboxPolicy" => turn_sandbox_policy
       }
@@ -365,22 +432,47 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp await_turn_completion(port, on_message, tool_executor, auto_approve_requests) do
+  defp await_turn_completion(port, on_message, tool_executor, auto_approve_requests, correction_binding) do
     receive_loop(
       port,
       on_message,
       Config.settings!().codex.turn_timeout_ms,
       "",
       tool_executor,
-      auto_approve_requests
+      auto_approve_requests,
+      correction_binding
     )
   end
 
-  defp receive_loop(port, on_message, timeout_ms, pending_line, tool_executor, auto_approve_requests) do
+  defp receive_loop(
+         port,
+         on_message,
+         timeout_ms,
+         pending_line,
+         tool_executor,
+         auto_approve_requests,
+         correction_binding,
+         silence_deadline_ms \\ nil
+       ) do
+    silence_deadline_ms =
+      silence_deadline_ms || System.monotonic_time(:millisecond) + timeout_ms
+
+    remaining_silence_ms =
+      max(silence_deadline_ms - System.monotonic_time(:millisecond), 0)
+
     receive do
       {^port, {:data, {:eol, chunk}}} ->
         complete_line = pending_line <> to_string(chunk)
-        handle_incoming(port, on_message, complete_line, timeout_ms, tool_executor, auto_approve_requests)
+
+        handle_incoming(
+          port,
+          on_message,
+          complete_line,
+          timeout_ms,
+          tool_executor,
+          auto_approve_requests,
+          correction_binding
+        )
 
       {^port, {:data, {:noeol, chunk}}} ->
         receive_loop(
@@ -389,24 +481,61 @@ defmodule SymphonyElixir.Codex.AppServer do
           timeout_ms,
           pending_line <> to_string(chunk),
           tool_executor,
-          auto_approve_requests
+          auto_approve_requests,
+          correction_binding
+        )
+
+      {:deliver_correction, correction} ->
+        deliver_correction(port, on_message, correction, correction_binding)
+
+        receive_loop(
+          port,
+          on_message,
+          timeout_ms,
+          pending_line,
+          tool_executor,
+          auto_approve_requests,
+          correction_binding,
+          silence_deadline_ms
+        )
+
+      {:correction_validation_result, "symphony-recovery-validation-" <> _ = request_id, result}
+      when is_map(result) ->
+        send_message(port, %{"id" => request_id, "result" => result})
+
+        receive_loop(
+          port,
+          on_message,
+          timeout_ms,
+          pending_line,
+          tool_executor,
+          auto_approve_requests,
+          correction_binding,
+          silence_deadline_ms
         )
 
       {^port, {:exit_status, status}} ->
         {:error, {:port_exit, status}}
     after
-      timeout_ms ->
+      remaining_silence_ms ->
         {:error, :turn_timeout}
     end
   end
 
-  defp handle_incoming(port, on_message, data, timeout_ms, tool_executor, auto_approve_requests) do
+  defp handle_incoming(
+         port,
+         on_message,
+         data,
+         timeout_ms,
+         tool_executor,
+         auto_approve_requests,
+         correction_binding
+       ) do
     payload_string = to_string(data)
 
     case Jason.decode(payload_string) do
       {:ok, %{"method" => "turn/completed"} = payload} ->
-        emit_turn_event(on_message, :turn_completed, payload, payload_string, port, payload)
-        {:ok, :turn_completed}
+        handle_turn_completion(port, on_message, payload, payload_string)
 
       {:ok, %{"method" => "turn/failed", "params" => _} = payload} ->
         emit_turn_event(
@@ -432,6 +561,99 @@ defmodule SymphonyElixir.Codex.AppServer do
 
         {:error, {:turn_cancelled, Map.get(payload, "params")}}
 
+      {:ok,
+       %{
+         "id" => "symphony-recovery-validation-" <> _ = request_id,
+         "method" => "symphony/correction/validate",
+         "params" => params
+       } = payload}
+      when is_map(params) ->
+        # The manager must validate its current source and authorization record;
+        # a bridge request or echoed operator payload is not authority by itself.
+        details = %{
+          instruction_id: Map.get(params, "instructionId"),
+          issue_id: Map.get(params, "issueId"),
+          issue_identifier: Map.get(params, "issueIdentifier"),
+          thread_id: Map.get(params, "threadId"),
+          expected_turn_id: Map.get(params, "expectedTurnId"),
+          session_id: Map.get(params, "sessionId"),
+          workspace_path: Map.get(params, "workspacePath"),
+          worker_pid: Map.get(params, "workerPid"),
+          worker_host: Map.get(params, "workerHost")
+        }
+
+        if correction_status_matches_binding?(details, correction_binding) do
+          emit_message(
+            on_message,
+            :correction_validation_requested,
+            Map.merge(details, %{request_id: request_id, validation: params, reply_to: self()}),
+            metadata_from_message(port, payload)
+          )
+        else
+          send_message(port, %{"id" => request_id, "result" => %{"current" => false}})
+        end
+
+        receive_loop(
+          port,
+          on_message,
+          timeout_ms,
+          "",
+          tool_executor,
+          auto_approve_requests,
+          correction_binding
+        )
+
+      {:ok, %{"method" => "symphony/correction/status", "params" => params} = payload} when is_map(params) ->
+        emit_correction_status(on_message, params, correction_binding, metadata_from_message(port, payload))
+
+        receive_loop(
+          port,
+          on_message,
+          timeout_ms,
+          "",
+          tool_executor,
+          auto_approve_requests,
+          correction_binding
+        )
+
+      {:ok,
+       %{
+         "id" => "symphony-correction-" <> response_instruction_id,
+         "result" => %{"correction" => params}
+       } = payload}
+      when is_map(params) ->
+        if Map.get(params, "instructionId") == response_instruction_id do
+          emit_correction_status(on_message, params, correction_binding, metadata_from_message(port, payload))
+        end
+
+        receive_loop(
+          port,
+          on_message,
+          timeout_ms,
+          "",
+          tool_executor,
+          auto_approve_requests,
+          correction_binding
+        )
+
+      {:ok, %{"id" => "symphony-correction-" <> instruction_id, "error" => error} = payload} ->
+        emit_message(
+          on_message,
+          :correction_failed,
+          Map.merge(correction_binding, %{instruction_id: instruction_id, error: inspect(error)}),
+          metadata_from_message(port, payload)
+        )
+
+        receive_loop(
+          port,
+          on_message,
+          timeout_ms,
+          "",
+          tool_executor,
+          auto_approve_requests,
+          correction_binding
+        )
+
       {:ok, %{"method" => method} = payload}
       when is_binary(method) ->
         handle_turn_method(
@@ -442,7 +664,8 @@ defmodule SymphonyElixir.Codex.AppServer do
           method,
           timeout_ms,
           tool_executor,
-          auto_approve_requests
+          auto_approve_requests,
+          correction_binding
         )
 
       {:ok, payload} ->
@@ -456,7 +679,15 @@ defmodule SymphonyElixir.Codex.AppServer do
           metadata_from_message(port, payload)
         )
 
-        receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests)
+        receive_loop(
+          port,
+          on_message,
+          timeout_ms,
+          "",
+          tool_executor,
+          auto_approve_requests,
+          correction_binding
+        )
 
       {:error, _reason} ->
         log_non_json_stream_line(payload_string, "turn stream")
@@ -473,7 +704,27 @@ defmodule SymphonyElixir.Codex.AppServer do
           )
         end
 
-        receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests)
+        receive_loop(
+          port,
+          on_message,
+          timeout_ms,
+          "",
+          tool_executor,
+          auto_approve_requests,
+          correction_binding
+        )
+    end
+  end
+
+  defp handle_turn_completion(port, on_message, payload, payload_string) do
+    case input_required_completion_outcome(payload) do
+      nil ->
+        emit_turn_event(on_message, :turn_completed, payload, payload_string, port, payload)
+        {:ok, :turn_completed}
+
+      outcome ->
+        emit_turn_event(on_message, outcome, payload, payload_string, port, payload)
+        {:error, {outcome, payload}}
     end
   end
 
@@ -498,7 +749,8 @@ defmodule SymphonyElixir.Codex.AppServer do
          method,
          timeout_ms,
          tool_executor,
-         auto_approve_requests
+         auto_approve_requests,
+         correction_binding
        ) do
     metadata = metadata_from_message(port, payload)
 
@@ -523,7 +775,15 @@ defmodule SymphonyElixir.Codex.AppServer do
         {:error, {:turn_input_required, payload}}
 
       :approved ->
-        receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests)
+        receive_loop(
+          port,
+          on_message,
+          timeout_ms,
+          "",
+          tool_executor,
+          auto_approve_requests,
+          correction_binding
+        )
 
       :approval_required ->
         emit_message(
@@ -557,9 +817,136 @@ defmodule SymphonyElixir.Codex.AppServer do
           )
 
           Logger.debug("Codex notification: #{inspect(method)}")
-          receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests)
+
+          receive_loop(
+            port,
+            on_message,
+            timeout_ms,
+            "",
+            tool_executor,
+            auto_approve_requests,
+            correction_binding
+          )
         end
     end
+  end
+
+  defp deliver_correction(port, on_message, correction, binding) do
+    cond do
+      binding.correction_delivery_supported != true ->
+        emit_message(
+          on_message,
+          :correction_failed,
+          correction_event_details(correction, %{error: "active transport does not advertise correction delivery"}),
+          %{}
+        )
+
+      Map.get(correction, :recovery, false) == true and Map.get(binding, :correction_recovery_supported) != true ->
+        emit_message(
+          on_message,
+          :correction_failed,
+          correction_event_details(correction, %{error: "active transport does not advertise explicit recovery"}),
+          %{}
+        )
+
+      correction_binding_matches?(correction, binding) ->
+        send_message(port, %{
+          "id" => "symphony-correction-#{correction.instruction_id}",
+          "method" => "symphony/correction/deliver",
+          "params" => %{
+            "instructionId" => correction.instruction_id,
+            "issueId" => correction.issue_id,
+            "issueIdentifier" => correction.issue_identifier,
+            "threadId" => binding.thread_id,
+            "expectedTurnId" => binding.turn_id,
+            "sessionId" => correction.session_id,
+            "workspacePath" => correction.workspace_path,
+            "workerPid" => correction.worker_pid,
+            "workerHost" => correction.worker_host,
+            "text" => correction.text,
+            "recovery" => Map.get(correction, :recovery, false),
+            "sourceRevision" => Map.get(correction, :source_revision),
+            "authorizationId" => Map.get(correction, :authorization_id),
+            "cwdRevision" => Map.get(correction, :cwd_revision)
+          }
+        })
+
+      true ->
+        emit_message(
+          on_message,
+          :correction_failed,
+          correction_event_details(correction, %{error: "active turn binding changed"}),
+          %{}
+        )
+    end
+  end
+
+  defp correction_binding_matches?(correction, binding) do
+    correction.issue_id == binding.issue_id and
+      correction.issue_identifier == binding.issue_identifier and
+      correction.session_id == binding.session_id and
+      correction.workspace_path == binding.workspace_path and
+      correction.worker_pid == binding.worker_pid and
+      correction.worker_host == binding.worker_host
+  end
+
+  defp emit_correction_status(on_message, params, binding, metadata) do
+    event =
+      case Map.get(params, "status") do
+        "delivered" -> :correction_delivered
+        "execution_started" -> :correction_execution_started
+        "completed" -> :correction_completed
+        "blocked" -> :correction_blocked
+        "failed" -> :correction_failed
+        _ -> nil
+      end
+
+    if event do
+      details = %{
+        instruction_id: Map.get(params, "instructionId"),
+        issue_id: Map.get(params, "issueId"),
+        issue_identifier: Map.get(params, "issueIdentifier"),
+        thread_id: Map.get(params, "threadId"),
+        expected_turn_id: Map.get(params, "expectedTurnId"),
+        session_id: Map.get(params, "sessionId"),
+        workspace_path: Map.get(params, "workspacePath"),
+        worker_pid: Map.get(params, "workerPid"),
+        worker_host: Map.get(params, "workerHost"),
+        run_id: Map.get(params, "runId"),
+        result: Map.get(params, "result"),
+        error: Map.get(params, "error")
+      }
+
+      if correction_status_matches_binding?(details, binding) do
+        emit_message(on_message, event, details, metadata)
+      end
+    end
+  end
+
+  defp correction_event_details(correction, extra) do
+    Map.merge(
+      %{
+        instruction_id: correction.instruction_id,
+        issue_id: correction.issue_id,
+        issue_identifier: correction.issue_identifier,
+        session_id: correction.session_id,
+        workspace_path: correction.workspace_path,
+        worker_pid: correction.worker_pid,
+        worker_host: correction.worker_host
+      },
+      extra
+    )
+  end
+
+  defp correction_status_matches_binding?(details, binding) do
+    details.issue_id == binding.issue_id and
+      details.issue_identifier == binding.issue_identifier and
+      details.thread_id == binding.thread_id and
+      details.expected_turn_id == binding.turn_id and
+      details.session_id == binding.session_id and
+      details.workspace_path == binding.workspace_path and
+      details.worker_pid == binding.worker_pid and
+      details.worker_host == binding.worker_host
   end
 
   defp maybe_handle_approval_request(
@@ -979,6 +1366,53 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
+  defp stop_detached_omx_sessions(workspace) when is_binary(workspace) do
+    with tmux when is_binary(tmux) <- System.find_executable("tmux"),
+         {output, _status} <-
+           System.cmd(tmux, ["list-panes", "-a", "-F", "\#{session_name}\t\#{pane_current_path}"],
+             env: correction_secret_system_env(),
+             stderr_to_stdout: true
+           ) do
+      output
+      |> String.split("\n", trim: true)
+      |> Enum.filter(&detached_omx_session_for_workspace?(&1, workspace))
+      |> Enum.map(&tmux_session_name/1)
+      |> Enum.reject(&is_nil/1)
+      |> Enum.uniq()
+      |> Enum.each(fn session_name ->
+        System.cmd(tmux, ["kill-session", "-t", session_name],
+          env: correction_secret_system_env(),
+          stderr_to_stdout: true
+        )
+      end)
+    else
+      _ -> :ok
+    end
+
+    :ok
+  end
+
+  defp stop_detached_omx_sessions(_workspace), do: :ok
+
+  defp correction_secret_system_env do
+    Config.correction_secret_environment_names()
+    |> Enum.map(&{&1, nil})
+  end
+
+  defp detached_omx_session_for_workspace?(line, workspace) when is_binary(line) and is_binary(workspace) do
+    trimmed_line = String.trim_leading(line)
+    String.starts_with?(trimmed_line, "omx") and String.contains?(trimmed_line, Path.expand(workspace))
+  end
+
+  defp detached_omx_session_for_workspace?(_line, _workspace), do: false
+
+  defp tmux_session_name(line) when is_binary(line) do
+    line
+    |> String.trim_leading()
+    |> String.split(~r/\s+/, parts: 2)
+    |> List.first()
+  end
+
   defp emit_message(on_message, event, details, metadata) when is_function(on_message, 1) do
     message = metadata |> Map.merge(details) |> Map.put(:event, event) |> Map.put(:timestamp, DateTime.utc_now())
     on_message.(message)
@@ -999,6 +1433,19 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp maybe_set_usage(metadata, _payload), do: metadata
+
+  defp input_required_completion_outcome(payload) when is_map(payload) do
+    params = Map.get(payload, "params") || %{}
+    completion = Map.get(params, "completion") || %{}
+    outcome = Map.get(params, "outcome") || Map.get(completion, "outcome")
+
+    case outcome do
+      "input_required" -> :turn_input_required
+      "needs_input" -> :turn_input_required
+      "approval_required" -> :approval_required
+      _ -> nil
+    end
+  end
 
   defp shell_escape(value) when is_binary(value) do
     "'" <> String.replace(value, "'", "'\"'\"'") <> "'"

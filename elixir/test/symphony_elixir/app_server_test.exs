@@ -118,7 +118,7 @@ defmodule SymphonyElixir.AppServerTest do
       write_workflow_file!(Workflow.workflow_file_path(),
         workspace_root: workspace_root,
         codex_command: "#{codex_binary} app-server",
-        codex_turn_timeout_ms: 250
+        codex_turn_timeout_ms: 500
       )
 
       issue = %Issue{
@@ -160,6 +160,87 @@ defmodule SymphonyElixir.AppServerTest do
       )
 
       assert {:error, :turn_timeout} = AppServer.run(workspace, "silent turn", issue)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "correction delivery does not extend the stream silence timeout" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-correction-timeout-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-CORRECTION-TIMEOUT")
+      codex_binary = Path.join(test_root, "fake-codex")
+      File.mkdir_p!(workspace)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      count=0
+      while IFS= read -r _line; do
+        count=$((count + 1))
+        case "$count" in
+          1) printf '%s\n' '{"id":1,"result":{"capabilities":{"symphonyCorrectionDelivery":true}}}' ;;
+          2) ;;
+          3) printf '%s\n' '{"id":2,"result":{"thread":{"id":"thread-correction-timeout"}}}' ;;
+          4) printf '%s\n' '{"id":3,"result":{"turn":{"id":"turn-correction-timeout"}}}' ;;
+          5) sleep 2 ;;
+          *) exit 0 ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server",
+        codex_turn_timeout_ms: 1_000
+      )
+
+      issue = %Issue{
+        id: "issue-correction-timeout",
+        identifier: "MT-CORRECTION-TIMEOUT",
+        title: "Correction timeout",
+        state: "In Progress"
+      }
+
+      parent = self()
+
+      task =
+        Task.async(fn ->
+          AppServer.run(workspace, "wait", issue, on_message: fn message -> send(parent, {:app_server_message, message}) end)
+        end)
+
+      assert_receive {:app_server_message,
+                      %{
+                        event: :session_started,
+                        session_id: session_id,
+                        codex_app_server_pid: worker_pid
+                      }},
+                     1_000
+
+      Process.sleep(500)
+
+      send(task.pid, {
+        :deliver_correction,
+        %{
+          instruction_id: "instruction-timeout",
+          issue_id: issue.id,
+          issue_identifier: issue.identifier,
+          session_id: session_id,
+          workspace_path: workspace,
+          worker_pid: worker_pid,
+          worker_host: nil,
+          text: "Apply the authorized correction."
+        }
+      })
+
+      assert {:ok, {:error, :turn_timeout}} = Task.yield(task, 750)
     after
       File.rm_rf(test_root)
     end
@@ -347,6 +428,439 @@ defmodule SymphonyElixir.AppServerTest do
 
       assert payload["method"] == "turn/input_required"
     after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "app server marks input-required completion outcomes as a hard failure" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-input-completion-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-89")
+      codex_binary = Path.join(test_root, "fake-codex")
+      File.mkdir_p!(workspace)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      count=0
+      while IFS= read -r _line; do
+        count=$((count + 1))
+
+        case "$count" in
+          1)
+            printf '%s\n' '{"id":1,"result":{}}'
+            ;;
+          2)
+            printf '%s\n' '{"id":2,"result":{"thread":{"id":"thread-89"}}}'
+            ;;
+          3)
+            printf '%s\n' '{"id":3,"result":{"turn":{"id":"turn-89"}}}'
+            ;;
+          4)
+            printf '%s\n' '{"method":"turn/completed","params":{"turn":{"id":"turn-89"},"completion":{"outcome":"input_required"}}}'
+            ;;
+          *)
+            exit 0
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server"
+      )
+
+      parent = self()
+      on_message = fn message -> send(parent, {:app_server_message, message}) end
+
+      issue = %Issue{
+        id: "issue-input-completion",
+        identifier: "MT-89",
+        title: "Input needed",
+        description: "Cannot satisfy codex input",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-89",
+        labels: ["backend"]
+      }
+
+      assert {:error, {:turn_input_required, payload}} =
+               AppServer.run(workspace, "Needs input", issue, on_message: on_message)
+
+      assert payload["method"] == "turn/completed"
+      assert payload["params"]["completion"]["outcome"] == "input_required"
+      assert_received {:app_server_message, %{event: :turn_input_required}}
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "app server cleanup kills detached OMX tmux sessions for the workspace" do
+    tmux = System.find_executable("tmux")
+
+    if is_nil(tmux) do
+      :ok
+    else
+      do_test_app_server_cleanup_kills_detached_omx_tmux_sessions(tmux)
+    end
+  end
+
+  test "app server cleanup does not pass the correction token to tmux" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-cleanup-secret-#{System.unique_integer([:positive])}"
+      )
+
+    secret_name = "SYMPHONY_CLEANUP_CORRECTION_SECRET_#{System.unique_integer([:positive])}"
+    previous_path = System.get_env("PATH")
+    previous_secret = System.get_env(secret_name)
+
+    on_exit(fn ->
+      restore_env("PATH", previous_path)
+      restore_env(secret_name, previous_secret)
+      File.rm_rf(test_root)
+    end)
+
+    workspace_root = Path.join(test_root, "workspaces")
+    workspace = Path.join(workspace_root, "MT-CLEANUP-SECRET")
+    bin_dir = Path.join(test_root, "bin")
+    codex_binary = Path.join(bin_dir, "fake-codex")
+    tmux_binary = Path.join(bin_dir, "tmux")
+    trace_file = Path.join(test_root, "tmux.trace")
+    File.mkdir_p!(workspace)
+    File.mkdir_p!(bin_dir)
+    assert {:ok, canonical_workspace} = SymphonyElixir.PathSafety.canonicalize(workspace)
+
+    File.write!(codex_binary, """
+    #!/bin/sh
+    count=0
+    while IFS= read -r _line; do
+      count=$((count + 1))
+      case "$count" in
+        1) printf '%s\n' '{"id":1,"result":{}}' ;;
+        2) ;;
+        3) printf '%s\n' '{"id":2,"result":{"thread":{"id":"thread-cleanup-secret"}}}' ;;
+        4) printf '%s\n' '{"id":3,"result":{"turn":{"id":"turn-cleanup-secret"}}}'
+           printf '%s\n' '{"method":"turn/completed"}'
+           exit 0 ;;
+      esac
+    done
+    """)
+
+    File.write!(tmux_binary, """
+    #!/bin/sh
+    if env | grep -q '^#{secret_name}='; then
+      printf '%s:present\n' "$1" >> "#{trace_file}"
+    else
+      printf '%s:absent\n' "$1" >> "#{trace_file}"
+    fi
+    if [ "$1" = list-panes ]; then
+      printf 'omx-cleanup-secret\t%s\n' '#{canonical_workspace}'
+    fi
+    """)
+
+    File.chmod!(codex_binary, 0o755)
+    File.chmod!(tmux_binary, 0o755)
+    System.put_env(secret_name, "configured-secret")
+    System.put_env("PATH", bin_dir <> ":" <> (previous_path || ""))
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      workspace_root: workspace_root,
+      codex_command: "#{codex_binary} app-server",
+      server_correction_token: "$#{secret_name}"
+    )
+
+    issue = %Issue{
+      id: "issue-cleanup-secret",
+      identifier: "MT-CLEANUP-SECRET",
+      title: "Cleanup secret",
+      state: "In Progress"
+    }
+
+    assert {:ok, _result} = AppServer.run(workspace, "Cleanup", issue)
+    assert File.read!(trace_file) == "list-panes:absent\nkill-session:absent\n"
+  end
+
+  test "app server delivers corrections only to the bound active turn" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-correction-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-CORRECTION")
+      codex_binary = Path.join(test_root, "fake-codex")
+      File.mkdir_p!(workspace)
+      assert {:ok, canonical_workspace} = SymphonyElixir.PathSafety.canonicalize(workspace)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      count=0
+      while IFS= read -r line; do
+        count=$((count + 1))
+        case "$count" in
+          1) printf '%s\n' '{"id":1,"result":{"capabilities":{"symphonyCorrectionDelivery":true}}}' ;;
+          2) ;;
+          3) printf '%s\n' '{"id":2,"result":{"thread":{"id":"thread-correction"}}}' ;;
+          4) printf '%s\n' '{"id":3,"result":{"turn":{"id":"turn-correction"}}}' ;;
+          5)
+            case "$line" in
+              *'"method":"symphony/correction/deliver"'*'"sessionId":"thread-correction-turn-correction"'*) ;;
+              *) exit 9 ;;
+            esac
+            printf '%s%s%s\n' '{"id":"symphony-correction-instruction-1","result":{"correction":{"instructionId":"instruction-1","issueId":"issue-correction","issueIdentifier":"MT-CORRECTION","threadId":"thread-correction","expectedTurnId":"turn-correction","sessionId":"thread-correction-turn-correction","workspacePath":"#{canonical_workspace}","workerPid":"' "$$" '","workerHost":null,"status":"delivered"}}}'
+            printf '%s%s%s\n' '{"method":"symphony/correction/status","params":{"instructionId":"instruction-1","issueId":"issue-correction","issueIdentifier":"MT-CORRECTION","threadId":"thread-correction","expectedTurnId":"turn-correction","sessionId":"thread-correction-turn-correction","workspacePath":"#{canonical_workspace}","workerPid":"' "$$" '","workerHost":null,"status":"execution_started"}}'
+            printf '%s%s%s\n' '{"method":"symphony/correction/status","params":{"instructionId":"instruction-1","issueId":"issue-correction","issueIdentifier":"MT-CORRECTION","threadId":"thread-correction","expectedTurnId":"turn-correction","sessionId":"thread-correction-turn-correction","workspacePath":"#{canonical_workspace}","workerPid":"' "$$" '","workerHost":null,"status":"completed","result":"revision abc"}}'
+            printf '%s\n' '{"method":"turn/completed"}'
+            exit 0
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server"
+      )
+
+      issue = %Issue{
+        id: "issue-correction",
+        identifier: "MT-CORRECTION",
+        title: "Correction delivery",
+        state: "In Progress"
+      }
+
+      parent = self()
+
+      task =
+        Task.async(fn ->
+          AppServer.run(workspace, "wait for correction", issue, on_message: fn message -> send(parent, {:app_server_message, message}) end)
+        end)
+
+      assert_receive {:app_server_message,
+                      %{
+                        event: :session_started,
+                        session_id: "thread-correction-turn-correction",
+                        codex_app_server_pid: worker_pid
+                      }},
+                     5_000
+
+      correction = %{
+        instruction_id: "instruction-1",
+        issue_id: issue.id,
+        issue_identifier: issue.identifier,
+        session_id: "thread-correction-turn-correction",
+        workspace_path: canonical_workspace,
+        worker_pid: worker_pid,
+        worker_host: nil,
+        text: "Apply the authorized correction."
+      }
+
+      send(task.pid, {:deliver_correction, Map.put(correction, :recovery, true)})
+
+      assert_receive {:app_server_message,
+                      %{event: :correction_failed, error: "active transport does not advertise explicit recovery"}}
+
+      send(task.pid, {:deliver_correction, correction})
+
+      assert_receive {:app_server_message, %{event: :correction_delivered}}
+      assert_receive {:app_server_message, %{event: :correction_execution_started}}
+      assert_receive {:app_server_message, %{event: :correction_completed, result: "revision abc"}}
+      assert {:ok, _result} = Task.await(task)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "recovery transport forwards current manager validation without granting authority itself" do
+    test_root = Path.join(System.tmp_dir!(), "symphony-recovery-#{System.unique_integer([:positive])}")
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "LIKE-179")
+      codex_binary = Path.join(test_root, "fake-codex")
+      File.mkdir_p!(workspace)
+      assert {:ok, canonical_workspace} = SymphonyElixir.PathSafety.canonicalize(workspace)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      count=0
+      while IFS= read -r line; do
+        count=$((count + 1))
+        case "$count" in
+          1) printf '%s\\n' '{"id":1,"result":{"capabilities":{"symphonyCorrectionDelivery":true,"symphonyCorrectionRecovery":true}}}' ;;
+          2) ;;
+          3) printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-recovery"}}}' ;;
+          4) printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-recovery"}}}' ;;
+          5)
+            case "$line" in *'"recovery":true'*) ;; *) exit 9 ;; esac
+            case "$line" in *'"sourceRevision":"source-v2"'*) ;; *) exit 10 ;; esac
+            case "$line" in *'"authorizationId":"auth-v2"'*) ;; *) exit 11 ;; esac
+            case "$line" in *'"cwdRevision":4'*) ;; *) exit 12 ;; esac
+            printf '%s%s%s\\n' '{"id":"symphony-recovery-validation-test","method":"symphony/correction/validate","params":{"instructionId":"new-recovery","issueId":"issue-recovery","issueIdentifier":"LIKE-179","threadId":"thread-recovery","expectedTurnId":"turn-recovery","sessionId":"thread-recovery-turn-recovery","workspacePath":"#{canonical_workspace}","workerPid":"' "$$" '","workerHost":null,"sourceRevision":"source-v2","authorizationId":"auth-v2","cwdRevision":4,"stage":"acceptance","runtime":{"agent_id":"agent","conversation_id":"conversation"}}}'
+            ;;
+          6)
+            case "$line" in *'"current":false'*) ;; *) exit 13 ;; esac
+            printf '%s\\n' '{"method":"turn/completed"}'
+            exit 0
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+      write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root, codex_command: "#{codex_binary} app-server")
+      issue = %Issue{id: "issue-recovery", identifier: "LIKE-179", title: "Explicit recovery", state: "In Progress"}
+      parent = self()
+
+      task = Task.async(fn ->
+        AppServer.run(workspace, "wait for recovery", issue, on_message: fn message -> send(parent, {:recovery_message, message}) end)
+      end)
+
+      assert_receive {:recovery_message, %{event: :session_started, codex_app_server_pid: worker_pid}}, 1_000
+
+      send(task.pid, {:deliver_correction, %{
+        instruction_id: "new-recovery",
+        issue_id: issue.id,
+        issue_identifier: issue.identifier,
+        session_id: "thread-recovery-turn-recovery",
+        workspace_path: canonical_workspace,
+        worker_pid: worker_pid,
+        worker_host: nil,
+        text: "Explicit new correction",
+        recovery: true,
+        source_revision: "source-v2",
+        authorization_id: "auth-v2",
+        cwd_revision: 4
+      }})
+
+      assert_receive {:recovery_message, %{
+        event: :correction_validation_requested,
+        request_id: "symphony-recovery-validation-test",
+        reply_to: reply_to,
+        validation: %{"stage" => "acceptance", "sourceRevision" => "source-v2", "authorizationId" => "auth-v2"}
+      }}, 1_000
+
+      assert reply_to == task.pid
+      send(reply_to, {:correction_validation_result, "symphony-recovery-validation-test", %{"current" => false}})
+      assert {:ok, _result} = Task.await(task)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  defp do_test_app_server_cleanup_kills_detached_omx_tmux_sessions(real_tmux) do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-omx-cleanup-#{System.unique_integer([:positive])}"
+      )
+
+    session_name = "omx-symphony-test-#{System.unique_integer([:positive])}"
+    control_session_name = "omx-symphony-control-#{System.unique_integer([:positive])}"
+    previous_path = System.get_env("PATH")
+    tmux = Path.join([test_root, "bin", "tmux"])
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-190")
+      control_workspace = Path.join(workspace_root, "MT-191")
+      bin_dir = Path.join(test_root, "bin")
+      codex_binary = Path.join(bin_dir, "fake-codex")
+      tmux_socket_name = "symphony-test-#{System.unique_integer([:positive])}"
+      File.mkdir_p!(workspace)
+      File.mkdir_p!(control_workspace)
+      File.mkdir_p!(bin_dir)
+      assert {:ok, canonical_workspace} = SymphonyElixir.PathSafety.canonicalize(workspace)
+
+      assert {:ok, canonical_control_workspace} =
+               SymphonyElixir.PathSafety.canonicalize(control_workspace)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      count=0
+      while IFS= read -r _line; do
+        count=$((count + 1))
+
+        case "$count" in
+          1) printf '%s\n' '{"id":1,"result":{}}' ;;
+          2) printf '%s\n' '{"id":2,"result":{"thread":{"id":"thread-190"}}}' ;;
+          3) printf '%s\n' '{"id":3,"result":{"turn":{"id":"turn-190"}}}' ;;
+          4) printf '%s\n' '{"method":"turn/completed"}'; exit 0 ;;
+          *) exit 0 ;;
+        esac
+      done
+      """)
+
+      File.write!(tmux, """
+      #!/bin/sh
+      exec #{shell_escape(real_tmux)} -L #{shell_escape(tmux_socket_name)} "$@"
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+      File.chmod!(tmux, 0o755)
+      System.put_env("PATH", bin_dir <> ":" <> (previous_path || ""))
+
+      {_, 0} =
+        System.cmd(tmux, ["new-session", "-d", "-s", session_name, "-c", canonical_workspace, "sleep", "300"])
+
+      {_, 0} =
+        System.cmd(tmux, [
+          "new-session",
+          "-d",
+          "-s",
+          control_session_name,
+          "-c",
+          canonical_control_workspace,
+          "sleep",
+          "300"
+        ])
+
+      assert {_, 0} = System.cmd(tmux, ["has-session", "-t", session_name])
+      assert {_, 0} = System.cmd(tmux, ["has-session", "-t", control_session_name])
+
+      assert {pane, 0} =
+               System.cmd(tmux, ["list-panes", "-t", session_name, "-F", "\#{pane_current_path}"])
+
+      assert String.trim(pane) == canonical_workspace
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server"
+      )
+
+      issue = %Issue{
+        id: "issue-omx-cleanup",
+        identifier: "MT-190",
+        title: "Cleanup OMX",
+        description: "Ensure detached OMX tmux sessions do not linger",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-190",
+        labels: ["backend"]
+      }
+
+      assert {:ok, _result} = AppServer.run(canonical_workspace, "Cleanup", issue)
+
+      assert {_, 1} = System.cmd(tmux, ["has-session", "-t", session_name], stderr_to_stdout: true)
+      assert {_, 0} = System.cmd(tmux, ["has-session", "-t", control_session_name], stderr_to_stdout: true)
+    after
+      if File.exists?(tmux) do
+        System.cmd(tmux, ["kill-server"], stderr_to_stdout: true)
+      end
+
+      restore_env("PATH", previous_path)
       File.rm_rf(test_root)
     end
   end
@@ -1394,6 +1908,72 @@ defmodule SymphonyElixir.AppServerTest do
     end
   end
 
+  test "app server ignores malformed correction status payloads without ending the owner" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-malformed-correction-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-MALFORMED-CORRECTION")
+      codex_binary = Path.join(test_root, "fake-codex")
+      File.mkdir_p!(workspace)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      count=0
+      while IFS= read -r _line; do
+        count=$((count + 1))
+
+        case "$count" in
+          1)
+            printf '%s\n' '{"id":1,"result":{"capabilities":{"symphonyCorrectionDelivery":true}}}'
+            ;;
+          2)
+            ;;
+          3)
+            printf '%s\n' '{"id":2,"result":{"thread":{"id":"thread-malformed-correction"}}}'
+            ;;
+          4)
+            printf '%s\n' '{"id":3,"result":{"turn":{"id":"turn-malformed-correction"}}}'
+            printf '%s\n' '{"method":"symphony/correction/status","params":null}'
+            printf '%s\n' '{"id":"symphony-correction-invalid","result":{"correction":null}}'
+            printf '%s\n' '{"method":"turn/completed"}'
+            exit 0
+            ;;
+          *)
+            exit 0
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server"
+      )
+
+      issue = %Issue{
+        id: "issue-malformed-correction",
+        identifier: "MT-MALFORMED-CORRECTION",
+        title: "Malformed correction status",
+        description: "Keep the owner alive after malformed correction protocol payloads",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-MALFORMED-CORRECTION",
+        labels: ["backend"]
+      }
+
+      assert {:ok, %{result: :turn_completed}} =
+               AppServer.run(workspace, "Ignore malformed correction status", issue)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
   test "app server does not pass tracker credentials to the local Codex child" do
     test_root =
       Path.join(
@@ -1627,5 +2207,9 @@ defmodule SymphonyElixir.AppServerTest do
     after
       File.rm_rf(test_root)
     end
+  end
+
+  defp shell_escape(value) when is_binary(value) do
+    "'" <> String.replace(value, "'", "'\"'\"'") <> "'"
   end
 end

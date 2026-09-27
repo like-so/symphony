@@ -14,6 +14,10 @@ defmodule SymphonyElixirWeb.Router do
     plug(:put_secure_browser_headers)
   end
 
+  pipeline :correction_control do
+    plug(SymphonyElixirWeb.Plugs.CorrectionAuth)
+  end
+
   scope "/", SymphonyElixirWeb do
     get("/dashboard.css", StaticAssetController, :dashboard_css)
     get("/favicon.png", StaticAssetController, :favicon)
@@ -35,6 +39,18 @@ defmodule SymphonyElixirWeb.Router do
     match(:*, "/api/v1/state", ObservabilityApiController, :method_not_allowed)
     post("/api/v1/refresh", ObservabilityApiController, :refresh)
     match(:*, "/api/v1/refresh", ObservabilityApiController, :method_not_allowed)
+  end
+
+  scope "/", SymphonyElixirWeb do
+    pipe_through(:correction_control)
+
+    post("/api/v1/issues/:issue_identifier/corrections", CorrectionController, :create)
+    match(:*, "/api/v1/issues/:issue_identifier/corrections", ObservabilityApiController, :method_not_allowed)
+    get("/api/v1/corrections/:instruction_id", CorrectionController, :show)
+    match(:*, "/api/v1/corrections/:instruction_id", ObservabilityApiController, :method_not_allowed)
+  end
+
+  scope "/", SymphonyElixirWeb do
     get("/api/v1/:issue_identifier", ObservabilityApiController, :issue)
     match(:*, "/api/v1/:issue_identifier", ObservabilityApiController, :method_not_allowed)
     match(:*, "/*path", ObservabilityApiController, :not_found)
