@@ -39,14 +39,22 @@ through `letta agents list --name` before running the turn.
 
 While a turn is active, Symphony may send `symphony/correction/deliver` with the exact issue,
 session, workspace, worker-PID, and worker-host binding supplied on `turn/start`. The bridge rejects
-stale or duplicate instruction IDs, acknowledges receipt separately, and drains accepted corrections
-serially on the same Letta runtime and conversation between workflow phases. It reports execution
+stale or duplicate instruction IDs and returns `received` for bridge receipt. It submits corrections
+serially to the same Letta runtime and conversation during the active phase, once the phase input
+has native acceptance or correlated execution evidence. `delivered` means the native App Server
+accepted the input (possibly into its queue), not that the model has read it or that it is already
+in the persisted transcript. Letta consumes queued input at its next tool-result continuation or
+after the active turn ends; a running tool or LLM request is not interrupted. Later corrections
+retain FIFO order and wait for the preceding correction's terminal outcome. It reports execution
 start after the App Server correlates the exact correction message to a run with accepted or dequeued
 execution evidence, and completion only after that run reaches a successful `turn_finished`.
 Input-required outcomes are reported as blocked; other terminal outcomes are failed. If an input may
 have been accepted but its terminal outcome cannot be observed, the bridge fails the delivery and
 stops later corrections and workflow
 phases instead of submitting more input behind unresolved execution.
+The owner waits for in-flight corrections before completion and transport teardown. Explicit
+recovery remains a separate authorization path requiring fresh idle and cwd-revision evidence;
+it is not used to steer an executing owner.
 
 ## App Server lifecycle
 

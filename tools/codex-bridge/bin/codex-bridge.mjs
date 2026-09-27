@@ -201,6 +201,7 @@ export const bridgeTestHooks = {
   AppServerProcessManager,
   createAppServerBridgeClientForTest,
   acceptCorrectionForTarget,
+  acceptCorrection,
   createCorrectionTarget,
   inspectRecoveryIdle,
   validateRecoveryAuthority,
@@ -398,24 +399,63 @@ async function submitWorkflowPhase(
   submitTurn = submitAndWaitForTurn,
 ) {
   target.phaseActive = true;
+  target.phaseClientMessageId = `symphony-phase-${randomUUID()}`;
+  target.phaseRunId = null;
   target.usage = usage;
   const localStop = new Promise((resolve) => { target.stopPhaseWait = resolve; });
+  const markPhaseReady = (runId) => {
+    if (!target.accepting) return;
+    if (runId) target.phaseRunId = runId;
+    target.phaseReady = true;
+    if (target.queue.length > 0) void drainCorrections(target, usage);
+  };
   try {
     const terminal = await submitTurn(
       target.client, target.runtime, prompt, target.turnId, usage,
-      { clientMessageId: `symphony-phase-${randomUUID()}`, localStop },
+      {
+        clientMessageId: target.phaseClientMessageId, localStop,
+        onAccepted: (acceptance) => {
+          if (!acceptance.accepted) throw new Error(acceptance.error || "owner input was rejected");
+          markPhaseReady();
+        },
+        onExecutionStarted: markPhaseReady,
+        onTerminal: (terminal) => {
+          if (!correctionCompletionError(terminal)) return;
+          closeCorrectionTarget(target, "owner turn ended before correction execution");
+          if (!target.recoveryTakenOver) {
+            // Other listeners may consume this same correlated terminal.
+            // Let that evidence settle before ending an uncorrelated waiter.
+            const stopCorrectionWait = target.stopCorrectionWait;
+            queueMicrotask(() => stopCorrectionWait?.(new Error("owner turn ended before correction terminal")));
+          }
+        },
+      },
     );
+    target.phaseActive = false;
     if (target.recoveryTakenOver) {
       throw new Error("Original phase outcome unresolved; explicit recovery is a separate instruction");
+    }
+    if (target.correctionOutcomeUnresolved) {
+      throw new Error("Correction terminal outcome is unresolved; stopping the owner workflow");
     }
     // Preserve the workflow's existing approval/input-required completion path.
     if (terminal.stopReason !== "requires_approval" && !blockedTurns.has(target.turnId)) {
       const error = correctionCompletionError(terminal);
       if (error) throw new Error(error);
+    } else {
+      closeCorrectionTarget(target, "owner turn blocked before correction execution");
+      target.stopCorrectionWait?.(new Error("owner turn requires operator input or approval"));
+    }
+    // A native queued input can finish after the original phase. Keep its
+    // listener and transport alive, and emit its result before owner completion.
+    if (target.drainPromise) await target.drainPromise;
+    if (target.correctionOutcomeUnresolved) {
+      throw new Error("Correction terminal outcome is unresolved; stopping the owner workflow");
     }
     return terminal;
   } catch (error) {
     closeCorrectionTarget(target, "owner turn ended before correction execution");
+    if (!target.recoveryTakenOver) target.stopCorrectionWait?.(error);
     // A separately authorized input must retain its own terminal waiter even
     // when the original phase times out or its local waiter is relinquished.
     if (target.drainPromise) await target.drainPromise;
@@ -423,6 +463,9 @@ async function submitWorkflowPhase(
     throw error;
   } finally {
     target.phaseActive = false;
+    target.phaseReady = false;
+    target.phaseClientMessageId = null;
+    target.phaseRunId = null;
     target.stopPhaseWait = null;
   }
 }
@@ -453,11 +496,13 @@ function createCorrectionTarget(params, turnId, client, runtime) {
   };
 }
 
-async function acceptCorrection(responseId, params) {
-  const target = activeCorrectionTarget;
-  const result = await acceptCorrectionForTarget(target, params);
-  respond(responseId, { correction: result });
-  if (result.status === "delivered" && params.recovery === true) {
+async function acceptCorrection(
+  responseId, params, target = activeCorrectionTarget,
+  reply = respond, seen = acceptedCorrectionIds,
+) {
+  const result = await acceptCorrectionForTarget(target, params, seen);
+  reply(responseId, { correction: result });
+  if (result.status === "received" && (params.recovery === true || target.phaseReady)) {
     void drainCorrections(target, target.usage || {});
   }
 }
@@ -496,7 +541,7 @@ async function acceptCorrectionForTarget(target, params, seen = acceptedCorrecti
     return fail("explicit recovery is already pending", "blocked");
   }
   target.queue.push({ ...params });
-  return correctionStatus(params, "delivered");
+  return correctionStatus(params, "received");
 }
 
 async function requestRecoveryAuthority(target, correction, stage) {
@@ -583,14 +628,24 @@ function drainCorrections(target, usage, submitTurn = submitAndWaitForTurn) {
 async function drainCorrectionQueue(target, usage, submitTurn) {
   while (target.queue.length > 0) {
     const correction = target.queue.shift();
+    let delivered = false;
+    const markDelivered = () => {
+      if (delivered) return;
+      delivered = true;
+      target.emitStatus(correction, "delivered");
+    };
     let executionStarted = false;
     const markExecutionStarted = (runId) => {
       if (executionStarted) return;
+      // Correlation may arrive before the input acknowledgement (or replace a
+      // lost acknowledgement). Preserve monotonic status ordering either way.
+      markDelivered();
       executionStarted = true;
       target.emitStatus(correction, "execution_started", { runId });
     };
 
     let submissionAttempted = false;
+    const localStop = new Promise((_resolve, reject) => { target.stopCorrectionWait = reject; });
     try {
       const submit = () => {
         submissionAttempted = true;
@@ -602,14 +657,16 @@ async function drainCorrectionQueue(target, usage, submitTurn) {
           usage,
           {
             clientMessageId: `symphony-correction-${correction.instructionId}`,
+            waitingOnOwnerClientMessageId: target.phaseActive ? target.phaseClientMessageId : null,
+            waitingOnOwnerRunId: target.phaseActive ? target.phaseRunId : null,
+            localStop,
             onAccepted: (acceptance) => {
               if (!acceptance.accepted) {
                 throw new Error(acceptance.error || "correction input was rejected");
               }
+              markDelivered();
             },
-            onExecutionStarted: (runId) => {
-              markExecutionStarted(runId);
-            },
+            onExecutionStarted: markExecutionStarted,
           },
         );
       };
@@ -660,13 +717,16 @@ async function drainCorrectionQueue(target, usage, submitTurn) {
         error: formatError(error),
       });
       if (error?.correctionOutcomeUnresolved) {
+        target.correctionOutcomeUnresolved = true;
         closeCorrectionTarget(
           target,
           "earlier accepted correction has no observed terminal outcome",
         );
+        target.stopPhaseWait?.({ stopReason: "correction_unresolved", text: "" });
         return { outcomeUnresolved: true };
       }
     } finally {
+      target.stopCorrectionWait = null;
       if (correction.recovery === true) target.recoveryPending = false;
     }
   }
@@ -1005,6 +1065,8 @@ async function submitAndWaitForTurn(client, runtime, prompt, turnId, usage, hook
   let executionObserved = false;
   let executionReported = false;
   let correctionRunId = null;
+  let waitingOnOwnerRunId = hooks.waitingOnOwnerRunId || null;
+  const runsWithoutInput = new Set(waitingOnOwnerRunId ? [waitingOnOwnerRunId] : []);
   let inputAccepted = false;
   let inputRejected = false;
   let inputSubmissionAttempted = false;
@@ -1019,6 +1081,7 @@ async function submitAndWaitForTurn(client, runtime, prompt, turnId, usage, hook
     const resolveTerminal = (result) => {
       if (observedTerminal) return;
       observedTerminal = result;
+      hooks.onTerminal?.(result);
       resolve(result);
     };
     const replayToolCorrelationMessages = () => {
@@ -1035,8 +1098,16 @@ async function submitAndWaitForTurn(client, runtime, prompt, turnId, usage, hook
       replayingToolCorrelationMessages = false;
     };
     const processMessage = (message) => {
-      if (!sameRuntime(message.runtime, runtime)) return;
+      if (observedTerminal) return;
+      if (hooks.clientMessageId && strictRuntime(runtime, runtime)
+        ? !strictRuntime(message.runtime, runtime)
+        : !sameRuntime(message.runtime, runtime)) return;
 
+      for (const [runId, ids] of Object.entries(message.loop_status?.client_message_ids_by_run_id || {})) {
+        if (!Array.isArray(ids)) continue;
+        if (ids.includes(hooks.clientMessageId)) runsWithoutInput.delete(runId);
+        else runsWithoutInput.add(runId);
+      }
       if (recordToolRunCorrelations(message, runIdsByToolCallId)) {
         replayToolCorrelationMessages();
       }
@@ -1047,11 +1118,35 @@ async function submitAndWaitForTurn(client, runtime, prompt, turnId, usage, hook
       );
 
       if (queueDisposition === "dequeued") {
+        if (!executionObserved) {
+          // A continuation can reuse the owner's run ID. Events preceding
+          // consumption belong to the old input, even if a later snapshot
+          // adds this client message to that same run.
+          pendingCorrelationMessages.length = 0;
+          pendingToolCorrelationMessages.length = 0;
+        }
         executionObserved = true;
       } else if (queueDisposition === "cancelled") {
         resolveTerminal({ cancelled: true, text: collapseText(runEvents) });
         return;
       }
+
+      // Until dequeue, progress of the exact bound owner can keep a queued
+      // input alive. Once consumed, only this correction's activity counts.
+      if (!executionObserved && hooks.waitingOnOwnerClientMessageId) {
+        waitingOnOwnerRunId = correctionRunIdForMessage(
+          message, hooks.waitingOnOwnerClientMessageId, waitingOnOwnerRunId,
+        ) || waitingOnOwnerRunId;
+        if (isTurnActivityMessage(message, {
+          clientMessageId: hooks.waitingOnOwnerClientMessageId,
+          correctionRunId: waitingOnOwnerRunId,
+          runIdsByToolCallId,
+        })) refreshTurnTimeout();
+      }
+
+      // Do not save an old owner's terminal for retrospective correlation
+      // when a later continuation adds this message to the same run ID.
+      if (!executionObserved && runsWithoutInput.has(runIdForMessage(message))) return;
 
       const correlatedRunId = correctionRunIdForMessage(
         message,
@@ -1250,7 +1345,7 @@ async function submitAndWaitForTurn(client, runtime, prompt, turnId, usage, hook
     inputSubmissionAttempted = true;
     let acceptance;
     try {
-      acceptance = await client.submitInput(
+      const submission = client.submitInput(
         {
           runtime,
           payload: {
@@ -1269,6 +1364,7 @@ async function submitAndWaitForTurn(client, runtime, prompt, turnId, usage, hook
         },
         { timeoutMs: options.requestTimeoutMs },
       );
+      acceptance = await Promise.race([submission, ...(hooks.localStop ? [hooks.localStop] : [])]);
     } catch (error) {
       if (hooks.clientMessageId && observedTerminal) {
         terminalOutcomeObserved = true;
