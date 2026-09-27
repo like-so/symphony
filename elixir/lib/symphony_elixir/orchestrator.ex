@@ -33,6 +33,9 @@ defmodule SymphonyElixir.Orchestrator do
       :poll_check_in_progress,
       :tick_timer_ref,
       :tick_token,
+      :tracker_task,
+      :startup_cleanup_task,
+      pending_retries: MapSet.new(),
       task_supervisor: SymphonyElixir.TaskSupervisor,
       running: %{},
       completed: MapSet.new(),
@@ -54,6 +57,8 @@ defmodule SymphonyElixir.Orchestrator do
 
   @impl true
   def init(opts) do
+    Process.flag(:trap_exit, true)
+
     case Config.settings() do
       {:ok, config} ->
         now_ms = System.monotonic_time(:millisecond)
@@ -70,8 +75,7 @@ defmodule SymphonyElixir.Orchestrator do
           codex_rate_limits: nil
         }
 
-        run_terminal_workspace_cleanup()
-        state = schedule_tick(state, 0)
+        state = state |> start_startup_cleanup() |> schedule_tick(0)
 
         {:ok, state}
 
@@ -81,6 +85,32 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   @impl true
+  def handle_info(message, %{tracker_task: task} = state)
+      when not is_nil(task) and (message == :tick or message == :run_poll_cycle) do
+    {:noreply, state}
+  end
+
+  def handle_info({:tick, _token}, %{tracker_task: task} = state) when not is_nil(task),
+    do: {:noreply, state}
+
+  def handle_info({ref, result}, %{tracker_task: %{ref: ref} = task} = state) do
+    Process.demonitor(ref, [:flush])
+    {:noreply, complete_tracker_task(state, task, result)}
+  end
+
+  def handle_info({:DOWN, ref, :process, _pid, reason}, %{tracker_task: %{ref: ref} = task} = state) do
+    {:noreply, complete_tracker_task(state, task, {:error, {:tracker_task_exit, reason}})}
+  end
+
+  def handle_info({ref, result}, %{startup_cleanup_task: %{ref: ref} = task} = state) do
+    Process.demonitor(ref, [:flush])
+    {:noreply, complete_startup_cleanup(state, task, result)}
+  end
+
+  def handle_info({:DOWN, ref, :process, _pid, reason}, %{startup_cleanup_task: %{ref: ref} = task} = state) do
+    {:noreply, complete_startup_cleanup(state, task, {:error, {:tracker_task_exit, reason}})}
+  end
+
   def handle_info({:tick, tick_token}, %{tick_token: tick_token} = state)
       when is_reference(tick_token) do
     state = refresh_runtime_config(state)
@@ -118,12 +148,10 @@ defmodule SymphonyElixir.Orchestrator do
 
   def handle_info(:run_poll_cycle, state) do
     state = refresh_runtime_config(state)
-    state = maybe_dispatch(state)
-    state = schedule_tick(state, state.poll_interval_ms)
-    state = %{state | poll_check_in_progress: false}
+    if state.tick_timer_ref, do: Process.cancel_timer(state.tick_timer_ref)
 
-    notify_dashboard()
-    {:noreply, state}
+    state = %{state | poll_check_in_progress: true, next_poll_due_at_ms: nil, tick_timer_ref: nil, tick_token: nil}
+    {:noreply, maybe_dispatch(state)}
   end
 
   def handle_info(
@@ -192,21 +220,19 @@ defmodule SymphonyElixir.Orchestrator do
 
   def handle_info({:codex_worker_update, _issue_id, _update}, state), do: {:noreply, state}
 
+  def handle_info({:retry_issue, _issue_id, _retry_token} = message, %{tracker_task: task} = state)
+      when not is_nil(task) do
+    {:noreply, %{state | pending_retries: MapSet.put(state.pending_retries, message)}}
+  end
+
   def handle_info({:retry_issue, issue_id, retry_token}, state) do
-    result =
-      case capacity_waiting_retry(state, issue_id) do
-        {:ok, %{retry_token: ^retry_token} = retry_entry} ->
-          handle_capacity_retry_timer(state, issue_id, retry_entry)
+    case Map.get(state.retry_attempts, issue_id) do
+      %{retry_token: ^retry_token} = retry_entry ->
+        {:noreply, start_retry_poll(state, issue_id, retry_entry)}
 
-        _ ->
-          case pop_retry_attempt_state(state, issue_id, retry_token) do
-            {:ok, attempt, metadata, state} -> handle_retry_issue(state, issue_id, attempt, metadata)
-            :missing -> {:noreply, state}
-          end
-      end
-
-    notify_dashboard()
-    result
+      _ ->
+        {:noreply, state}
+    end
   end
 
   def handle_info({:retry_issue, _issue_id}, state), do: {:noreply, state}
@@ -266,106 +292,190 @@ defmodule SymphonyElixir.Orchestrator do
     })
   end
 
-  defp maybe_dispatch(%State{} = state) do
-    state =
-      state
-      |> reconcile_running_issues()
-      |> reconcile_blocked_issues()
+  @impl true
+  def terminate(_reason, state) do
+    for task <- [state.tracker_task, state.startup_cleanup_task], not is_nil(task) do
+      Task.Supervisor.terminate_child(state.task_supervisor, task.pid)
+    end
 
-    with :ok <- Config.validate!(),
-         {:ok, issues} <- Tracker.fetch_issues_by_states(Config.settings!().tracker.active_states),
+    :ok
+  end
+
+  # Terminal hydration must not occupy the active polling/dispatch slot.
+  defp start_startup_cleanup(state) do
+    config = Config.settings()
+    terminal_states = Config.settings!().tracker.terminal_states
+    task = Task.Supervisor.async(state.task_supervisor, fn -> Tracker.fetch_issues_by_states(terminal_states) end)
+    %{state | startup_cleanup_task: %{ref: task.ref, pid: task.pid, config: config}}
+  end
+
+  defp complete_startup_cleanup(state, task, result) do
+    state = %{state | startup_cleanup_task: nil}
+
+    if Config.settings() == task.config do
+      run_terminal_workspace_cleanup(result, state)
+      state
+    else
+      start_startup_cleanup(state)
+    end
+  end
+
+  # Tasks return I/O results only. Continuations always receive the current owner state.
+  defp start_tracker_task(state, request, continuation) do
+    if state.tick_timer_ref, do: Process.cancel_timer(state.tick_timer_ref)
+    config = Config.settings()
+    task = Task.Supervisor.async(state.task_supervisor, request)
+    %{state | tracker_task: %{ref: task.ref, pid: task.pid, continuation: continuation, config: config}, poll_check_in_progress: true, tick_timer_ref: nil, tick_token: nil, next_poll_due_at_ms: nil}
+  end
+
+  defp complete_tracker_task(state, task, result) do
+    state = %{state | tracker_task: nil}
+
+    state =
+      if Config.settings() == task.config do
+        task.continuation.(result, state)
+      else
+        # Do not interpret a response under a different tracker/configuration.
+        state
+        |> finish_poll()
+        |> schedule_tick(0)
+      end
+
+    notify_dashboard()
+    state
+  end
+
+  defp finish_poll(state) do
+    Enum.each(state.pending_retries, &send(self(), &1))
+
+    state = %{state | pending_retries: MapSet.new(), poll_check_in_progress: false}
+    if state.tick_timer_ref, do: state, else: schedule_tick(state, state.poll_interval_ms)
+  end
+
+  defp maybe_dispatch(%State{} = state) do
+    reconcile_running_issues(state, &poll_blocked_issues/1)
+  end
+
+  defp poll_blocked_issues(state) do
+    reconcile_blocked_issues(state, &poll_candidates/1)
+  end
+
+  defp poll_candidates(state) do
+    start_tracker_task(state, &fetch_dispatch_candidates/0, &apply_dispatch_poll/2)
+  end
+
+  defp fetch_dispatch_candidates do
+    with :ok <- Config.validate!() do
+      Tracker.fetch_issues_by_states(Config.settings!().tracker.active_states)
+    end
+  end
+
+  defp apply_dispatch_poll(result, state) do
+    with {:ok, issues} <- result,
          true <- available_slots(state) > 0 do
-      choose_issues(issues, state)
+      choose_issues(sort_issues_for_dispatch(issues), state)
     else
       {:error, :missing_linear_api_token} ->
         Logger.error("Tracker API token missing in WORKFLOW.md")
-        state
+        finish_poll(state)
 
       {:error, :missing_linear_project_slug} ->
         Logger.error("Tracker project scope missing in WORKFLOW.md")
-        state
+        finish_poll(state)
 
       {:error, :missing_tracker_kind} ->
         Logger.error("Tracker kind missing in WORKFLOW.md")
 
-        state
+        finish_poll(state)
 
       {:error, {:unsupported_tracker_kind, kind}} ->
         Logger.error("Unsupported tracker kind in WORKFLOW.md: #{inspect(kind)}")
 
-        state
+        finish_poll(state)
 
       {:error, {:invalid_workflow_config, message}} ->
         Logger.error("Invalid WORKFLOW.md config: #{message}")
-        state
+        finish_poll(state)
 
       {:error, {:missing_workflow_file, path, reason}} ->
         Logger.error("Missing WORKFLOW.md at #{path}: #{inspect(reason)}")
-        state
+        finish_poll(state)
 
       {:error, :workflow_front_matter_not_a_map} ->
         Logger.error("Failed to parse WORKFLOW.md: workflow front matter must decode to a map")
-        state
+        finish_poll(state)
 
       {:error, {:workflow_parse_error, reason}} ->
         Logger.error("Failed to parse WORKFLOW.md: #{inspect(reason)}")
-        state
+        finish_poll(state)
 
       {:error, reason} ->
         Logger.error("Failed to fetch from issue tracker: #{inspect(reason)}")
-        state
+        finish_poll(state)
 
       false ->
-        state
+        finish_poll(state)
     end
   end
 
-  defp reconcile_running_issues(%State{} = state) do
+  defp reconcile_running_issues(%State{} = state, next) do
     state = reconcile_stalled_running_issues(state)
-    running_ids = Map.keys(state.running)
+    owners = Map.new(state.running, fn {id, entry} -> {id, entry.ref} end)
 
-    if running_ids == [] do
-      state
+    if map_size(owners) == 0 do
+      next.(state)
     else
-      case Tracker.fetch_issues_by_ids(running_ids) do
-        {:ok, issues} ->
-          issues
-          |> reconcile_running_issue_states(
-            state,
-            active_state_set(),
-            terminal_state_set()
-          )
-          |> reconcile_missing_running_issue_ids(running_ids, issues)
+      start_tracker_task(state, fn -> Tracker.fetch_issues_by_ids(Map.keys(owners)) end, fn result, current ->
+        ids = Enum.filter(Map.keys(owners), &(get_in(current.running, [&1, :ref]) == owners[&1]))
 
-        {:error, reason} ->
-          Logger.debug("Failed to refresh running issue states: #{inspect(reason)}; keeping active workers")
+        current = apply_running_poll(result, current, ids)
 
-          state
-      end
+        next.(current)
+      end)
     end
   end
 
-  defp reconcile_blocked_issues(%State{} = state) do
-    blocked_ids = Map.keys(state.blocked)
+  defp apply_running_poll(result, current, ids) do
+    case result do
+      {:ok, issues} ->
+        issues
+        |> Enum.filter(&(&1.id in ids))
+        |> reconcile_running_issue_states(current, active_state_set(), terminal_state_set())
+        |> reconcile_missing_running_issue_ids(ids, issues)
 
-    if blocked_ids == [] do
-      state
+      {:error, reason} ->
+        Logger.debug("Failed to refresh running issue states: #{inspect(reason)}; keeping active workers")
+        current
+    end
+  end
+
+  defp reconcile_blocked_issues(%State{} = state, next) do
+    owners = state.blocked
+
+    if map_size(owners) == 0 do
+      next.(state)
     else
-      case Tracker.fetch_issues_by_ids(blocked_ids) do
-        {:ok, issues} ->
-          issues
-          |> reconcile_blocked_issue_states(
-            state,
-            active_state_set(),
-            terminal_state_set()
-          )
-          |> reconcile_missing_blocked_issue_ids(blocked_ids, issues)
+      start_tracker_task(state, fn -> Tracker.fetch_issues_by_ids(Map.keys(owners)) end, fn result, current ->
+        ids = Enum.filter(Map.keys(owners), &(current.blocked[&1] == owners[&1]))
 
-        {:error, reason} ->
-          Logger.debug("Failed to refresh blocked issue states: #{inspect(reason)}; keeping blocked issues")
+        current = apply_blocked_poll(result, current, ids)
 
-          state
-      end
+        next.(current)
+      end)
+    end
+  end
+
+  defp apply_blocked_poll(result, current, ids) do
+    case result do
+      {:ok, issues} ->
+        issues
+        |> Enum.filter(&(&1.id in ids))
+        |> reconcile_blocked_issue_states(current, active_state_set(), terminal_state_set())
+        |> reconcile_missing_blocked_issue_ids(ids, issues)
+
+      {:error, reason} ->
+        Logger.debug("Failed to refresh blocked issue states: #{inspect(reason)}; keeping blocked issues")
+        current
     end
   end
 
@@ -803,19 +913,57 @@ defmodule SymphonyElixir.Orchestrator do
     }
   end
 
-  defp choose_issues(issues, state) do
-    active_states = active_state_set()
-    terminal_states = terminal_state_set()
+  defp choose_issues([], state), do: finish_poll(state)
 
-    issues
-    |> sort_issues_for_dispatch()
-    |> Enum.reduce(state, fn issue, state_acc ->
-      if should_dispatch_issue?(issue, state_acc, active_states, terminal_states) do
-        dispatch_issue(state_acc, issue)
-      else
-        state_acc
-      end
-    end)
+  defp choose_issues([issue | rest], state) do
+    if should_dispatch_issue?(issue, state, active_state_set(), terminal_state_set()) do
+      retry = capacity_waiting_retry(state, issue.id)
+      request = fn -> refresh_issue_for_dispatch(issue) end
+      start_tracker_task(state, request, &apply_dispatch_refresh(&1, &2, issue, retry, rest))
+    else
+      choose_issues(rest, state)
+    end
+  end
+
+  defp apply_dispatch_refresh(result, state, issue, retry, rest) do
+    if should_dispatch_issue?(issue, state, active_state_set(), terminal_state_set()) and
+         capacity_waiting_retry(state, issue.id) == retry do
+      continue_dispatch(state, issue, result, retry, rest)
+    else
+      choose_issues(rest, state)
+    end
+  end
+
+  defp continue_dispatch(state, issue, result, {:ok, retry}, rest) do
+    state
+    |> dispatch_capacity_waiter(issue, retry, result)
+    |> then(&choose_issues(rest, &1))
+  end
+
+  defp continue_dispatch(state, _issue, {:ok, refreshed}, :missing, rest) do
+    if should_dispatch_issue?(refreshed, state, active_state_set(), terminal_state_set()) do
+      start_tracker_task(state, fn -> Tracker.claim_issue(refreshed) end, fn result, current ->
+        current = apply_claim_result(result, current, refreshed)
+        choose_issues(rest, current)
+      end)
+    else
+      choose_issues(rest, state)
+    end
+  end
+
+  defp continue_dispatch(state, _issue, _result, :missing, rest), do: choose_issues(rest, state)
+
+  defp apply_claim_result({:ok, claimed}, state, _refreshed) do
+    if should_dispatch_issue?(claimed, state, active_state_set(), terminal_state_set()) do
+      do_dispatch_issue(state, claimed, nil, nil)
+    else
+      state
+    end
+  end
+
+  defp apply_claim_result({:error, reason}, state, refreshed) do
+    Logger.warning("Skipping dispatch; issue claim failed for #{issue_context(refreshed)}: #{inspect(reason)}")
+    state
   end
 
   defp sort_issues_for_dispatch(issues) when is_list(issues) do
@@ -929,38 +1077,8 @@ defmodule SymphonyElixir.Orchestrator do
     |> MapSet.new()
   end
 
-  defp dispatch_issue(%State{} = state, issue, attempt \\ nil, preferred_worker_host \\ nil) do
-    case capacity_waiting_retry(state, issue.id) do
-      {:ok, retry_entry} ->
-        dispatch_capacity_waiter(state, issue, retry_entry)
-
-      :missing ->
-        dispatch_unclaimed_issue(state, issue, attempt, preferred_worker_host)
-    end
-  end
-
-  defp dispatch_unclaimed_issue(state, issue, attempt, preferred_worker_host) do
-    case refresh_issue_for_dispatch(issue) do
-      {:ok, %Issue{} = refreshed_issue} ->
-        case Tracker.claim_issue(refreshed_issue) do
-          {:ok, %Issue{} = claimed_issue} ->
-            do_dispatch_issue(state, claimed_issue, attempt, preferred_worker_host)
-
-          {:error, reason} ->
-            Logger.warning("Skipping dispatch; issue claim failed for #{issue_context(refreshed_issue)}: #{inspect(reason)}")
-            state
-        end
-
-      {:skip, _reason} ->
-        state
-
-      {:error, _reason} ->
-        state
-    end
-  end
-
-  defp dispatch_capacity_waiter(state, issue, retry_entry) do
-    case refresh_issue_for_dispatch(issue) do
+  defp dispatch_capacity_waiter(state, issue, retry_entry, result) do
+    case result do
       {:ok, %Issue{} = refreshed_issue} ->
         if dispatch_slots_available?(refreshed_issue, state) and
              worker_slots_available?(state, Map.get(retry_entry, :worker_host)) do
@@ -1184,12 +1302,75 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp handle_retry_issue(%State{} = state, issue_id, attempt, metadata) do
-    case Tracker.fetch_issues_by_ids([issue_id]) do
+  defp start_retry_poll(state, issue_id, retry_entry) do
+    poll_due_at = state.next_poll_due_at_ms || System.monotonic_time(:millisecond)
+    capacity_retry? = capacity_waiting_retry?(state, issue_id)
+    message = {:retry_issue, issue_id, retry_entry.retry_token}
+    state = %{state | pending_retries: MapSet.put(state.pending_retries, message)}
+
+    start_tracker_task(state, fn -> fetch_retry_poll(issue_id, capacity_retry?) end, fn result, current ->
+      current = %{current | pending_retries: MapSet.delete(current.pending_retries, message), poll_check_in_progress: false}
+      current = apply_retry_poll(result, current, issue_id, retry_entry) |> finish_poll()
+
+      if current.next_poll_due_at_ms > poll_due_at do
+        schedule_tick(current, max(0, poll_due_at - System.monotonic_time(:millisecond)))
+      else
+        current
+      end
+    end)
+  end
+
+  defp fetch_retry_poll(issue_id, capacity_retry?) do
+    result = Tracker.fetch_issues_by_ids([issue_id])
+
+    refresh =
+      case result do
+        {:ok, [%Issue{} = issue | _]} ->
+          if not capacity_retry? and retry_candidate_issue?(issue, terminal_state_set()),
+            do: refresh_issue_for_dispatch(issue)
+
+        _ ->
+          nil
+      end
+
+    {:retry_result, result, refresh}
+  end
+
+  defp apply_retry_poll(result, state, issue_id, retry_entry) do
+    case Map.get(state.retry_attempts, issue_id) do
+      %{retry_token: token} when token == retry_entry.retry_token ->
+        apply_current_retry_poll(result, state, issue_id, retry_entry)
+
+      _ ->
+        state
+    end
+  end
+
+  defp apply_current_retry_poll({:error, _} = error, state, issue_id, retry_entry) do
+    apply_current_retry_poll({:retry_result, error, error}, state, issue_id, retry_entry)
+  end
+
+  defp apply_current_retry_poll({:retry_result, lookup, refresh}, state, issue_id, retry_entry) do
+    {:noreply, updated} =
+      case capacity_waiting_retry(state, issue_id) do
+        {:ok, entry} ->
+          handle_capacity_retry_result(state, issue_id, entry, lookup)
+
+        :missing ->
+          token = retry_entry.retry_token
+          {:ok, attempt, metadata, state} = pop_retry_attempt_state(state, issue_id, token)
+          handle_retry_result(state, issue_id, attempt, metadata, lookup, fn _ -> refresh end)
+      end
+
+    updated
+  end
+
+  defp handle_retry_result(state, issue_id, attempt, metadata, result, refresh) do
+    case result do
       {:ok, issues} ->
         issues
         |> find_issue_by_id(issue_id)
-        |> handle_retry_issue_lookup(state, issue_id, attempt, metadata)
+        |> handle_retry_issue_lookup(state, issue_id, attempt, metadata, refresh)
 
       {:error, reason} ->
         Logger.warning("Retry poll failed for issue_id=#{issue_id} issue_identifier=#{metadata[:identifier] || issue_id}: #{inspect(reason)}")
@@ -1204,15 +1385,6 @@ defmodule SymphonyElixir.Orchestrator do
            |> Map.put(:error, "retry poll failed: #{inspect(reason)}")
          )}
     end
-  end
-
-  defp handle_capacity_retry_timer(%State{} = state, issue_id, retry_entry) do
-    handle_capacity_retry_result(
-      state,
-      issue_id,
-      retry_entry,
-      Tracker.fetch_issues_by_ids([issue_id])
-    )
   end
 
   defp handle_capacity_retry_result(state, issue_id, retry_entry, result) do
@@ -1259,7 +1431,9 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp handle_retry_issue_lookup(%Issue{} = issue, state, issue_id, attempt, metadata) do
+  defp handle_retry_issue_lookup(issue, state, issue_id, attempt, metadata, refresh \\ &refresh_issue_for_dispatch/1)
+
+  defp handle_retry_issue_lookup(%Issue{} = issue, state, issue_id, attempt, metadata, refresh) do
     terminal_states = terminal_state_set()
 
     cond do
@@ -1270,7 +1444,7 @@ defmodule SymphonyElixir.Orchestrator do
         {:noreply, release_issue_claim(state, issue_id)}
 
       retry_candidate_issue?(issue, terminal_states) ->
-        handle_active_retry(state, issue, attempt, metadata)
+        handle_active_retry(state, issue, attempt, metadata, refresh)
 
       true ->
         Logger.debug("Issue left active states, removing claim issue_id=#{issue_id} issue_identifier=#{issue.identifier}")
@@ -1279,7 +1453,7 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp handle_retry_issue_lookup(nil, state, issue_id, _attempt, _metadata) do
+  defp handle_retry_issue_lookup(nil, state, issue_id, _attempt, _metadata, _refresh) do
     Logger.debug("Issue no longer visible, removing claim issue_id=#{issue_id}")
     {:noreply, release_issue_claim(state, issue_id)}
   end
@@ -1306,13 +1480,13 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp cleanup_issue_workspace(_issue_or_identifier, _worker_host), do: :ok
 
-  defp run_terminal_workspace_cleanup do
-    case Tracker.fetch_issues_by_states(Config.settings!().tracker.terminal_states) do
+  defp run_terminal_workspace_cleanup(result, state) do
+    case result do
       {:ok, issues} ->
         issues
         |> Enum.each(fn
           %Issue{} = issue ->
-            cleanup_issue_workspace(issue)
+            unless startup_cleanup_protected?(issue, state), do: cleanup_issue_workspace(issue)
 
           _ ->
             :ok
@@ -1323,15 +1497,23 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  defp startup_cleanup_protected?(issue, state) do
+    MapSet.member?(state.claimed, issue.id) or MapSet.member?(state.completed, issue.id) or
+      Enum.any?([state.running, state.blocked, state.retry_attempts], fn entries ->
+        Map.has_key?(entries, issue.id) or
+          Enum.any?(entries, fn {_id, entry} -> entry.identifier == issue.identifier end)
+      end)
+  end
+
   defp notify_dashboard do
     StatusDashboard.notify_update()
   end
 
-  defp handle_active_retry(state, issue, attempt, metadata) do
+  defp handle_active_retry(state, issue, attempt, metadata, refresh) do
     if retry_candidate_issue?(issue, terminal_state_set()) and
          dispatch_slots_available?(issue, state) and
          worker_slots_available?(state, metadata[:worker_host]) do
-      case refresh_issue_for_dispatch(issue) do
+      case refresh.(issue) do
         {:ok, %Issue{} = refreshed_issue} ->
           {:noreply, do_dispatch_issue(state, refreshed_issue, attempt, metadata[:worker_host])}
 
@@ -1339,7 +1521,7 @@ defmodule SymphonyElixir.Orchestrator do
           {:noreply, release_issue_claim(state, issue.id)}
 
         {:skip, %Issue{} = refreshed_issue} ->
-          handle_retry_issue_lookup(refreshed_issue, state, issue.id, attempt, metadata)
+          handle_retry_issue_lookup(refreshed_issue, state, issue.id, attempt, metadata, refresh)
 
         {:error, reason} ->
           {:noreply,
