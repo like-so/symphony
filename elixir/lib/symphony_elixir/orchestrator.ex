@@ -2023,16 +2023,20 @@ defmodule SymphonyElixir.Orchestrator do
         correction.worker_pid == Map.get(running_entry, :codex_app_server_pid) and
         correction.worker_host == Map.get(running_entry, :worker_host)
 
-    update_matches? and correction_run_evidence?(status, update) and
+    update_matches? and correction_run_evidence?(status, update, correction) and
       (status == :failed or current_owner_matches?)
   end
 
-  defp correction_run_evidence?(status, update)
+  defp correction_run_evidence?(:blocked, _update, %{status: status}) when status in [:queued, :received],
+    do: true
+
+  defp correction_run_evidence?(status, update, _correction)
        when status in [:execution_started, :completed, :blocked],
        do: present_string?(Map.get(update, :run_id))
 
-  defp correction_run_evidence?(_status, _update), do: true
+  defp correction_run_evidence?(_status, _update, _correction), do: true
 
+  defp correction_status_for_event(:correction_received), do: :received
   defp correction_status_for_event(:correction_delivered), do: :delivered
   defp correction_status_for_event(:correction_execution_started), do: :execution_started
   defp correction_status_for_event(:correction_completed), do: :completed
@@ -2053,7 +2057,9 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp correction_transition_allowed?(:queued, status), do: status in [:delivered, :failed]
+  defp correction_transition_allowed?(:queued, status), do: status in [:received, :delivered, :blocked, :failed]
+
+  defp correction_transition_allowed?(:received, status), do: status in [:delivered, :blocked, :failed]
 
   defp correction_transition_allowed?(:delivered, status),
     do: status in [:execution_started, :failed]

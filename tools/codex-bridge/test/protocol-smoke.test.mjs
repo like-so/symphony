@@ -157,7 +157,7 @@ test("correction receipt, execution start, and completion remain distinct", asyn
     text: "Apply the authorized correction.",
   };
   const statuses = [
-    bridgeTestHooks.correctionStatus(correction, "delivered"),
+    bridgeTestHooks.correctionStatus(correction, "received"),
   ];
   const target = {
     client: {},
@@ -189,10 +189,10 @@ test("correction receipt, execution start, and completion remain distinct", asyn
 
   assert.deepEqual(
     statuses.map((status) => status.status),
-    ["delivered", "execution_started", "completed"],
+    ["received", "delivered", "execution_started", "completed"],
   );
-  assert.equal(statuses[2].result, "revision abc");
-  assert.equal(statuses[2].runId, "run-correction-2");
+  assert.equal(statuses[3].result, "revision abc");
+  assert.equal(statuses[3].runId, "run-correction-2");
 });
 
 test("correction completion rejects non-success terminal outcomes", () => {
@@ -903,6 +903,7 @@ test("input-required correction is blocked and later queued work is failed", asy
   assert.deepEqual(
     statuses.map(({ instructionId, status }) => [instructionId, status]),
     [
+      ["instruction-blocked", "delivered"],
       ["instruction-blocked", "execution_started"],
       ["instruction-blocked", "blocked"],
       ["instruction-queued", "failed"],
@@ -910,6 +911,7 @@ test("input-required correction is blocked and later queued work is failed", asy
   );
   assert.equal(target.accepting, false);
   assert.deepEqual(lifecycle, [
+    "delivered",
     "execution_started",
     "blocked",
     "failed",
@@ -958,9 +960,9 @@ test("approval-required correction terminal is blocked", async () => {
 
   assert.deepEqual(
     statuses.map(({ status }) => status),
-    ["execution_started", "blocked"],
+    ["delivered", "execution_started", "blocked"],
   );
-  assert.match(statuses[1].error, /requires operator approval/);
+  assert.match(statuses[2].error, /requires operator approval/);
   assert.equal(target.accepting, false);
 });
 

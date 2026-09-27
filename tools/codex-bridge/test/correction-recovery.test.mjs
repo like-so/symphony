@@ -60,7 +60,7 @@ test("successful owner phase is not an active stalled recovery target", async ()
 test("explicit idle recovery replaces stale queue, validates twice, and submits exactly one new input", async () => {
   const f = fixture();
   f.target.queue.push({ instructionId: "stale-queued", text: "Do not replay" });
-  assert.equal((await f.accept()).status, "delivered");
+  assert.equal((await f.accept()).status, "received");
   let submissions = 0;
   await bridge.drainCorrections(f.target, {}, async (_client, _runtime, text, _turn, _usage, hooks) => {
     submissions++;
@@ -73,7 +73,7 @@ test("explicit idle recovery replaces stale queue, validates twice, and submits 
   assert.equal(submissions, 1);
   assert.deepEqual(f.stages, ["acceptance", "submission"]);
   assert.deepEqual(f.statuses.map((s) => [s.id, s.status]), [
-    ["stale-queued", "failed"], ["new-recovery", "execution_started"], ["new-recovery", "completed"],
+    ["stale-queued", "failed"], ["new-recovery", "delivered"], ["new-recovery", "execution_started"], ["new-recovery", "completed"],
   ]);
   assert.equal(f.target.recoveryTakenOver, true);
   assert.equal(f.handlers.size, 0);
@@ -84,7 +84,7 @@ for (const status of ["PROCESSING_API_RESPONSE", "EXECUTING_CLIENT_SIDE_TOOL", "
     const f = fixture();
     f.loop.status = status;
     if (status === "EXECUTING_CLIENT_SIDE_TOOL") f.loop.executing_tool_call_ids = ["Bash-call"];
-    assert.equal((await f.accept()).status, "delivered");
+    assert.equal((await f.accept()).status, "received");
     await bridge.drainCorrections(f.target, {}, () => assert.fail("must not submit"));
     assert.equal(f.statuses.at(-1).status, "blocked");
     assert.match(f.statuses.at(-1).error, /safe idle/);
@@ -123,7 +123,7 @@ for (const stage of ["acceptance", "submission"]) {
         assert.equal(accepted.status, "blocked");
         assert.equal(f.target.queue.length, 0);
       } else {
-        assert.equal(accepted.status, "delivered");
+        assert.equal(accepted.status, "received");
         await bridge.drainCorrections(f.target, {}, () => assert.fail("must not submit"));
         assert.equal(f.statuses.at(-1).status, "blocked");
       }
@@ -139,7 +139,7 @@ test("duplicate IDs are reserved during asynchronous validation and recovery req
   assert.equal((await f.accept()).error, "duplicate instruction id");
   assert.equal((await f.accept({ ...f.correction, instructionId: "second" })).status, "blocked");
   release({ ...f.correction, runtime: f.runtime, current: true });
-  assert.equal((await first).status, "delivered");
+  assert.equal((await first).status, "received");
   assert.equal(f.target.queue.length, 1);
 });
 
@@ -306,7 +306,7 @@ test("native interleaved original and recovery run terminals retain separate out
   const usage = { input_tokens: 0, output_tokens: 0, total_tokens: 0 };
   const originalFailed = assert.rejects(bridge.submitWorkflowPhase(f.target, "Original", usage), /Original phase outcome unresolved/);
   await started;
-  assert.equal((await f.accept()).status, "delivered");
+  assert.equal((await f.accept()).status, "received");
   await bridge.drainCorrections(f.target, usage);
   await originalFailed;
   assert.equal(clientIds.length, 2);

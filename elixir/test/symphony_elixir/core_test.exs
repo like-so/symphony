@@ -1847,10 +1847,44 @@ defmodule SymphonyElixir.CoreTest do
       )
     end
 
+    assert {:noreply, received_state} =
+             Orchestrator.handle_info(
+               {:codex_worker_update, issue_id, update.(:correction_received, %{})},
+               queued_state
+             )
+
+    assert received_state.corrections[correction.instruction_id].status == :received
+
+    assert {:noreply, received_state} =
+             Orchestrator.handle_info(
+               {:codex_worker_update, issue_id, update.(:correction_completed, %{run_id: "early"})},
+               received_state
+             )
+
+    assert received_state.corrections[correction.instruction_id].status == :received
+
+    for pending_state <- [queued_state, received_state] do
+      assert {:noreply, blocked_state} =
+               Orchestrator.handle_info(
+                 {:codex_worker_update, issue_id, update.(:correction_blocked, %{error: "recovery gate refused"})},
+                 pending_state
+               )
+
+      assert blocked_state.corrections[correction.instruction_id].status == :blocked
+
+      assert {:noreply, unchanged_state} =
+               Orchestrator.handle_info(
+                 {:codex_worker_update, issue_id, update.(:correction_delivered, %{})},
+                 blocked_state
+               )
+
+      assert unchanged_state.corrections[correction.instruction_id].status == :blocked
+    end
+
     assert {:noreply, delivered_state} =
              Orchestrator.handle_info(
                {:codex_worker_update, issue_id, update.(:correction_delivered, %{})},
-               queued_state
+               received_state
              )
 
     assert delivered_state.corrections[correction.instruction_id].status == :delivered

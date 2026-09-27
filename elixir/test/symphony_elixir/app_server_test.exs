@@ -618,7 +618,8 @@ defmodule SymphonyElixir.AppServerTest do
               *'"method":"symphony/correction/deliver"'*'"sessionId":"thread-correction-turn-correction"'*) ;;
               *) exit 9 ;;
             esac
-            printf '%s%s%s\n' '{"id":"symphony-correction-instruction-1","result":{"correction":{"instructionId":"instruction-1","issueId":"issue-correction","issueIdentifier":"MT-CORRECTION","threadId":"thread-correction","expectedTurnId":"turn-correction","sessionId":"thread-correction-turn-correction","workspacePath":"#{canonical_workspace}","workerPid":"' "$$" '","workerHost":null,"status":"delivered"}}}'
+            printf '%s%s%s\n' '{"id":"symphony-correction-instruction-1","result":{"correction":{"instructionId":"instruction-1","issueId":"issue-correction","issueIdentifier":"MT-CORRECTION","threadId":"thread-correction","expectedTurnId":"turn-correction","sessionId":"thread-correction-turn-correction","workspacePath":"#{canonical_workspace}","workerPid":"' "$$" '","workerHost":null,"status":"received"}}}'
+            printf '%s%s%s\n' '{"method":"symphony/correction/status","params":{"instructionId":"instruction-1","issueId":"issue-correction","issueIdentifier":"MT-CORRECTION","threadId":"thread-correction","expectedTurnId":"turn-correction","sessionId":"thread-correction-turn-correction","workspacePath":"#{canonical_workspace}","workerPid":"' "$$" '","workerHost":null,"status":"delivered"}}'
             printf '%s%s%s\n' '{"method":"symphony/correction/status","params":{"instructionId":"instruction-1","issueId":"issue-correction","issueIdentifier":"MT-CORRECTION","threadId":"thread-correction","expectedTurnId":"turn-correction","sessionId":"thread-correction-turn-correction","workspacePath":"#{canonical_workspace}","workerPid":"' "$$" '","workerHost":null,"status":"execution_started"}}'
             printf '%s%s%s\n' '{"method":"symphony/correction/status","params":{"instructionId":"instruction-1","issueId":"issue-correction","issueIdentifier":"MT-CORRECTION","threadId":"thread-correction","expectedTurnId":"turn-correction","sessionId":"thread-correction-turn-correction","workspacePath":"#{canonical_workspace}","workerPid":"' "$$" '","workerHost":null,"status":"completed","result":"revision abc"}}'
             printf '%s\n' '{"method":"turn/completed"}'
@@ -675,6 +676,7 @@ defmodule SymphonyElixir.AppServerTest do
 
       send(task.pid, {:deliver_correction, correction})
 
+      assert_receive {:app_server_message, %{event: :correction_received}}
       assert_receive {:app_server_message, %{event: :correction_delivered}}
       assert_receive {:app_server_message, %{event: :correction_execution_started}}
       assert_receive {:app_server_message, %{event: :correction_completed, result: "revision abc"}}

@@ -893,6 +893,7 @@ defmodule SymphonyElixir.Codex.AppServer do
   defp emit_correction_status(on_message, params, binding, metadata) do
     event =
       case Map.get(params, "status") do
+        "received" -> :correction_received
         "delivered" -> :correction_delivered
         "execution_started" -> :correction_execution_started
         "completed" -> :correction_completed
