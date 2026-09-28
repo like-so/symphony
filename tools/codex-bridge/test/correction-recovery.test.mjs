@@ -195,16 +195,22 @@ for (const variant of ["missing-runtime", "wrong-runtime", "wrong-request", "fai
   });
 }
 
-test("one drain promise serializes concurrent callers", async () => {
+test("native recovery acceptance retains exclusive drain ownership until its terminal", async () => {
   const f = fixture();
   await f.accept();
   let release;
   let submissions = 0;
-  const submit = () => { submissions++; return new Promise((resolve) => { release = resolve; }); };
+  const submit = (_client, _runtime, _text, _turn, _usage, hooks) => {
+    submissions++;
+    hooks.onAccepted({ accepted: true, disposition: "started" });
+    return new Promise((resolve) => { release = resolve; });
+  };
   const first = bridge.drainCorrections(f.target, {}, submit);
   const second = bridge.drainCorrections(f.target, {}, submit);
   assert.equal(first, second);
   while (!release) await new Promise((resolve) => setImmediate(resolve));
+  assert.equal((await f.accept({ ...f.correction, instructionId: "ordinary", recovery: false })).status, "blocked");
+  assert.equal(f.target.drainPromise, first);
   release(success);
   await Promise.all([first, second]);
   assert.equal(submissions, 1);
