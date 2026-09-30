@@ -148,8 +148,8 @@ defmodule SymphonyElixir.Plane.AdapterTest do
   end
 
   test "tracker claim delegates to adapters with claim support" do
-    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "plane")
     Application.put_env(:symphony_elixir, :plane_client_module, FakePlaneClient)
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "plane")
 
     issue = %Issue{id: "plane-1", identifier: "NAUTILUS-1", state: "Todo"}
     assert {:ok, %{state: "In Progress"}} = Tracker.claim_issue(issue)
