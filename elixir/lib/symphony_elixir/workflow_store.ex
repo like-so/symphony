@@ -11,6 +11,7 @@ defmodule SymphonyElixir.WorkflowStore do
   alias SymphonyElixir.Workflow
 
   @poll_interval_ms 1_000
+  @snapshot_key {__MODULE__, :validated_snapshot}
 
   defmodule State do
     @moduledoc false
@@ -27,7 +28,7 @@ defmodule SymphonyElixir.WorkflowStore do
   def current do
     case Process.whereis(__MODULE__) do
       pid when is_pid(pid) ->
-        GenServer.call(__MODULE__, :current)
+        cached_reply(:workflow, :current)
 
       _ ->
         Workflow.load()
@@ -38,7 +39,7 @@ defmodule SymphonyElixir.WorkflowStore do
   def settings do
     case Process.whereis(__MODULE__) do
       pid when is_pid(pid) ->
-        GenServer.call(__MODULE__, :settings)
+        cached_reply(:settings, :settings)
 
       _ ->
         case load_state(Workflow.workflow_file_path()) do
@@ -66,6 +67,7 @@ defmodule SymphonyElixir.WorkflowStore do
   def init(_opts) do
     case load_state(Workflow.workflow_file_path()) do
       {:ok, state} ->
+        publish_snapshot(state)
         schedule_poll()
         {:ok, state}
 
@@ -122,10 +124,34 @@ defmodule SymphonyElixir.WorkflowStore do
   defp reload_state(%State{} = state) do
     path = Workflow.workflow_file_path()
 
-    if path != state.path do
-      reload_path(path, state)
-    else
-      reload_current_path(path, state)
+    result =
+      if path != state.path do
+        reload_path(path, state)
+      else
+        reload_current_path(path, state)
+      end
+
+    case result do
+      {:ok, new_state} -> publish_snapshot(new_state)
+      {:error, _reason, last_good_state} -> publish_snapshot(last_good_state)
+    end
+
+    result
+  end
+
+  defp cached_reply(field, request) do
+    case :persistent_term.get(@snapshot_key, nil) do
+      %{^field => value} -> {:ok, value}
+      # An already-running store needs one reload to publish after a hot upgrade.
+      nil -> GenServer.call(__MODULE__, request)
+    end
+  end
+
+  defp publish_snapshot(%State{workflow: workflow, settings: settings}) do
+    snapshot = %{workflow: workflow, settings: settings}
+
+    if :persistent_term.get(@snapshot_key, nil) != snapshot do
+      :persistent_term.put(@snapshot_key, snapshot)
     end
   end
 

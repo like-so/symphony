@@ -152,11 +152,63 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert {:ok, %{prompt: "Third prompt"}} = Workflow.current()
 
     assert :ok = Supervisor.terminate_child(SymphonyElixir.Supervisor, WorkflowStore)
-    assert {:ok, %{prompt: "Third prompt"}} = WorkflowStore.current()
+    write_workflow_file!(third_workflow, prompt: "Changed while stopped", poll_interval_ms: 60_000)
+    assert {:ok, %{prompt: "Changed while stopped"}} = WorkflowStore.current()
     assert {:ok, settings} = WorkflowStore.settings()
-    assert settings.polling.interval_ms == 30_000
+    assert settings.polling.interval_ms == 60_000
     assert :ok = WorkflowStore.force_reload()
     assert {:ok, _pid} = Supervisor.restart_child(SymphonyElixir.Supervisor, WorkflowStore)
+    assert {:ok, %{prompt: "Changed while stopped"}} = WorkflowStore.current()
+    assert Config.settings!().polling.interval_ms == 60_000
+  end
+
+  test "workflow polling publishes file edits without a getter-triggered reload" do
+    ensure_workflow_store_running()
+    path = Workflow.workflow_file_path()
+    replacement = Path.join(Path.dirname(path), "POLL_UPDATE.md")
+    write_workflow_file!(replacement, prompt: "Polled workflow", poll_interval_ms: 45_000)
+    File.write!(path, File.read!(replacement))
+
+    assert_eventually(
+      fn ->
+        match?({:ok, %{prompt: "Polled workflow"}}, Workflow.current()) and
+          Config.settings!().polling.interval_ms == 45_000
+      end,
+      100
+    )
+  end
+
+  test "force reload primes an unchanged workflow after a hot upgrade" do
+    ensure_workflow_store_running()
+    settings = Config.settings!()
+    workflow = Workflow.current()
+    key = {WorkflowStore, :validated_snapshot}
+    :persistent_term.erase(key)
+
+    assert :ok = WorkflowStore.force_reload()
+    assert %{settings: ^settings} = :persistent_term.get(key)
+    assert Workflow.current() == workflow
+  end
+
+  test "uncached getters prime the last validated snapshot during a hot upgrade" do
+    ensure_workflow_store_running()
+    path = Workflow.workflow_file_path()
+    original = File.read!(path)
+    getters = [{&WorkflowStore.current/0, Workflow.current()}, {&WorkflowStore.settings/0, Config.settings()}]
+
+    try do
+      for content <- [original, "---\ntracker: [\n---\nBroken prompt\n"] do
+        File.write!(path, content)
+
+        for {getter, expected} <- getters do
+          :persistent_term.erase({WorkflowStore, :validated_snapshot})
+          assert getter.() == expected
+        end
+      end
+    after
+      File.write!(path, original)
+      assert :ok = WorkflowStore.force_reload()
+    end
   end
 
   test "workflow store init stops on missing workflow file" do
@@ -517,13 +569,14 @@ defmodule SymphonyElixir.ExtensionsTest do
                       text: "Apply the authorized correction."
                     }}
 
-    recovery = Map.merge(body, %{
-      "instruction_id" => "new-recovery",
-      "recovery" => true,
-      "source_revision" => "source-v2",
-      "authorization_id" => "auth-v2",
-      "cwd_revision" => 4
-    })
+    recovery =
+      Map.merge(body, %{
+        "instruction_id" => "new-recovery",
+        "recovery" => true,
+        "source_revision" => "source-v2",
+        "authorization_id" => "auth-v2",
+        "cwd_revision" => 4
+      })
 
     assert %{"error" => %{"code" => "unauthorized"}} =
              build_conn()
@@ -535,13 +588,14 @@ defmodule SymphonyElixir.ExtensionsTest do
     |> post("/api/v1/issues/MT-1/corrections", recovery)
     |> json_response(202)
 
-    assert_receive {:queued_correction, %{
-      instruction_id: "new-recovery",
-      recovery: true,
-      source_revision: "source-v2",
-      authorization_id: "auth-v2",
-      cwd_revision: 4
-    }}
+    assert_receive {:queued_correction,
+                    %{
+                      instruction_id: "new-recovery",
+                      recovery: true,
+                      source_revision: "source-v2",
+                      authorization_id: "auth-v2",
+                      cwd_revision: 4
+                    }}
 
     for invalid_recovery <- [
           Map.delete(recovery, "source_revision"),

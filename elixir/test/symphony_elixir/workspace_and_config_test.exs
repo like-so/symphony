@@ -1478,6 +1478,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     """
 
     File.write!(Workflow.workflow_file_path(), workflow)
+    assert :ok = WorkflowStore.force_reload()
 
     assert Config.settings!().agent.max_concurrent_agents == 10
     assert Config.max_concurrent_agents_for_state("Todo") == 1

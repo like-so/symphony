@@ -202,6 +202,10 @@ codex:
 - If `WORKFLOW.md` is missing or has invalid YAML at startup, Symphony does not boot.
 - If a later reload fails, Symphony keeps running with the last known good workflow and logs the
   reload error until the file is fixed.
+- After the workflow store initializes, regular configuration and prompt reads use its last validated
+  memory snapshot without waiting for file I/O. The one-second polling loop publishes successful
+  reloads; slow or invalid reloads do not interrupt active workers. An explicit
+  `WorkflowStore.force_reload/0` call waits for validation and reports reload errors to its caller.
 - `server.port` or CLI `--port` enables the optional Phoenix LiveView dashboard and JSON API at
   `/`, `/api/v1/state`, `/api/v1/<issue_identifier>`, and `/api/v1/refresh`.
 - `server.correction_token` enables the authenticated correction API and must be configured through a
