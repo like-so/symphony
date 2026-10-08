@@ -112,21 +112,32 @@ test("native rejection never becomes delivered; duplicate and closed targets nev
   assert.equal(f.handlers.size, 0);
 });
 
-test("queued corrections retain FIFO and each submits once across phase completion", async () => {
+test("a second ordinary correction reaches native acceptance before the first terminal", async () => {
   const f = fixture();
   const { phase } = await start(f);
   await deliver(f);
-  await deliver(f, { ...f.correction, instructionId: "second", text: "Second instruction" });
   f.submissions[1].resolve({ accepted: true, disposition: "queued" });
-  assert.equal(f.submissions.length, 2);
-  f.finish(f.submissions[0], "owner-run");
+  f.emit({ type: "update_loop_status", loop_status: {
+    active_run_ids: ["first-run"], client_message_ids_by_run_id: {
+      "first-run": ["symphony-correction-correction"],
+    },
+  } });
   await tick();
-  assert.equal(f.submissions.length, 2);
+  await deliver(f, { ...f.correction, instructionId: "second", text: "Second instruction" });
+  assert.equal(f.submissions.length, 3, "submit guidance while the first correction is executing");
+  assert.deepEqual(f.submissions[2].input.runtime, f.runtime);
+  assert.equal(f.submissions[2].input.payload.messages[0].content[0].text, "Second instruction");
+  assert.equal(f.submissions[2].input.payload.messages[0].client_message_id, "symphony-correction-second");
+  f.submissions[2].resolve({ accepted: true, disposition: "queued", run_id: "first-run" });
+  await tick();
+  assert.deepEqual(f.statuses.filter((s) => s.id === "second").map((s) => s.status), ["delivered"]);
+  assert.equal(f.statuses.some((s) => s.status === "completed"), false);
+  let phaseEnded = false;
+  phase.then(() => { phaseEnded = true; });
+  f.finish(f.submissions[0], "owner-run");
   f.finish(f.submissions[1], "first-run");
   await tick();
-  assert.equal(f.submissions.length, 3);
-  assert.equal(f.submissions[2].input.payload.messages[0].content[0].text, "Second instruction");
-  f.submissions[2].resolve({ accepted: true, disposition: "started" });
+  assert.equal(phaseEnded, false, "phase must retain every outstanding outcome waiter");
   f.finish(f.submissions[2], "second-run");
   await phase;
   assert.deepEqual(f.statuses.filter((s) => s.status === "completed").map((s) => s.id), ["correction", "second"]);
@@ -153,13 +164,14 @@ test("owner and correction can share a native continuation without duplicate com
 });
 
 for (const stopReason of ["cancelled", "llm_api_error", "requires_approval"]) {
-  test(`owner ${stopReason} releases in-flight waiter and fails later queue without submitting it`, async () => {
+  test(`owner ${stopReason} releases all in-flight waiters and fails unsent queue`, async () => {
     const f = fixture();
     const { phase } = await start(f);
     await deliver(f);
     await deliver(f, { ...f.correction, instructionId: "later" });
     f.submissions[1].resolve({ accepted: true, disposition: "queued" });
     await tick();
+    await deliver(f, { ...f.correction, instructionId: "unsent" });
     const id = f.submissions[0].input.payload.messages[0].client_message_id;
     f.emit({ type: "update_loop_status", loop_status: {
       active_run_ids: ["owner-run"], client_message_ids_by_run_id: { "owner-run": [id] },
@@ -167,8 +179,8 @@ for (const stopReason of ["cancelled", "llm_api_error", "requires_approval"]) {
     f.emit({ type: "turn_finished", run_id: "owner-run", stop_reason: stopReason });
     await assert.rejects(phase);
     assert.equal(f.target.accepting, false);
-    assert.equal(f.submissions.length, 2);
-    assert.deepEqual(f.statuses.filter((s) => s.status === "failed").map((s) => s.id).sort(), ["correction", "later"]);
+    assert.equal(f.submissions.length, 3, "the third correction must remain unsent");
+    assert.deepEqual(f.statuses.filter((s) => s.status === "failed").map((s) => s.id).sort(), ["correction", "later", "unsent"]);
     assert.equal(f.handlers.size, 0);
   });
 }
@@ -404,4 +416,236 @@ test("a post-dequeue reused-run terminal survives a delayed exact correlation sn
   await phase;
   assert.deepEqual(f.statuses.map((s) => s.status), ["delivered", "execution_started", "completed"]);
   assert.equal(f.handlers.size, 0);
+});
+
+for (const disposition of [undefined, "unsupported"]) {
+  test(`ordinary acceptance with ${disposition} disposition retains the terminal submission gate`, async () => {
+    const f = fixture();
+    const { phase } = await start(f);
+    await deliver(f);
+    await deliver(f, { ...f.correction, instructionId: "second" });
+    f.submissions[1].resolve({ accepted: true, disposition });
+    await tick();
+    assert.equal(f.submissions.length, 2);
+    f.finish(f.submissions[1], "first-run");
+    await tick();
+    assert.equal(f.submissions.length, 3);
+    f.submissions[2].resolve({ accepted: true, disposition });
+    f.finish(f.submissions[2], "second-run");
+    f.finish(f.submissions[0], "owner-run");
+    await phase;
+    assert.equal(f.handlers.size, 0);
+  });
+}
+
+test("the submission pump retains FIFO across native rejection and several outstanding outcomes", async () => {
+  const f = fixture();
+  const { phase } = await start(f);
+  await deliver(f);
+  await deliver(f, { ...f.correction, instructionId: "second" });
+  await deliver(f, { ...f.correction, instructionId: "third" });
+  assert.equal(f.submissions.length, 2, "await first native acceptance before sending second");
+  f.submissions[1].resolve({ accepted: true, disposition: "queued" });
+  await tick();
+  assert.equal(f.submissions.length, 3, "await second native acceptance before sending third");
+  f.submissions[2].resolve({ accepted: false, error: "queue rejected input" });
+  await tick();
+  assert.equal(f.submissions.length, 4);
+  assert.deepEqual(f.submissions.slice(1).map((s) => s.input.payload.messages[0].client_message_id),
+    ["symphony-correction-correction", "symphony-correction-second", "symphony-correction-third"]);
+  assert.deepEqual(f.statuses.filter((s) => s.id === "second").map((s) => s.status), ["failed"]);
+  f.submissions[3].resolve({ accepted: true, disposition: "queued" });
+  f.finish(f.submissions[1], "first-run");
+  f.finish(f.submissions[3], "third-run");
+  f.finish(f.submissions[0], "owner-run");
+  await phase;
+  assert.equal(f.handlers.size, 0);
+});
+
+test("an uncertain later submission stops every outstanding waiter and never submits the remaining queue", async () => {
+  const f = fixture();
+  const { phase } = await start(f);
+  await deliver(f);
+  f.submissions[1].resolve({ accepted: true, disposition: "queued" });
+  await deliver(f, { ...f.correction, instructionId: "second" });
+  await deliver(f, { ...f.correction, instructionId: "third" });
+  f.submissions[2].reject(new Error("native acceptance response lost"));
+  await assert.rejects(phase);
+  assert.equal(f.submissions.length, 3);
+  assert.equal(f.handlers.size, 0);
+  assert.equal(f.target.correctionOutcomeUnresolved, true);
+  assert.deepEqual(f.statuses.filter((s) => s.status === "failed").map((s) => s.id).sort(),
+    ["correction", "second", "third"]);
+  const before = [...f.statuses];
+  f.finish(f.submissions[1], "late-first");
+  f.finish(f.submissions[2], "late-second");
+  assert.deepEqual(f.statuses, before);
+});
+
+for (const stopReason of ["end_turn", "requires_approval"]) {
+  test(`two corrections sharing a native continuation retain separate ${stopReason} outcomes`, async () => {
+    const f = fixture();
+    const { phase } = await start(f);
+    f.target.emitInputRequired = () => {};
+    await deliver(f);
+    f.submissions[1].resolve({ accepted: true, disposition: "queued" });
+    await deliver(f, { ...f.correction, instructionId: "second" });
+    f.submissions[2].resolve({ accepted: true, disposition: "queued" });
+    await tick();
+    const ids = f.submissions.map((s) => s.input.payload.messages[0].client_message_id);
+    f.emit({ type: "update_loop_status", loop_status: {
+      active_run_ids: ["shared-run"], client_message_ids_by_run_id: { "shared-run": ids },
+    } });
+    f.emit({ type: "turn_finished", run_id: "shared-run", turn_id: "continuation", stop_reason: stopReason });
+    await phase;
+    const expected = stopReason === "end_turn" ? "completed" : "blocked";
+    assert.deepEqual(f.statuses.filter((s) => s.status === expected).map((s) => s.id).sort(), ["correction", "second"]);
+    assert.equal(f.statuses.some((s) => s.status === "failed"), false);
+    assert.equal(f.handlers.size, 0);
+  });
+}
+
+test("a blocked terminal before acceptance prevents submission of the next ordinary input", async () => {
+  const f = fixture();
+  const { phase } = await start(f);
+  f.target.emitInputRequired = () => {};
+  await deliver(f);
+  await deliver(f, { ...f.correction, instructionId: "second" });
+  f.emit({ type: "update_loop_status", loop_status: {
+    active_run_ids: ["first-run"], client_message_ids_by_run_id: { "first-run": ["symphony-correction-correction"] },
+  } });
+  f.emit({ type: "turn_finished", run_id: "first-run", stop_reason: "requires_approval" });
+  f.submissions[1].resolve({ accepted: true, disposition: "queued" });
+  await f.target.drainPromise;
+  assert.equal(f.submissions.length, 2);
+  assert.deepEqual(f.statuses.filter((s) => s.id === "second").map((s) => s.status), ["failed"]);
+  f.finish(f.submissions[0], "owner-run");
+  await phase;
+});
+
+test("recovery remains blocked while any ordinary correction outcome is outstanding", async () => {
+  const f = fixture();
+  const { phase } = await start(f);
+  await deliver(f);
+  f.submissions[1].resolve({ accepted: true, disposition: "queued" });
+  await deliver(f, { ...f.correction, instructionId: "second" });
+  f.submissions[2].resolve({ accepted: true, disposition: "queued" });
+  f.finish(f.submissions[1], "first-run");
+  await tick();
+  const result = await deliver(f, { ...f.correction, instructionId: "recovery", recovery: true });
+  assert.equal(result.status, "blocked");
+  assert.equal(f.submissions.length, 3);
+  f.finish(f.submissions[2], "second-run");
+  f.finish(f.submissions[0], "owner-run");
+  await phase;
+});
+
+test("new receipts racing drain completion never strand ordinary guidance", async () => {
+  for (let depth = 0; depth < 8; depth++) {
+    const f = fixture();
+    const { phase } = await start(f);
+    await deliver(f);
+    f.submissions[1].resolve({ accepted: true, disposition: "queued" });
+    await tick();
+    const emitStatus = f.target.emitStatus;
+    let nextReceipt;
+    f.target.emitStatus = (item, status, extra) => {
+      emitStatus(item, status, extra);
+      if (item.instructionId !== "correction" || status !== "completed") return;
+      nextReceipt = (async () => {
+        for (let index = 0; index < depth; index++) await Promise.resolve();
+        return deliver(f, { ...f.correction, instructionId: "second" });
+      })();
+    };
+    f.finish(f.submissions[1], "first-run");
+    await tick();
+    assert.equal((await nextReceipt).status, "received");
+    assert.equal(f.submissions.length, 3, `receipt at completion microtask depth ${depth}`);
+    f.submissions[2].resolve({ accepted: true, disposition: "queued" });
+    f.finish(f.submissions[2], "second-run");
+    f.finish(f.submissions[0], "owner-run");
+    await phase;
+    assert.equal(f.handlers.size, 0);
+  }
+});
+
+for (const middleRejected of [false, true]) {
+  test(`queued corrections track active predecessor progress${middleRejected ? " across a rejected middle input" : " through several queued inputs"}`, async () => {
+    const f = fixture();
+    const seen = new Set();
+    const submit = (client, runtime, text, turnId, totals, hooks) =>
+      bridge.submitAndWaitForTurn(client, runtime, text, turnId, totals, {
+        ...hooks, turnTimeoutMs: hooks.clientMessageId === "symphony-correction-correction" ? 500 : 60,
+      });
+    const enqueue = async (instructionId) => {
+      const item = { ...f.correction, instructionId };
+      assert.equal((await bridge.acceptCorrectionForTarget(f.target, item, seen)).status, "received");
+      const drain = bridge.drainCorrections(f.target, usage(), submit);
+      await tick();
+      return { drain };
+    };
+    const { drain } = await enqueue("correction");
+    f.submissions[0].resolve({ accepted: true, disposition: "started" });
+    f.emit({ type: "update_loop_status", loop_status: {
+      active_run_ids: ["first-run"], client_message_ids_by_run_id: { "first-run": ["symphony-correction-correction"] },
+    } });
+    await enqueue("second");
+    f.submissions[1].resolve(middleRejected
+      ? { accepted: false, error: "queue rejected input" }
+      : { accepted: true, disposition: "queued" });
+    await tick();
+    await enqueue("third");
+    f.submissions[2].resolve({ accepted: true, disposition: "queued" });
+    const activity = setInterval(() => f.emit({ type: "stream_delta", delta: {
+      run_id: "first-run", type: "reasoning_delta", reasoning: "Still executing the first correction",
+    } }), 10);
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 160));
+      assert.equal(f.target.correctionOutcomeUnresolved, undefined,
+        "the exact active predecessor must keep all later queue waiters alive");
+      assert.deepEqual(f.statuses.filter((s) => s.status === "failed").map((s) => s.id), middleRejected ? ["second"] : []);
+      f.finish(f.submissions[0], "first-run");
+      if (!middleRejected) f.finish(f.submissions[1], "second-run");
+      f.finish(f.submissions[2], "third-run");
+      assert.deepEqual(await drain, { outcomeUnresolved: false });
+      assert.equal(f.handlers.size, 0);
+    } finally {
+      clearInterval(activity);
+      f.target.stopCorrectionWait?.(new Error("test cleanup"));
+      await drain;
+    }
+  });
+}
+
+test("predecessor queue-wait tracking never refreshes from an unrelated run", async () => {
+  const f = fixture();
+  const waiting = bridge.submitAndWaitForTurn(f.client, f.runtime, "Correction", "turn", usage(), {
+    clientMessageId: "symphony-correction-correction", turnTimeoutMs: 50,
+    waitingOnPredecessors: [{ clientMessageId: "earlier-message", runId: "earlier-run" }],
+  });
+  waiting.catch(() => {});
+  f.submissions[0].resolve({ accepted: true, disposition: "queued" });
+  const activity = setInterval(() => f.emit({ type: "stream_delta", delta: {
+    run_id: "unrelated-run", type: "reasoning_delta", reasoning: "Unrelated activity",
+  } }), 10);
+  try {
+    await assert.rejects(waiting, (error) => error.correctionOutcomeUnresolved === true);
+    assert.equal(f.handlers.size, 0);
+  } finally {
+    clearInterval(activity);
+  }
+});
+
+test("a queued predecessor without a known run cannot turn runless events into progress", () => {
+  const context = { clientMessageId: "predecessor", correctionRunId: null, runIdsByToolCallId: new Map() };
+  for (const message of [
+    { type: "stream_delta", delta: { message_type: "user_message", content: "Uncorrelated echo" } },
+    { type: "turn_finished", stop_reason: "end_turn" },
+    { type: "external_tool_call_request", tool_call_id: "unknown" },
+  ]) {
+    assert.equal(bridge.isTurnActivityMessage(message, context), false);
+  }
+  assert.equal(bridge.isTurnActivityMessage({ type: "update_queue", removed: [
+    { client_message_id: "predecessor", disposition: "dequeued" },
+  ] }, context), true);
 });

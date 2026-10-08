@@ -41,6 +41,39 @@ defmodule SymphonyElixir.OrchestratorPollTest do
     %{pid: pid}
   end
 
+  test "blocked workflow reload leaves config reads and active workers responsive", %{pid: pid} do
+    worker = put_worker(pid)
+    store = Process.whereis(WorkflowStore)
+    settings = Config.settings!()
+    workflow = Workflow.current()
+    :ok = :sys.suspend(store)
+
+    try do
+      reader = Task.async(fn -> {Config.settings!(), Workflow.current()} end)
+      assert {^settings, ^workflow} = Task.await(reader, 200)
+      assert %{running: [%{issue_id: "issue-1"}]} = Orchestrator.snapshot(__MODULE__.Server, 200)
+      assert Process.whereis(__MODULE__.Server) == pid
+      state = :sys.get_state(pid, 200)
+      assert state.running["issue-1"].pid == worker
+      assert MapSet.member?(state.claimed, "issue-1")
+      send(worker, :still_running)
+      assert_receive {:worker_message, ^worker, :still_running}, 200
+    after
+      :sys.resume(store)
+    end
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      prompt: "Reloaded after a slow workflow read",
+      poll_interval_ms: 45_000
+    )
+
+    assert {:ok, %{prompt: "Reloaded after a slow workflow read"}} = Workflow.current()
+    assert Config.settings!().polling.interval_ms == 45_000
+    assert %{polling: %{poll_interval_ms: 45_000}} = Orchestrator.snapshot(__MODULE__.Server, 200)
+    assert :sys.get_state(pid).running["issue-1"].pid == worker
+  end
+
   test "blocked tracker HTTP leaves snapshots responsive", %{pid: pid} do
     send(pid, :run_poll_cycle)
     assert_receive {:tracker_request, request}, 1_000
