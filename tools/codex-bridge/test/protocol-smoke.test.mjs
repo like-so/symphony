@@ -4,6 +4,41 @@ import { test } from "node:test";
 
 import { bridgeTestHooks } from "../bin/codex-bridge.mjs";
 
+test("forwards bounded reasoning activity without private text", (t) => {
+  let now = 0;
+  t.mock.method(performance, "now", () => now);
+  const writes = [];
+  const originalWrite = process.stdout.write;
+  process.stdout.write = (chunk) => { writes.push(String(chunk)); return true; };
+  try {
+    bridgeTestHooks.forwardStreamDelta("reasoning-test", {
+      message_type: "reasoning_message", reasoning: "   ",
+    }, {});
+    assert.equal(writes.length, 0);
+    for (let i = 0; i < 2; i++) {
+      bridgeTestHooks.forwardStreamDelta("reasoning-test", {
+        message_type: "reasoning_message", reasoning: "private test content",
+      }, {});
+    }
+    assert.equal(writes.length, 1);
+    const event = JSON.parse(writes[0]);
+    assert.equal(event.method, "item/reasoning/activity");
+    assert.deepEqual(event.params, { turnId: "reasoning-test" });
+    assert.ok(!writes[0].includes("private test content"));
+    bridgeTestHooks.forwardStreamDelta("another-turn", {
+      message_type: "reasoning_message", reasoning: "private test content",
+    }, {});
+    assert.equal(writes.length, 2);
+    now = 10_000;
+    bridgeTestHooks.forwardStreamDelta("reasoning-test", {
+      message_type: "reasoning_message", reasoning: "private test content",
+    }, {});
+    assert.equal(writes.length, 3);
+  } finally {
+    process.stdout.write = originalWrite;
+  }
+});
+
 test("responds to Symphony initialize and thread start messages", async () => {
   const child = spawn(process.execPath, ["bin/codex-bridge.mjs"], {
     cwd: new URL("..", import.meta.url),
