@@ -181,6 +181,7 @@ const acceptedCorrectionIds = new Set();
 const pendingSymphonyResponses = new Map();
 const toolNamesById = new Map();
 const lastProgressByTurn = new Map();
+const lastReasoningActivityByTurn = new Map();
 const blockedTurns = new Set();
 const isMain =
   process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
@@ -189,6 +190,7 @@ const appServers = new AppServerProcessManager({
 });
 
 export const bridgeTestHooks = {
+  forwardStreamDelta,
   isInputRequiredTool,
   semanticStatusFromText,
   summarizeClientToolEnd,
@@ -1756,6 +1758,21 @@ function runCommand(command, args, cwd) {
 
 function forwardStreamDelta(turnId, delta, usage, deferInputRequired = false) {
   const messageType = delta?.message_type;
+  const now = performance.now();
+
+  // Forward actual generation activity without exposing private reasoning.
+  if (
+    messageType === "reasoning_message" &&
+    typeof delta.reasoning === "string" &&
+    delta.reasoning.trim().length > 0 &&
+    now - (lastReasoningActivityByTurn.get(turnId) ?? -Infinity) >= 10_000
+  ) {
+    lastReasoningActivityByTurn.set(turnId, now);
+    emit({
+      method: "item/reasoning/activity",
+      params: { turnId },
+    });
+  }
 
   if (delta?.type === "message") {
     const text = extractText(delta);
