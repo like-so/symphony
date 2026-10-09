@@ -4,6 +4,28 @@ import { test } from "node:test";
 
 import { bridgeTestHooks } from "../bin/codex-bridge.mjs";
 
+test("forwards bounded native tool-generation activity without arguments", (t) => {
+  let now = 0;
+  t.mock.method(performance, "now", () => now);
+  const writes = [];
+  const originalWrite = process.stdout.write;
+  process.stdout.write = (chunk) => { writes.push(JSON.parse(String(chunk))); return true; };
+  try {
+    const delta = { message_type: "event_message", event_type: "tool_call_activity", event_data: { phase: "progress", arguments: "private" } };
+    bridgeTestHooks.forwardStreamDelta("tool-generation-test", delta, {});
+    bridgeTestHooks.forwardStreamDelta("tool-generation-test", delta, {});
+    assert.equal(writes.length, 1);
+    now = 10_000;
+    bridgeTestHooks.forwardStreamDelta("tool-generation-test", delta, {});
+    assert.deepEqual(writes, [
+      { method: "item/toolCall/activity", params: { turnId: "tool-generation-test" } },
+      { method: "item/toolCall/activity", params: { turnId: "tool-generation-test" } },
+    ]);
+  } finally {
+    process.stdout.write = originalWrite;
+  }
+});
+
 test("forwards real compaction boundaries and throttled progress without content", (t) => {
   let now = 0;
   t.mock.method(performance, "now", () => now);
