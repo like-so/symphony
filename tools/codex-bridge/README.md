@@ -37,7 +37,7 @@ through `letta agents list --name` before running the turn.
   isolated Letta runtime conversation: planning, execution, then review.
 - `--workflow single` starts one execution phase.
 
-Real reasoning deltas and compaction lifecycle events produce content-free activity notifications.
+Real reasoning/tool-argument deltas and compaction lifecycle events produce content-free activity notifications.
 Progress notifications are throttled; no periodic heartbeat is generated in the absence of actual activity.
 
 If an owner response ends with `max_tokens_exceeded`, the bridge continues the phase in the

@@ -183,6 +183,7 @@ const toolNamesById = new Map();
 const lastProgressByTurn = new Map();
 const lastReasoningActivityByTurn = new Map();
 const lastCompactionActivityByTurn = new Map();
+const lastToolActivityByTurn = new Map();
 const blockedTurns = new Set();
 const isMain =
   process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
@@ -1872,6 +1873,15 @@ function runCommand(command, args, cwd) {
 function forwardStreamDelta(turnId, delta, usage, deferInputRequired = false) {
   const messageType = delta?.message_type;
   const now = performance.now();
+
+  if (
+    messageType === "event_message" && delta.event_type === "tool_call_activity" &&
+    delta.event_data?.phase === "progress" &&
+    now - (lastToolActivityByTurn.get(turnId) ?? -Infinity) >= 10_000
+  ) {
+    lastToolActivityByTurn.set(turnId, now);
+    emit({ method: "item/toolCall/activity", params: { turnId } });
+  }
 
   if (messageType === "event_message" && delta.event_type === "compaction_activity") {
     const phase = delta.event_data?.phase;
