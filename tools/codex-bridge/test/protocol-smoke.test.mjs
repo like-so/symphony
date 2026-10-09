@@ -248,6 +248,79 @@ test("correction completion rejects non-success terminal outcomes", () => {
   );
 });
 
+test("a correction blocking after output exhaustion preserves blocked completion", async () => {
+  const target = {
+    client: {}, runtime: {}, turnId: "output-limit-late-block", accepting: true, queue: [],
+    emitStatus: () => {},
+  };
+  let submissions = 0;
+  const terminal = await bridgeTestHooks.submitWorkflowPhase(target, "original task", {}, async () => {
+    submissions += 1;
+    target.queue.push({ instructionId: "late-block", text: "correction" });
+    bridgeTestHooks.drainCorrections(target, {}, async () => {
+      await new Promise((resolve) => setImmediate(resolve));
+      return { stopReason: "requires_approval", runId: "blocked-correction" };
+    });
+    return { stopReason: "max_tokens_exceeded" };
+  });
+  assert.equal(terminal.stopReason, "max_tokens_exceeded");
+  assert.equal(submissions, 1);
+  assert.equal(target.accepting, false);
+});
+
+test("owner output limit continues on the same runtime with a fresh input identity", async () => {
+  const target = {
+    client: {}, runtime: {}, turnId: "output-limit-resume", accepting: true, queue: [],
+    emitStatus: () => assert.fail("output exhaustion must not fail queued work"),
+  };
+  const inputs = [];
+  let completedSteps = 0;
+  const terminal = await bridgeTestHooks.submitWorkflowPhase(target, "original task", {},
+    async (client, runtime, prompt, turnId, usage, hooks) => {
+      assert.equal(client, target.client);
+      assert.equal(runtime, target.runtime);
+      assert.equal(turnId, target.turnId);
+      inputs.push(hooks.clientMessageId);
+      if (inputs.length === 1) {
+        const limit = { stopReason: "max_tokens_exceeded", error: "Unexpected stop reason: max_tokens_exceeded" };
+        hooks.onTerminal(limit);
+        assert.equal(target.accepting, true);
+        return limit;
+      }
+      assert.match(prompt, /do not repeat completed operations/);
+      completedSteps += 1;
+      return { stopReason: "end_turn", text: "next step completed" };
+    });
+  assert.equal(terminal.stopReason, "end_turn");
+  assert.equal(completedSteps, 1);
+  assert.equal(inputs.length, 2);
+  assert.notEqual(inputs[0], inputs[1]);
+  assert.equal(target.accepting, true);
+});
+
+test("repeated owner output limits stop after bounded same-conversation recovery", async () => {
+  const target = { client: {}, runtime: {}, turnId: "output-limit-exhausted", accepting: true, queue: [] };
+  let submissions = 0;
+  const terminal = await bridgeTestHooks.submitWorkflowPhase(target, "original task", {}, async () => {
+    submissions += 1;
+    return { stopReason: "max_tokens_exceeded" };
+  });
+  assert.equal(submissions, 3);
+  assert.equal(terminal.stopReason, "max_tokens_exceeded");
+  assert.equal(target.accepting, false);
+});
+
+test("output-limit continuation respects unresolved correction outcomes", async () => {
+  const target = { client: {}, runtime: {}, turnId: "output-limit-unresolved", accepting: true, queue: [] };
+  let submissions = 0;
+  await assert.rejects(bridgeTestHooks.submitWorkflowPhase(target, "original task", {}, async () => {
+    submissions += 1;
+    target.correctionOutcomeUnresolved = true;
+    return { stopReason: "max_tokens_exceeded" };
+  }), /Correction terminal outcome is unresolved/);
+  assert.equal(submissions, 1);
+});
+
 for (const outcome of ["llm_api_error", "cancelled", "timeout"]) {
   test(`a ${outcome} phase fails queued corrections without submitting them`, async () => {
     const statuses = [];
