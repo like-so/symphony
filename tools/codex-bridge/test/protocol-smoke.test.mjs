@@ -4,6 +4,34 @@ import { test } from "node:test";
 
 import { bridgeTestHooks } from "../bin/codex-bridge.mjs";
 
+test("forwards real compaction boundaries and throttled progress without content", (t) => {
+  let now = 0;
+  t.mock.method(performance, "now", () => now);
+  const writes = [];
+  const originalWrite = process.stdout.write;
+  process.stdout.write = (chunk) => { writes.push(JSON.parse(String(chunk))); return true; };
+  const send = (phase) => bridgeTestHooks.forwardStreamDelta("compaction-test", {
+    message_type: "event_message", event_type: "compaction_activity",
+    event_data: { phase, trigger: "private context must not be forwarded" },
+  }, {});
+  try {
+    send("unknown");
+    assert.equal(writes.length, 0);
+    send("start");
+    send("progress");
+    assert.equal(writes.length, 1);
+    now = 10_000;
+    send("progress");
+    send("end");
+    send("failure");
+    assert.deepEqual(writes.map((event) => event.params.phase), ["start", "progress", "end", "failure"]);
+    assert.ok(writes.every((event) => event.method === "item/compaction/activity"));
+    assert.ok(writes.every((event) => Object.keys(event.params).sort().join() === "phase,turnId"));
+  } finally {
+    process.stdout.write = originalWrite;
+  }
+});
+
 test("forwards bounded reasoning activity without private text", (t) => {
   let now = 0;
   t.mock.method(performance, "now", () => now);
