@@ -182,6 +182,7 @@ const pendingSymphonyResponses = new Map();
 const toolNamesById = new Map();
 const lastProgressByTurn = new Map();
 const lastReasoningActivityByTurn = new Map();
+const lastCompactionActivityByTurn = new Map();
 const blockedTurns = new Set();
 const isMain =
   process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
@@ -1871,6 +1872,20 @@ function runCommand(command, args, cwd) {
 function forwardStreamDelta(turnId, delta, usage, deferInputRequired = false) {
   const messageType = delta?.message_type;
   const now = performance.now();
+
+  if (messageType === "event_message" && delta.event_type === "compaction_activity") {
+    const phase = delta.event_data?.phase;
+    const boundary = ["start", "end", "failure"].includes(phase);
+    const progressDue = phase === "progress" &&
+      now - (lastCompactionActivityByTurn.get(turnId) ?? -Infinity) >= 10_000;
+    if (boundary || progressDue) {
+      lastCompactionActivityByTurn.set(turnId, now);
+      emit({
+        method: "item/compaction/activity",
+        params: { turnId, phase },
+      });
+    }
+  }
 
   // Forward actual generation activity without exposing private reasoning.
   if (
