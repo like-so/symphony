@@ -400,8 +400,10 @@ async function submitWorkflowPhase(
   prompt,
   usage,
   submitTurn = submitAndWaitForTurn,
+  outputLimitContinuations = 0,
 ) {
   target.phaseActive = true;
+  target.phaseReady = false;
   target.phaseClientMessageId = `symphony-phase-${randomUUID()}`;
   target.phaseRunId = null;
   target.usage = usage;
@@ -423,6 +425,7 @@ async function submitWorkflowPhase(
         },
         onExecutionStarted: markPhaseReady,
         onTerminal: (terminal) => {
+          if (terminal.stopReason === "max_tokens_exceeded") return;
           if (!correctionCompletionError(terminal)) return;
           closeCorrectionTarget(target, "owner turn ended before correction execution");
           if (!target.recoveryTakenOver) {
@@ -440,6 +443,35 @@ async function submitWorkflowPhase(
     }
     if (target.correctionOutcomeUnresolved) {
       throw new Error("Correction terminal outcome is unresolved; stopping the owner workflow");
+    }
+    if (terminal.stopReason === "max_tokens_exceeded" && target.accepting && !blockedTurns.has(target.turnId)) {
+      // An output limit ends one response, not the task or its conversation.
+      // Bound consecutive saturation rather than redispatching fresh workers.
+      while (target.drainPromise) await target.drainPromise;
+      if (target.recoveryTakenOver || target.correctionOutcomeUnresolved) {
+        throw new Error("Owner continuation stopped after correction state changed");
+      }
+      if (blockedTurns.has(target.turnId)) return terminal;
+      if (!target.accepting) {
+        throw new Error("Owner continuation stopped after correction target closed");
+      }
+      if (outputLimitContinuations >= 2) {
+        closeCorrectionTarget(target, "owner output-limit recovery exhausted");
+        emitInputRequired(target.turnId, {
+          reason: "Model output limit exhausted after two same-conversation continuations; runtime intervention required",
+          missing: ["a complete model response"],
+          remainingScope: "model output-limit recovery",
+        });
+        return terminal;
+      }
+      emitProgress(target.turnId, "Model output limit reached; continuing the existing conversation");
+      return await submitWorkflowPhase(
+        target,
+        "The previous response reached its output limit. Continue the same task from the existing conversation and workspace. Preserve completed tool results and edits; do not repeat completed operations. Take the next concrete implementation or validation step, keeping the response concise.",
+        usage,
+        submitTurn,
+        outputLimitContinuations + 1,
+      );
     }
     // Preserve the workflow's existing approval/input-required completion path.
     if (terminal.stopReason !== "requires_approval" && !blockedTurns.has(target.turnId)) {

@@ -35,7 +35,14 @@ through `letta agents list --name` before running the turn.
   `--name <name>`.
 - `--workflow plan-execute-review` sends three sequential inputs to the same
   isolated Letta runtime conversation: planning, execution, then review.
-- `--workflow single` sends only one execution input.
+- `--workflow single` starts one execution phase.
+
+If an owner response ends with `max_tokens_exceeded`, the bridge continues the phase in the
+same runtime conversation, preserving prior messages and tool results. At most two consecutive
+output-limit continuations are allowed. Repeated exhaustion is reported as blocked for runtime
+intervention, not successful completion or another fresh-worker retry. Cancellation, provider
+errors, unresolved corrections and explicit recovery boundaries retain their existing handling;
+this continuation policy does not resubmit failed manager corrections.
 
 While a turn is active, Symphony may send `symphony/correction/deliver` with the exact issue,
 session, workspace, worker-PID, and worker-host binding supplied on `turn/start`. The bridge rejects
