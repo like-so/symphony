@@ -36,7 +36,7 @@ jobs:
 
       - name: Fetch origin and upstream main
         env:
-          SYNC_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN || github.token }}
+          SYNC_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN }}
         run: |
           set -euo pipefail
           git remote add upstream https://github.com/openai/symphony.git
@@ -76,7 +76,7 @@ jobs:
       - name: Push synced main
         if: steps.merge.outputs.has_changes == 'true' && inputs.dry_run != true
         env:
-          SYNC_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN || github.token }}
+          SYNC_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN }}
         run: |
           set -euo pipefail
           git push "https://x-access-token:${SYNC_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" HEAD:main
