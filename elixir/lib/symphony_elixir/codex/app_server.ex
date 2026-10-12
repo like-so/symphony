@@ -335,8 +335,7 @@ defmodule SymphonyElixir.Codex.AppServer do
 
     with {:ok, response} <- await_response(port, @initialize_id) do
       send_message(port, %{"method" => "initialized", "params" => %{}})
-      {:ok, get_in(response, ["capabilities", "symphonyCorrectionDelivery"]) == true,
-       get_in(response, ["capabilities", "symphonyCorrectionRecovery"]) == true}
+      {:ok, get_in(response, ["capabilities", "symphonyCorrectionDelivery"]) == true, get_in(response, ["capabilities", "symphonyCorrectionRecovery"]) == true}
     end
   end
 

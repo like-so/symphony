@@ -671,8 +671,7 @@ defmodule SymphonyElixir.AppServerTest do
 
       send(task.pid, {:deliver_correction, Map.put(correction, :recovery, true)})
 
-      assert_receive {:app_server_message,
-                      %{event: :correction_failed, error: "active transport does not advertise explicit recovery"}}
+      assert_receive {:app_server_message, %{event: :correction_failed, error: "active transport does not advertise explicit recovery"}}
 
       send(task.pid, {:deliver_correction, correction})
 
@@ -727,33 +726,40 @@ defmodule SymphonyElixir.AppServerTest do
       issue = %Issue{id: "issue-recovery", identifier: "LIKE-179", title: "Explicit recovery", state: "In Progress"}
       parent = self()
 
-      task = Task.async(fn ->
-        AppServer.run(workspace, "wait for recovery", issue, on_message: fn message -> send(parent, {:recovery_message, message}) end)
-      end)
+      task =
+        Task.async(fn ->
+          AppServer.run(workspace, "wait for recovery", issue, on_message: fn message -> send(parent, {:recovery_message, message}) end)
+        end)
 
       assert_receive {:recovery_message, %{event: :session_started, codex_app_server_pid: worker_pid}}, 1_000
 
-      send(task.pid, {:deliver_correction, %{
-        instruction_id: "new-recovery",
-        issue_id: issue.id,
-        issue_identifier: issue.identifier,
-        session_id: "thread-recovery-turn-recovery",
-        workspace_path: canonical_workspace,
-        worker_pid: worker_pid,
-        worker_host: nil,
-        text: "Explicit new correction",
-        recovery: true,
-        source_revision: "source-v2",
-        authorization_id: "auth-v2",
-        cwd_revision: 4
-      }})
+      send(
+        task.pid,
+        {:deliver_correction,
+         %{
+           instruction_id: "new-recovery",
+           issue_id: issue.id,
+           issue_identifier: issue.identifier,
+           session_id: "thread-recovery-turn-recovery",
+           workspace_path: canonical_workspace,
+           worker_pid: worker_pid,
+           worker_host: nil,
+           text: "Explicit new correction",
+           recovery: true,
+           source_revision: "source-v2",
+           authorization_id: "auth-v2",
+           cwd_revision: 4
+         }}
+      )
 
-      assert_receive {:recovery_message, %{
-        event: :correction_validation_requested,
-        request_id: "symphony-recovery-validation-test",
-        reply_to: reply_to,
-        validation: %{"stage" => "acceptance", "sourceRevision" => "source-v2", "authorizationId" => "auth-v2"}
-      }}, 1_000
+      assert_receive {:recovery_message,
+                      %{
+                        event: :correction_validation_requested,
+                        request_id: "symphony-recovery-validation-test",
+                        reply_to: reply_to,
+                        validation: %{"stage" => "acceptance", "sourceRevision" => "source-v2", "authorizationId" => "auth-v2"}
+                      }},
+                     1_000
 
       assert reply_to == task.pid
       send(reply_to, {:correction_validation_result, "symphony-recovery-validation-test", %{"current" => false}})

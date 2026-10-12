@@ -97,8 +97,7 @@ defmodule SymphonyElixir.Workspace do
          # Permit platform/root aliases, but never a redirected child within the root.
          true <- canonical_path == Path.expand(Path.relative_to(path, root), canonical_root),
          {:ok, head} <- binding_head(binding, canonical_path) do
-      {:ok, %{workspace_path: canonical_path, root: canonical_root, binding: binding,
-              managed: false, kind: binding["kind"], worker_host: nil, head: head}}
+      {:ok, %{workspace_path: canonical_path, root: canonical_root, binding: binding, managed: false, kind: binding["kind"], worker_host: nil, head: head}}
     else
       false -> {:error, :invalid_workspace_binding}
       {:error, _reason} = error -> error
@@ -125,6 +124,7 @@ defmodule SymphonyElixir.Workspace do
   defp git_value(path, args) do
     # Do not inherit a launcher-selected repository or alternate Git configuration.
     env = System.get_env() |> Map.keys() |> Enum.filter(&String.starts_with?(&1, "GIT_")) |> Enum.map(&{&1, nil})
+
     case System.cmd("git", ["-C", path | args], env: env, stderr_to_stdout: true) do
       {output, 0} -> String.trim(output)
       _ -> nil
@@ -144,8 +144,10 @@ defmodule SymphonyElixir.Workspace do
     with {:ok, settings} <- Config.settings(),
          {:ok, candidate} <- PathSafety.canonicalize(workspace) do
       workflow_dir = SymphonyElixir.Workflow.workflow_file_path() |> Path.expand() |> Path.dirname()
+
       Enum.any?(settings.workspace.bindings, fn {_identifier, binding} ->
         path = Path.expand(binding["path"], Path.expand(binding["root"], workflow_dir))
+
         case PathSafety.canonicalize(path) do
           {:ok, borrowed} -> borrowed == candidate or String.starts_with?(borrowed, candidate <> "/") or String.starts_with?(candidate, borrowed <> "/")
           _ -> true
@@ -271,7 +273,8 @@ defmodule SymphonyElixir.Workspace do
           {:error, reason} -> {:error, reason, ""}
         end
 
-      false -> File.rm_rf(workspace)
+      false ->
+        File.rm_rf(workspace)
     end
   end
 
