@@ -90,6 +90,7 @@ defmodule SymphonyElixir.Plane.Client do
     requested_states = state_names |> Enum.map(&normalize_state/1) |> MapSet.new()
 
     with {:ok, plane_settings} <- settings(tracker_settings),
+         {:ok, authenticated_user_id} <- authenticated_user_id(plane_settings, request_fun),
          {:ok, project} <- resolve_project(plane_settings, request_fun),
          {:ok, states_by_id} <- fetch_states_by_id(plane_settings, project.id, request_fun) do
       fetch_work_item_pages(
@@ -97,6 +98,7 @@ defmodule SymphonyElixir.Plane.Client do
         project,
         states_by_id,
         requested_states,
+        authenticated_user_id,
         request_fun,
         nil,
         []
@@ -111,9 +113,10 @@ defmodule SymphonyElixir.Plane.Client do
 
     with :ok <- validate_issue_ids(ids),
          {:ok, plane_settings} <- settings(tracker_settings),
+         {:ok, authenticated_user_id} <- authenticated_user_id(plane_settings, request_fun),
          {:ok, project} <- resolve_project(plane_settings, request_fun),
          {:ok, states_by_id} <- fetch_states_by_id(plane_settings, project.id, request_fun) do
-      fetch_issue_ids(ids, plane_settings, project, states_by_id, request_fun, [])
+      fetch_issue_ids(ids, plane_settings, project, states_by_id, authenticated_user_id, request_fun, [])
     end
   end
 
@@ -193,6 +196,7 @@ defmodule SymphonyElixir.Plane.Client do
          project,
          states_by_id,
          requested_states,
+         authenticated_user_id,
          request_fun,
          cursor,
          acc
@@ -219,6 +223,7 @@ defmodule SymphonyElixir.Plane.Client do
           project,
           states_by_id,
           requested_states,
+          authenticated_user_id,
           request_fun,
           payload["next_cursor"],
           updated_acc
@@ -227,14 +232,16 @@ defmodule SymphonyElixir.Plane.Client do
         updated_acc
         |> Enum.reverse()
         |> List.flatten()
+        |> Enum.filter(&assigned_to_user?(&1, authenticated_user_id))
         |> normalize_work_items(settings, project, states_by_id, requested_states, request_fun)
       end
     end
   end
 
-  defp fetch_issue_ids([], _settings, _project, _states_by_id, _request_fun, acc), do: {:ok, Enum.reverse(acc)}
+  defp fetch_issue_ids([], _settings, _project, _states_by_id, _authenticated_user_id, _request_fun, acc),
+    do: {:ok, Enum.reverse(acc)}
 
-  defp fetch_issue_ids([id | rest], settings, project, states_by_id, request_fun, acc) do
+  defp fetch_issue_ids([id | rest], settings, project, states_by_id, authenticated_user_id, request_fun, acc) do
     with {:ok, payload} <-
            request_with_settings(
              "GET",
@@ -245,22 +252,29 @@ defmodule SymphonyElixir.Plane.Client do
              request_fun,
              true
            ) do
-      continue_fetch_issue_ids(payload, rest, settings, project, states_by_id, request_fun, acc)
+      continue_fetch_issue_ids(payload, rest, settings, project, states_by_id, authenticated_user_id, request_fun, acc)
     end
   end
 
-  defp continue_fetch_issue_ids(:not_found, rest, settings, project, states_by_id, request_fun, acc) do
-    fetch_issue_ids(rest, settings, project, states_by_id, request_fun, acc)
+  defp continue_fetch_issue_ids(:not_found, rest, settings, project, states_by_id, authenticated_user_id, request_fun, acc) do
+    fetch_issue_ids(rest, settings, project, states_by_id, authenticated_user_id, request_fun, acc)
   end
 
-  defp continue_fetch_issue_ids(%{} = raw_issue, rest, settings, project, states_by_id, request_fun, acc) do
-    case normalize_issue_with_comments(raw_issue, settings, project, states_by_id, request_fun) do
-      {:ok, %Issue{} = issue} -> fetch_issue_ids(rest, settings, project, states_by_id, request_fun, [issue | acc])
-      {:error, reason} -> {:error, reason}
+  defp continue_fetch_issue_ids(%{} = raw_issue, rest, settings, project, states_by_id, authenticated_user_id, request_fun, acc) do
+    if assigned_to_user?(raw_issue, authenticated_user_id) do
+      case normalize_issue_with_comments(raw_issue, settings, project, states_by_id, request_fun) do
+        {:ok, %Issue{} = issue} ->
+          fetch_issue_ids(rest, settings, project, states_by_id, authenticated_user_id, request_fun, [issue | acc])
+
+        {:error, reason} ->
+          {:error, reason}
+      end
+    else
+      fetch_issue_ids(rest, settings, project, states_by_id, authenticated_user_id, request_fun, acc)
     end
   end
 
-  defp continue_fetch_issue_ids(_payload, _rest, _settings, _project, _states_by_id, _request_fun, _acc) do
+  defp continue_fetch_issue_ids(_payload, _rest, _settings, _project, _states_by_id, _authenticated_user_id, _request_fun, _acc) do
     {:error, :plane_unknown_payload}
   end
 
@@ -755,6 +769,28 @@ defmodule SymphonyElixir.Plane.Client do
   defp assignee_id(%{"assignees" => [%{"id" => id} | _]}) when is_binary(id), do: id
   defp assignee_id(%{"assignees" => [id | _]}) when is_binary(id), do: id
   defp assignee_id(_issue), do: nil
+
+  defp authenticated_user_path, do: "/api/v1/users/me/"
+
+  defp authenticated_user_id(settings, request_fun) do
+    with {:ok, payload} <-
+           request_with_settings("GET", authenticated_user_path(), %{}, nil, settings, request_fun, false) do
+      case payload do
+        %{"id" => user_id} when is_binary(user_id) and user_id != "" -> {:ok, user_id}
+        _payload -> {:error, :plane_authenticated_user_not_found}
+      end
+    end
+  end
+
+  defp assigned_to_user?(%{"assignees" => assignees}, user_id) when is_list(assignees) do
+    Enum.any?(assignees, fn
+      %{"id" => id} -> id == user_id
+      id when is_binary(id) -> id == user_id
+      _assignee -> false
+    end)
+  end
+
+  defp assigned_to_user?(_issue, _user_id), do: false
 
   defp extract_labels(%{"labels" => labels}) when is_list(labels) do
     labels

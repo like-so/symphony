@@ -256,6 +256,9 @@ defmodule SymphonyElixir.Plane.AdapterTest do
       send(self(), {:plane_call, method, path, params, body, settings})
 
       case {method, path, params} do
+        {"GET", "/api/v1/users/me/", _params} ->
+          {:ok, %{status: 200, body: raw_authenticated_user()}}
+
         {"GET", "/api/v1/workspaces/plane/projects/", _params} ->
           {:ok, %{status: 200, body: paged([raw_project()])}}
 
@@ -383,6 +386,9 @@ defmodule SymphonyElixir.Plane.AdapterTest do
       send(self(), {:plane_id_path, path})
 
       case {path, params} do
+        {"/api/v1/users/me/", %{}} ->
+          {:ok, %{status: 200, body: raw_authenticated_user()}}
+
         {^states_path, %{"per_page" => 100}} ->
           {:ok, %{status: 200, body: paged([raw_state("Todo", todo_state_id())])}}
 
@@ -439,6 +445,9 @@ defmodule SymphonyElixir.Plane.AdapterTest do
                settings,
                fn "GET", path, params, nil, _settings ->
                  case {path, params} do
+                   {"/api/v1/users/me/", %{}} ->
+                     {:ok, %{status: 200, body: raw_authenticated_user()}}
+
                    {^states_path, %{"per_page" => 100}} ->
                      {:ok, %{status: 200, body: paged([raw_state("Todo", todo_state_id())])}}
 
@@ -447,6 +456,94 @@ defmodule SymphonyElixir.Plane.AdapterTest do
                  end
                end
              )
+  end
+
+  test "client only returns Plane work items assigned to the authenticated API-key user" do
+    states_path = "/api/v1/workspaces/plane/projects/#{project_id()}/states/"
+    work_items_path = "/api/v1/workspaces/plane/projects/#{project_id()}/work-items/"
+    issue_1_path = "/api/v1/workspaces/plane/projects/#{project_id()}/work-items/#{issue_id(1)}/"
+    issue_2_path = "/api/v1/workspaces/plane/projects/#{project_id()}/work-items/#{issue_id(2)}/"
+    issue_1_comments_path = issue_1_path <> "comments/"
+    issue_1_relations_path = issue_1_path <> "relations/"
+    issue_2_comments_path = issue_2_path <> "comments/"
+    issue_2_relations_path = issue_2_path <> "relations/"
+    settings = tracker_settings(%{"project_id" => project_id(), "project_identifier" => "NAUTILUS"})
+
+    request_fun = fn "GET", path, params, nil, _settings ->
+      case {path, params} do
+        {"/api/v1/users/me/", %{}} ->
+          {:ok, %{status: 200, body: raw_authenticated_user()}}
+
+        {^states_path, %{"per_page" => 100}} ->
+          {:ok, %{status: 200, body: paged([raw_state("Todo", todo_state_id())])}}
+
+        {^work_items_path, %{"per_page" => 100}} ->
+          {:ok,
+           %{
+             status: 200,
+             body:
+               paged([
+                 raw_issue(1, todo_state_id()),
+                 Map.put(raw_issue(2, todo_state_id()), "assignees", [%{"id" => "user-2"}, %{"id" => "user-1"}]),
+                 Map.put(raw_issue(3, todo_state_id()), "assignees", []),
+                 Map.put(raw_issue(4, todo_state_id()), "assignees", [%{"id" => "user-2"}])
+               ])
+           }}
+
+        {^issue_1_path, %{}} ->
+          {:ok, %{status: 200, body: raw_issue(1, todo_state_id())}}
+
+        {^issue_2_path, %{}} ->
+          {:ok, %{status: 200, body: Map.put(raw_issue(2, todo_state_id()), "assignees", [%{"id" => "user-2"}])}}
+
+        {path, %{"per_page" => 100}} when path in [issue_1_comments_path, issue_2_comments_path] ->
+          {:ok, %{status: 200, body: paged([])}}
+
+        {path, %{}} when path in [issue_1_relations_path, issue_2_relations_path] ->
+          {:ok, %{status: 200, body: %{"blocked_by" => []}}}
+      end
+    end
+
+    assert {:ok, issues} =
+             PlaneClient.fetch_issues_by_states_for_test(["Todo"], settings, request_fun)
+
+    assert Enum.map(issues, & &1.id) == [issue_id(1), issue_id(2)]
+    assert Enum.map(issues, & &1.assignee_id) == ["user-1", "user-2"]
+
+    assert {:ok, refreshed} =
+             PlaneClient.fetch_issues_by_ids_for_test([issue_id(1), issue_id(2)], settings, request_fun)
+
+    assert Enum.map(refreshed, & &1.id) == [issue_id(1)]
+  end
+
+  test "client fails closed when the authenticated Plane user cannot be resolved" do
+    settings = tracker_settings(%{"project_id" => project_id(), "project_identifier" => "NAUTILUS"})
+
+    request_fun = fn "GET", path, params, nil, _settings ->
+      case {path, params} do
+        {"/api/v1/users/me/", %{}} ->
+          {:ok, %{status: 500, body: %{"error" => "failed"}}}
+
+        _other ->
+          flunk("assignment routing must not fetch work items without an authenticated user")
+      end
+    end
+
+    assert {:error, {:plane_api_status, 500}} =
+             PlaneClient.fetch_issues_by_states_for_test(["Todo"], settings, request_fun)
+
+    assert {:error, {:plane_api_status, 500}} =
+             PlaneClient.fetch_issues_by_ids_for_test([issue_id(1)], settings, request_fun)
+
+    malformed_fun = fn "GET", "/api/v1/users/me/", %{}, nil, _settings ->
+      {:ok, %{status: 200, body: %{"display_name" => "No id"}}}
+    end
+
+    assert {:error, :plane_authenticated_user_not_found} =
+             PlaneClient.fetch_issues_by_states_for_test(["Todo"], settings, malformed_fun)
+
+    assert {:error, :plane_authenticated_user_not_found} =
+             PlaneClient.fetch_issues_by_ids_for_test([issue_id(1)], settings, malformed_fun)
   end
 
   test "client propagates comment and relation hydration failures" do
@@ -468,6 +565,9 @@ defmodule SymphonyElixir.Plane.AdapterTest do
         {failure_kind, failure_response, expected_reason} <- failures do
       request_fun = fn "GET", path, params, nil, _settings ->
         cond do
+          path == "/api/v1/users/me/" and params == %{} ->
+            {:ok, %{status: 200, body: raw_authenticated_user()}}
+
           path == states_path and params == %{"per_page" => 100} ->
             {:ok, %{status: 200, body: paged([raw_state("Todo", todo_state_id())])}}
 
@@ -519,6 +619,9 @@ defmodule SymphonyElixir.Plane.AdapterTest do
       send(self(), {:plane_subtask_call, method, path, params, body})
 
       case {method, path, params, body} do
+        {"GET", "/api/v1/users/me/", %{}, nil} ->
+          {:ok, %{status: 200, body: raw_authenticated_user()}}
+
         {"GET", "/api/v1/workspaces/plane/projects/", %{"per_page" => 100}, nil} ->
           {:ok, %{status: 200, body: paged([raw_project()])}}
 
@@ -673,6 +776,10 @@ defmodule SymphonyElixir.Plane.AdapterTest do
 
   defp raw_state(name, id) do
     %{"id" => id, "name" => name, "group" => String.downcase(name)}
+  end
+
+  defp raw_authenticated_user do
+    %{"id" => "user-1", "display_name" => "Test User", "email" => "test@example.com"}
   end
 
   defp raw_issue(sequence_id, state_id) do
