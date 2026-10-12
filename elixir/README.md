@@ -35,6 +35,15 @@ issue claimed and exposes it as blocked in the runtime state, JSON API, and dash
 entries are in memory only; restarting the orchestrator clears that blocked map, so any still-active
 tracker issue can become a dispatch candidate again after restart.
 
+A native bridge may report a bounded first-response wait using `turn/providerFirstWait`.
+Notifications must match the active `turnId`. A `started` notification carries a request
+`trace_id`, positive integer `timeout_ms`, and
+`deadline_unix_ms`; the producer and controller must share a synchronized Unix clock.
+The controller suspends inactivity recovery only until that deadline. Starting or repeating
+this metadata does not count as activity. A matching `ended` notification resumes inactivity
+timing once, and terminal turns clear the wait. Providers without these notifications retain
+the ordinary stall timeout behavior.
+
 ## How to use it
 
 1. Make sure your codebase is set up to work well with agents: see

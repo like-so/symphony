@@ -4,6 +4,34 @@ import { test } from "node:test";
 
 import { bridgeTestHooks } from "../bin/codex-bridge.mjs";
 
+test("provider wait metadata crosses the bridge without fabricating progress", () => {
+  const frames = [];
+  const originalWrite = process.stdout.write;
+  process.stdout.write = (chunk) => { frames.push(JSON.parse(String(chunk))); return true; };
+  try {
+    bridgeTestHooks.forwardStreamDelta("turn", {
+      message_type: "event_message", event_type: "provider_first_wait_started",
+      event_data: { trace_id: "request", timeout_ms: 1000, deadline_unix_ms: 2000,
+        private_payload: "must not cross this boundary" },
+    }, {});
+    bridgeTestHooks.forwardStreamDelta("turn", {
+      message_type: "event_message", event_type: "provider_first_wait_ended",
+      event_data: { trace_id: "request" },
+    }, {});
+    bridgeTestHooks.forwardStreamDelta("turn", {
+      message_type: "event_message", event_type: "provider_first_wait_started",
+      event_data: { trace_id: "" },
+    }, {});
+  } finally {
+    process.stdout.write = originalWrite;
+  }
+  assert.deepEqual(frames, [
+    { method: "turn/providerFirstWait", params: { turnId: "turn", phase: "started",
+      trace_id: "request", timeout_ms: 1000, deadline_unix_ms: 2000 } },
+    { method: "turn/providerFirstWait", params: { turnId: "turn", phase: "ended", trace_id: "request" } },
+  ]);
+});
+
 test("forwards bounded native tool-generation activity without arguments", (t) => {
   let now = 0;
   t.mock.method(performance, "now", () => now);
