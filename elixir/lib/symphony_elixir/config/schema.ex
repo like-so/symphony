@@ -427,12 +427,16 @@ defmodule SymphonyElixir.Config.Schema do
     Enum.all?(Map.keys(binding), &(&1 in ["root", "path", "kind", "origin", "revision"])) and
       text?.(binding["root"]) and text?.(binding["path"]) and
       case binding["kind"] do
-        "directory" -> not Map.has_key?(binding, "origin") and not Map.has_key?(binding, "revision")
+        "directory" ->
+          not Map.has_key?(binding, "origin") and not Map.has_key?(binding, "revision")
+
         "repository" ->
           text?.(binding["origin"]) and
             (not Map.has_key?(binding, "revision") or
                (is_binary(binding["revision"]) and Regex.match?(~r/\A(?:[0-9a-f]{40}|[0-9a-f]{64})\z/, binding["revision"])))
-        _ -> false
+
+        _ ->
+          false
       end
   end
 

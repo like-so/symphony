@@ -12,8 +12,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     on_exit(fn -> File.rm_rf!(root) end)
     File.write!(Path.join(path, "keep.txt"), "existing data")
     binding = %{"root" => root, "path" => "operations", "kind" => "directory"}
-    write_workflow_file!(Workflow.workflow_file_path(),
-      workspace_bindings: %{"OPS-1" => binding}, hook_after_create: "exit 99")
+    write_workflow_file!(Workflow.workflow_file_path(), workspace_bindings: %{"OPS-1" => binding}, hook_after_create: "exit 99")
     issue = %Issue{id: "ops-1", identifier: "OPS-1", description: "Inspect the service"}
     assert {:ok, context} = Workspace.context_for_issue(issue)
     refute context.managed
@@ -32,9 +31,12 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     root = Path.join(System.tmp_dir!(), "symphony-missing-binding-#{System.unique_integer([:positive])}")
     File.mkdir_p!(root)
     on_exit(fn -> File.rm_rf!(root) end)
+
     write_workflow_file!(Workflow.workflow_file_path(),
       workspace_root: Path.join(root, "default"),
-      workspace_bindings: %{"OPS-2" => %{"root" => root, "path" => "missing", "kind" => "directory"}})
+      workspace_bindings: %{"OPS-2" => %{"root" => root, "path" => "missing", "kind" => "directory"}}
+    )
+
     assert {:error, _reason} = Workspace.create_for_issue("OPS-2")
     refute File.exists?(Path.join(root, "default"))
     refute File.exists?(Path.join(root, "missing"))
