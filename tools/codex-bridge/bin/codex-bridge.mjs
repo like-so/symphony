@@ -1871,6 +1871,25 @@ function runCommand(command, args, cwd) {
 }
 
 function forwardStreamDelta(turnId, delta, usage, deferInputRequired = false) {
+  if (
+    delta?.message_type === "event_message" &&
+    ["provider_first_wait_started", "provider_first_wait_ended"].includes(delta.event_type)
+  ) {
+    const data = delta.event_data;
+    if (typeof data?.trace_id === "string" && data.trace_id.length > 0) {
+      emit({
+        method: "turn/providerFirstWait",
+        params: {
+          turnId,
+          phase: delta.event_type === "provider_first_wait_started" ? "started" : "ended",
+          trace_id: data.trace_id,
+          timeout_ms: data.timeout_ms,
+          deadline_unix_ms: data.deadline_unix_ms,
+        },
+      });
+    }
+    return;
+  }
   const messageType = delta?.message_type;
   const now = performance.now();
 

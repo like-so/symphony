@@ -805,15 +805,7 @@ defmodule SymphonyElixir.Codex.AppServer do
 
           {:error, {:turn_input_required, payload}}
         else
-          emit_message(
-            on_message,
-            :notification,
-            %{
-              payload: payload,
-              raw: payload_string
-            },
-            metadata
-          )
+          emit_turn_notification(on_message, payload, payload_string, metadata, correction_binding)
 
           Logger.debug("Codex notification: #{inspect(method)}")
 
@@ -887,6 +879,14 @@ defmodule SymphonyElixir.Codex.AppServer do
       correction.workspace_path == binding.workspace_path and
       correction.worker_pid == binding.worker_pid and
       correction.worker_host == binding.worker_host
+  end
+
+  defp emit_turn_notification(on_message, payload, raw, metadata, binding) do
+    matches_turn = match?(%{"params" => %{"turnId" => id}} when id == binding.turn_id, payload)
+
+    if payload["method"] != "turn/providerFirstWait" or matches_turn do
+      emit_message(on_message, :notification, %{payload: payload, raw: raw}, metadata)
+    end
   end
 
   defp emit_correction_status(on_message, params, binding, metadata) do

@@ -8,6 +8,7 @@ defmodule SymphonyElixir.Orchestrator do
   import Bitwise, only: [<<<: 2]
 
   alias SymphonyElixir.{AgentRunner, Config, StatusDashboard, Tracker, Workspace}
+  alias SymphonyElixir.Codex.ProviderWait
   alias SymphonyElixir.Tracker.Issue
 
   @continuation_retry_delay_ms 1_000
@@ -740,7 +741,9 @@ defmodule SymphonyElixir.Orchestrator do
   defp restart_stalled_issue(state, issue_id, running_entry, now, timeout_ms) do
     elapsed_ms = stall_elapsed_ms(running_entry, now)
 
-    if is_integer(elapsed_ms) and elapsed_ms > timeout_ms do
+    waiting = ProviderWait.pending?(Map.get(running_entry, :provider_first_wait), now)
+
+    if is_integer(elapsed_ms) and elapsed_ms > timeout_ms and not waiting do
       identifier = Map.get(running_entry, :identifier, issue_id)
       session_id = running_entry_session_id(running_entry)
 
@@ -1273,7 +1276,8 @@ defmodule SymphonyElixir.Orchestrator do
 
     %{
       state
-      | retry_attempts:
+      | claimed: MapSet.put(state.claimed, issue_id),
+        retry_attempts:
           Map.put(state.retry_attempts, issue_id, %{
             attempt: next_attempt,
             timer_ref: timer_ref,
@@ -2156,7 +2160,14 @@ defmodule SymphonyElixir.Orchestrator do
 
     {
       Map.merge(running_entry, %{
-        last_codex_timestamp: timestamp,
+        last_codex_timestamp:
+          ProviderWait.activity_timestamp(
+            Map.get(running_entry, :provider_first_wait),
+            update,
+            Map.get(running_entry, :last_codex_timestamp),
+            timestamp
+          ),
+        provider_first_wait: ProviderWait.update(Map.get(running_entry, :provider_first_wait), update),
         last_codex_message: summarize_codex_update(update),
         session_id: session_id_for_update(running_entry.session_id, update),
         correction_owner_active: correction_owner_active_for_update(running_entry, update),
