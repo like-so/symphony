@@ -1948,6 +1948,8 @@ defmodule SymphonyElixir.AppServerTest do
             printf '%s\n' '{"id":3,"result":{"turn":{"id":"turn-malformed-correction"}}}'
             printf '%s\n' '{"method":"symphony/correction/status","params":null}'
             printf '%s\n' '{"id":"symphony-correction-invalid","result":{"correction":null}}'
+            printf '%s\n' '{"id":"symphony-correction-method","method":"example/notification"}'
+            printf '%s\n' '{"id":"symphony-correction-invalid-method","result":{"correction":null},"method":"example/notification"}'
             printf '%s\n' '{"method":"turn/completed"}'
             exit 0
             ;;
@@ -1975,8 +1977,14 @@ defmodule SymphonyElixir.AppServerTest do
         labels: ["backend"]
       }
 
+      test_pid = self()
+      on_message = fn message -> send(test_pid, {:app_server_message, message}) end
+
       assert {:ok, %{result: :turn_completed}} =
-               AppServer.run(workspace, "Ignore malformed correction status", issue)
+               AppServer.run(workspace, "Ignore malformed correction status", issue, on_message: on_message)
+
+      assert_received {:app_server_message, %{event: :notification, payload: %{"id" => "symphony-correction-method"}}}
+      assert_received {:app_server_message, %{event: :notification, payload: %{"id" => "symphony-correction-invalid-method"}}}
     after
       File.rm_rf(test_root)
     end

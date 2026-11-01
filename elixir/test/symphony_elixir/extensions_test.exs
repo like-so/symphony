@@ -7,6 +7,7 @@ defmodule SymphonyElixir.ExtensionsTest do
 
   alias SymphonyElixir.Linear.Adapter
   alias SymphonyElixir.Tracker.Memory
+  alias SymphonyElixirWeb.Plugs.CorrectionAuth
 
   @endpoint SymphonyElixirWeb.Endpoint
 
@@ -67,6 +68,14 @@ defmodule SymphonyElixir.ExtensionsTest do
     def handle_call({:correction_status, instruction_id}, _from, state) do
       if test_pid = Keyword.get(state, :test_pid), do: send(test_pid, {:correction_status, instruction_id})
       {:reply, Keyword.get(state, :correction_status_reply, {:error, :not_found}), state}
+    end
+
+    def handle_cast({:set_correction_reply, reply}, state) do
+      {:noreply, Keyword.put(state, :correction_reply, reply)}
+    end
+
+    def handle_cast({:set_correction_status_reply, reply}, state) do
+      {:noreply, Keyword.put(state, :correction_status_reply, reply)}
     end
   end
 
@@ -650,6 +659,101 @@ defmodule SymphonyElixir.ExtensionsTest do
                "message" => "Correction control is not configured"
              }
            }
+  end
+
+  test "correction control maps orchestrator rejections and invalid targets to api errors" do
+    orchestrator_name = {:global, Module.concat(__MODULE__, :CorrectionErrorOrchestrator)}
+
+    {:ok, _pid} =
+      StaticOrchestrator.start_link(
+        name: orchestrator_name,
+        snapshot: static_snapshot(),
+        correction_reply: {:error, :duplicate_instruction_id}
+      )
+
+    start_test_endpoint(orchestrator: orchestrator_name, correction_token: "correction-secret")
+
+    body = %{
+      "instruction_id" => "instruction-errors",
+      "instruction" => "Apply the authorized correction.",
+      "target" => %{
+        "issue_id" => "issue-1",
+        "session_id" => "local-letta-turn-1",
+        "workspace_path" => "/workspaces/MT-1",
+        "worker_pid" => "4242",
+        "worker_host" => "worker-host-1"
+      }
+    }
+
+    for {reply, status, code} <- [
+          {{:error, :duplicate_instruction_id}, 409, "duplicate_instruction_id"},
+          {{:error, :stale_owner}, 404, "active_owner_not_found"},
+          {{:error, :owner_binding_mismatch}, 409, "owner_binding_mismatch"},
+          {{:error, :unsupported_correction_transport}, 409, "unsupported_correction_transport"},
+          {{:error, :unavailable}, 503, "orchestrator_unavailable"}
+        ] do
+      GenServer.cast(orchestrator_name, {:set_correction_reply, reply})
+
+      conn =
+        build_conn()
+        |> put_req_header("authorization", "Bearer correction-secret")
+        |> post("/api/v1/issues/MT-1/corrections", body)
+
+      assert %{"error" => %{"code" => ^code}} = json_response(conn, status)
+    end
+
+    GenServer.cast(orchestrator_name, {:set_correction_status_reply, {:error, :not_found}})
+
+    missing_conn =
+      build_conn()
+      |> put_req_header("authorization", "Bearer correction-secret")
+      |> get("/api/v1/corrections/instruction-errors")
+
+    assert %{"error" => %{"code" => "correction_not_found"}} = json_response(missing_conn, 404)
+
+    GenServer.cast(orchestrator_name, {:set_correction_status_reply, {:error, :unavailable}})
+
+    unavailable_status_conn =
+      build_conn()
+      |> put_req_header("authorization", "Bearer correction-secret")
+      |> get("/api/v1/corrections/instruction-errors")
+
+    assert %{"error" => %{"code" => "orchestrator_unavailable"}} = json_response(unavailable_status_conn, 503)
+
+    for invalid_target <- [
+          update_in(body, ["target", "worker_pid"], fn _ -> 4242 end),
+          update_in(body, ["target", "worker_host"], fn _ -> 123 end)
+        ] do
+      conn =
+        build_conn()
+        |> put_req_header("authorization", "Bearer correction-secret")
+        |> post("/api/v1/issues/MT-1/corrections", invalid_target)
+
+      assert %{"error" => %{"code" => "invalid_correction"}} = json_response(conn, 422)
+    end
+  end
+
+  test "correction auth plug preserves init options and accepts the ipv6 loopback" do
+    assert CorrectionAuth.init(correction_token: "t") == [correction_token: "t"]
+
+    orchestrator_name = {:global, Module.concat(__MODULE__, :LoopbackOrchestrator)}
+
+    {:ok, _pid} =
+      StaticOrchestrator.start_link(
+        name: orchestrator_name,
+        snapshot: static_snapshot(),
+        correction_status_reply: {:error, :not_found}
+      )
+
+    start_test_endpoint(orchestrator: orchestrator_name, correction_token: "correction-secret")
+
+    conn =
+      build_conn()
+      |> Map.put(:remote_ip, {0, 0, 0, 0, 0, 0, 0, 1})
+      |> put_req_header("authorization", "Bearer correction-secret")
+      |> get("/api/v1/corrections/instruction-1")
+
+    assert %{"error" => %{"code" => "correction_not_found"}} = json_response(conn, 404)
   end
 
   test "phoenix observability api preserves snapshot timeout behavior" do

@@ -4,7 +4,7 @@ defmodule SymphonyElixir.Workspace do
   """
 
   require Logger
-  alias SymphonyElixir.{Config, PathSafety, SSH}
+  alias SymphonyElixir.{Config, PathSafety, SSH, Workflow}
 
   @remote_workspace_marker "__SYMPHONY_WORKSPACE__"
 
@@ -76,20 +76,30 @@ defmodule SymphonyElixir.Workspace do
         resolve_binding(binding)
 
       :error ->
-        with {:ok, path} <- workspace_path_for_issue(workspace_key(issue), worker_host),
-             :ok <- validate_workspace_path(path, worker_host) do
-          head = if is_nil(worker_host) and File.dir?(path), do: git_value(path, ["rev-parse", "--verify", "HEAD"]), else: nil
-          {:ok, %{workspace_path: path, managed: true, kind: :default, worker_host: worker_host, head: head}}
+        resolve_default_workspace(workspace_key(issue), worker_host)
+    end
+  end
+
+  defp resolve_default_workspace(safe_id, worker_host) do
+    with {:ok, path} <- workspace_path_for_issue(safe_id, worker_host),
+         :ok <- validate_workspace_path(path, worker_host) do
+      head =
+        if is_nil(worker_host) and File.dir?(path) do
+          git_value(path, ["rev-parse", "--verify", "HEAD"])
+        else
+          nil
         end
+
+      {:ok, %{workspace_path: path, managed: true, kind: :default, worker_host: worker_host, head: head}}
     end
   end
 
   defp resolve_binding(binding) do
-    workflow_dir = SymphonyElixir.Workflow.workflow_file_path() |> Path.expand() |> Path.dirname()
+    workflow_dir = Workflow.workflow_file_path() |> Path.expand() |> Path.dirname()
     root = Path.expand(binding["root"], workflow_dir)
     path = Path.expand(binding["path"], root)
 
-    with true <- SymphonyElixir.Config.Schema.valid_workspace_binding?(binding),
+    with true <- Config.Schema.valid_workspace_binding?(binding),
          true <- File.dir?(root) and File.dir?(path),
          {:ok, canonical_root} <- PathSafety.canonicalize(root),
          {:ok, canonical_path} <- PathSafety.canonicalize(path),
@@ -97,7 +107,16 @@ defmodule SymphonyElixir.Workspace do
          # Permit platform/root aliases, but never a redirected child within the root.
          true <- canonical_path == Path.expand(Path.relative_to(path, root), canonical_root),
          {:ok, head} <- binding_head(binding, canonical_path) do
-      {:ok, %{workspace_path: canonical_path, root: canonical_root, binding: binding, managed: false, kind: binding["kind"], worker_host: nil, head: head}}
+      {:ok,
+       %{
+         workspace_path: canonical_path,
+         root: canonical_root,
+         binding: binding,
+         managed: false,
+         kind: binding["kind"],
+         worker_host: nil,
+         head: head
+       }}
     else
       false -> {:error, :invalid_workspace_binding}
       {:error, _reason} = error -> error
@@ -143,19 +162,28 @@ defmodule SymphonyElixir.Workspace do
   def borrowed_workspace?(workspace) do
     with {:ok, settings} <- Config.settings(),
          {:ok, candidate} <- PathSafety.canonicalize(workspace) do
-      workflow_dir = SymphonyElixir.Workflow.workflow_file_path() |> Path.expand() |> Path.dirname()
+      workflow_dir = Workflow.workflow_file_path() |> Path.expand() |> Path.dirname()
 
       Enum.any?(settings.workspace.bindings, fn {_identifier, binding} ->
-        path = Path.expand(binding["path"], Path.expand(binding["root"], workflow_dir))
-
-        case PathSafety.canonicalize(path) do
-          {:ok, borrowed} -> borrowed == candidate or String.starts_with?(borrowed, candidate <> "/") or String.starts_with?(candidate, borrowed <> "/")
-          _ -> true
-        end
+        borrowed_binding_covers?(candidate, binding, workflow_dir)
       end)
     else
       _ -> true
     end
+  end
+
+  defp borrowed_binding_covers?(candidate, binding, workflow_dir) do
+    path = Path.expand(binding["path"], Path.expand(binding["root"], workflow_dir))
+
+    case PathSafety.canonicalize(path) do
+      {:ok, borrowed} -> path_overlaps_workspace?(borrowed, candidate)
+      _ -> true
+    end
+  end
+
+  defp path_overlaps_workspace?(borrowed, candidate) do
+    borrowed == candidate or String.starts_with?(borrowed, candidate <> "/") or
+      String.starts_with?(candidate, borrowed <> "/")
   end
 
   @doc "Remove a recorded workspace only if its persisted ownership permits it."

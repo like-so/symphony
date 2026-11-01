@@ -324,7 +324,8 @@ defmodule SymphonyElixir.OrchestratorPollTest do
     old_workspace = Path.join(root, "POLL-2")
     File.mkdir_p!(old_workspace)
     on_exit(fn -> File.rm_rf(root) end)
-    write_workflow_file!(Workflow.workflow_file_path(), workspace_root: root, poll_interval_ms: 60_000, hook_before_run: "sleep 5")
+    workflow_opts = [workspace_root: root, poll_interval_ms: 60_000, hook_before_run: "sleep 5"]
+    write_workflow_file!(Workflow.workflow_file_path(), workflow_opts)
     tasks = start_supervised!({Task.Supervisor, []})
 
     pid =

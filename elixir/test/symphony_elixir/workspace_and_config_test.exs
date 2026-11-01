@@ -1537,6 +1537,31 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
            ]
   end
 
+  test "workspace binding helpers validate directory and repository bindings" do
+    refute Schema.valid_workspace_binding?("not-a-map")
+
+    directory = %{"root" => "r", "path" => "p", "kind" => "directory"}
+    assert Schema.valid_workspace_binding?(directory)
+    refute Schema.valid_workspace_binding?(Map.put(directory, "origin", "https://example.org/repo.git"))
+    refute Schema.valid_workspace_binding?(Map.put(directory, "revision", "abc"))
+
+    repository = %{
+      "root" => "r",
+      "path" => "p",
+      "kind" => "repository",
+      "origin" => "https://example.org/repo.git"
+    }
+
+    assert Schema.valid_workspace_binding?(repository)
+    assert Schema.valid_workspace_binding?(Map.put(repository, "revision", String.duplicate("a", 40)))
+    assert Schema.valid_workspace_binding?(Map.put(repository, "revision", String.duplicate("b", 64)))
+    refute Schema.valid_workspace_binding?(Map.put(repository, "revision", "not-a-revision"))
+    refute Schema.valid_workspace_binding?(Map.put(repository, "origin", " "))
+
+    refute Schema.valid_workspace_binding?(%{"root" => "r", "path" => "p", "kind" => "unknown"})
+    assert Schema.resolve_workspace_binding("legacy-binding") == "legacy-binding"
+  end
+
   test "schema parse normalizes policy keys and env-backed fallbacks" do
     missing_workspace_env = "SYMP_MISSING_WORKSPACE_#{System.unique_integer([:positive])}"
     empty_secret_env = "SYMP_EMPTY_SECRET_#{System.unique_integer([:positive])}"

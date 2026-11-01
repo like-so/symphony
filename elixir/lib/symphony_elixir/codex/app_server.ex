@@ -106,8 +106,7 @@ defmodule SymphonyElixir.Codex.AppServer do
            workspace,
            Map.get(metadata, :codex_app_server_pid),
            worker_host,
-           approval_policy,
-           turn_sandbox_policy
+           %{approval_policy: approval_policy, turn_sandbox_policy: turn_sandbox_policy}
          ) do
       {:ok, turn_id} ->
         session_id = "#{thread_id}-#{turn_id}"
@@ -389,17 +388,10 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp start_turn(
-         port,
-         thread_id,
-         prompt,
-         issue,
-         workspace,
-         worker_pid,
-         worker_host,
-         approval_policy,
-         turn_sandbox_policy
-       ) do
+  defp start_turn(port, thread_id, prompt, issue, workspace, worker_pid, worker_host, %{
+         approval_policy: approval_policy,
+         turn_sandbox_policy: turn_sandbox_policy
+       }) do
     send_message(port, %{
       "method" => "turn/start",
       "id" => @turn_start_id,
@@ -536,36 +528,111 @@ defmodule SymphonyElixir.Codex.AppServer do
       {:ok, %{"method" => "turn/completed"} = payload} ->
         handle_turn_completion(port, on_message, payload, payload_string)
 
-      {:ok, %{"method" => "turn/failed", "params" => _} = payload} ->
-        emit_turn_event(
-          on_message,
-          :turn_failed,
-          payload,
-          payload_string,
-          port,
-          Map.get(payload, "params")
-        )
-
-        {:error, {:turn_failed, Map.get(payload, "params")}}
-
-      {:ok, %{"method" => "turn/cancelled", "params" => _} = payload} ->
-        emit_turn_event(
-          on_message,
-          :turn_cancelled,
-          payload,
-          payload_string,
-          port,
-          Map.get(payload, "params")
-        )
-
-        {:error, {:turn_cancelled, Map.get(payload, "params")}}
+      {:ok, %{"method" => method, "params" => _} = payload}
+      when method in ["turn/failed", "turn/cancelled"] ->
+        handle_turn_abort(on_message, turn_abort_event(method), payload, payload_string, port)
 
       {:ok,
        %{
-         "id" => "symphony-recovery-validation-" <> _ = request_id,
+         "id" => "symphony-recovery-validation-" <> _,
          "method" => "symphony/correction/validate",
          "params" => params
        } = payload}
+      when is_map(params) ->
+        handle_correction_message(
+          port,
+          on_message,
+          payload,
+          payload_string,
+          timeout_ms,
+          tool_executor,
+          auto_approve_requests,
+          correction_binding
+        )
+
+      {:ok, %{"method" => "symphony/correction/status", "params" => params} = payload} when is_map(params) ->
+        handle_correction_message(
+          port,
+          on_message,
+          payload,
+          payload_string,
+          timeout_ms,
+          tool_executor,
+          auto_approve_requests,
+          correction_binding
+        )
+
+      {:ok, %{"id" => "symphony-correction-" <> _} = payload} ->
+        handle_correction_message(
+          port,
+          on_message,
+          payload,
+          payload_string,
+          timeout_ms,
+          tool_executor,
+          auto_approve_requests,
+          correction_binding
+        )
+
+      {:ok, %{"method" => method} = payload}
+      when is_binary(method) ->
+        handle_turn_method(
+          port,
+          on_message,
+          %{payload: payload, raw: payload_string, method: method},
+          method,
+          timeout_ms,
+          tool_executor,
+          auto_approve_requests,
+          correction_binding
+        )
+
+      {:ok, payload} ->
+        handle_other_message(
+          port,
+          on_message,
+          payload,
+          payload_string,
+          timeout_ms,
+          tool_executor,
+          auto_approve_requests,
+          correction_binding
+        )
+
+      {:error, _reason} ->
+        handle_malformed_stream(
+          port,
+          on_message,
+          payload_string,
+          timeout_ms,
+          tool_executor,
+          auto_approve_requests,
+          correction_binding
+        )
+    end
+  end
+
+  defp handle_turn_abort(on_message, event, payload, payload_string, port) do
+    emit_turn_event(on_message, event, payload, payload_string, port, Map.get(payload, "params"))
+
+    {:error, {event, Map.get(payload, "params")}}
+  end
+
+  defp turn_abort_event("turn/failed"), do: :turn_failed
+  defp turn_abort_event("turn/cancelled"), do: :turn_cancelled
+
+  defp handle_correction_message(
+         port,
+         on_message,
+         payload,
+         payload_string,
+         timeout_ms,
+         tool_executor,
+         auto_approve_requests,
+         correction_binding
+       ) do
+    case payload do
+      %{"id" => "symphony-recovery-validation-" <> _ = request_id, "method" => "symphony/correction/validate", "params" => params}
       when is_map(params) ->
         # The manager must validate its current source and authorization record;
         # a bridge request or echoed operator payload is not authority by itself.
@@ -602,7 +669,7 @@ defmodule SymphonyElixir.Codex.AppServer do
           correction_binding
         )
 
-      {:ok, %{"method" => "symphony/correction/status", "params" => params} = payload} when is_map(params) ->
+      %{"method" => "symphony/correction/status", "params" => params} when is_map(params) ->
         emit_correction_status(on_message, params, correction_binding, metadata_from_message(port, payload))
 
         receive_loop(
@@ -615,11 +682,7 @@ defmodule SymphonyElixir.Codex.AppServer do
           correction_binding
         )
 
-      {:ok,
-       %{
-         "id" => "symphony-correction-" <> response_instruction_id,
-         "result" => %{"correction" => params}
-       } = payload}
+      %{"id" => "symphony-correction-" <> response_instruction_id, "result" => %{"correction" => params}}
       when is_map(params) ->
         if Map.get(params, "instructionId") == response_instruction_id do
           emit_correction_status(on_message, params, correction_binding, metadata_from_message(port, payload))
@@ -635,7 +698,7 @@ defmodule SymphonyElixir.Codex.AppServer do
           correction_binding
         )
 
-      {:ok, %{"id" => "symphony-correction-" <> instruction_id, "error" => error} = payload} ->
+      %{"id" => "symphony-correction-" <> instruction_id, "error" => error} ->
         emit_message(
           on_message,
           :correction_failed,
@@ -653,13 +716,11 @@ defmodule SymphonyElixir.Codex.AppServer do
           correction_binding
         )
 
-      {:ok, %{"method" => method} = payload}
-      when is_binary(method) ->
+      %{"method" => method} when is_binary(method) ->
         handle_turn_method(
           port,
           on_message,
-          payload,
-          payload_string,
+          %{payload: payload, raw: payload_string, method: method},
           method,
           timeout_ms,
           tool_executor,
@@ -667,52 +728,66 @@ defmodule SymphonyElixir.Codex.AppServer do
           correction_binding
         )
 
-      {:ok, payload} ->
-        emit_message(
-          on_message,
-          :other_message,
-          %{
-            payload: payload,
-            raw: payload_string
-          },
-          metadata_from_message(port, payload)
-        )
-
-        receive_loop(
+      other ->
+        handle_other_message(
           port,
           on_message,
+          other,
+          payload_string,
           timeout_ms,
-          "",
-          tool_executor,
-          auto_approve_requests,
-          correction_binding
-        )
-
-      {:error, _reason} ->
-        log_non_json_stream_line(payload_string, "turn stream")
-
-        if protocol_message_candidate?(payload_string) do
-          emit_message(
-            on_message,
-            :malformed,
-            %{
-              payload: payload_string,
-              raw: payload_string
-            },
-            metadata_from_message(port, %{raw: payload_string})
-          )
-        end
-
-        receive_loop(
-          port,
-          on_message,
-          timeout_ms,
-          "",
           tool_executor,
           auto_approve_requests,
           correction_binding
         )
     end
+  end
+
+  defp handle_other_message(port, on_message, payload, payload_string, timeout_ms, tool_executor, auto_approve_requests, correction_binding) do
+    emit_message(
+      on_message,
+      :other_message,
+      %{
+        payload: payload,
+        raw: payload_string
+      },
+      metadata_from_message(port, payload)
+    )
+
+    receive_loop(
+      port,
+      on_message,
+      timeout_ms,
+      "",
+      tool_executor,
+      auto_approve_requests,
+      correction_binding
+    )
+  end
+
+  defp handle_malformed_stream(port, on_message, payload_string, timeout_ms, tool_executor, auto_approve_requests, correction_binding) do
+    log_non_json_stream_line(payload_string, "turn stream")
+
+    if protocol_message_candidate?(payload_string) do
+      emit_message(
+        on_message,
+        :malformed,
+        %{
+          payload: payload_string,
+          raw: payload_string
+        },
+        metadata_from_message(port, %{raw: payload_string})
+      )
+    end
+
+    receive_loop(
+      port,
+      on_message,
+      timeout_ms,
+      "",
+      tool_executor,
+      auto_approve_requests,
+      correction_binding
+    )
   end
 
   defp handle_turn_completion(port, on_message, payload, payload_string) do
@@ -743,8 +818,7 @@ defmodule SymphonyElixir.Codex.AppServer do
   defp handle_turn_method(
          port,
          on_message,
-         payload,
-         payload_string,
+         %{payload: payload, raw: payload_string, method: method},
          method,
          timeout_ms,
          tool_executor,
@@ -890,38 +964,40 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp emit_correction_status(on_message, params, binding, metadata) do
-    event =
-      case Map.get(params, "status") do
-        "received" -> :correction_received
-        "delivered" -> :correction_delivered
-        "execution_started" -> :correction_execution_started
-        "completed" -> :correction_completed
-        "blocked" -> :correction_blocked
-        "failed" -> :correction_failed
-        _ -> nil
-      end
-
-    if event do
-      details = %{
-        instruction_id: Map.get(params, "instructionId"),
-        issue_id: Map.get(params, "issueId"),
-        issue_identifier: Map.get(params, "issueIdentifier"),
-        thread_id: Map.get(params, "threadId"),
-        expected_turn_id: Map.get(params, "expectedTurnId"),
-        session_id: Map.get(params, "sessionId"),
-        workspace_path: Map.get(params, "workspacePath"),
-        worker_pid: Map.get(params, "workerPid"),
-        worker_host: Map.get(params, "workerHost"),
-        run_id: Map.get(params, "runId"),
-        result: Map.get(params, "result"),
-        error: Map.get(params, "error")
-      }
-
-      if correction_status_matches_binding?(details, binding) do
-        emit_message(on_message, event, details, metadata)
-      end
+    case correction_status_event(Map.get(params, "status")) do
+      nil -> :ok
+      event -> emit_matching_correction_status(on_message, event, params, binding, metadata)
     end
   end
+
+  defp emit_matching_correction_status(on_message, event, params, binding, metadata) do
+    details = %{
+      instruction_id: Map.get(params, "instructionId"),
+      issue_id: Map.get(params, "issueId"),
+      issue_identifier: Map.get(params, "issueIdentifier"),
+      thread_id: Map.get(params, "threadId"),
+      expected_turn_id: Map.get(params, "expectedTurnId"),
+      session_id: Map.get(params, "sessionId"),
+      workspace_path: Map.get(params, "workspacePath"),
+      worker_pid: Map.get(params, "workerPid"),
+      worker_host: Map.get(params, "workerHost"),
+      run_id: Map.get(params, "runId"),
+      result: Map.get(params, "result"),
+      error: Map.get(params, "error")
+    }
+
+    if correction_status_matches_binding?(details, binding) do
+      emit_message(on_message, event, details, metadata)
+    end
+  end
+
+  defp correction_status_event("received"), do: :correction_received
+  defp correction_status_event("delivered"), do: :correction_delivered
+  defp correction_status_event("execution_started"), do: :correction_execution_started
+  defp correction_status_event("completed"), do: :correction_completed
+  defp correction_status_event("blocked"), do: :correction_blocked
+  defp correction_status_event("failed"), do: :correction_failed
+  defp correction_status_event(_status), do: nil
 
   defp correction_event_details(correction, extra) do
     Map.merge(

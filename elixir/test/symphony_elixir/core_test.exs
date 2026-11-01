@@ -2180,6 +2180,23 @@ defmodule SymphonyElixir.CoreTest do
     assert prompt =~ "retained-id"
   end
 
+  test "prompt builder annotates bound operations directories and omits empty history" do
+    write_workflow_file!(Workflow.workflow_file_path(), prompt: "Ticket {{ issue.identifier }}")
+
+    issue = %Issue{identifier: "S-3", comments: nil}
+
+    prompt =
+      PromptBuilder.build_prompt(issue,
+        workspace_context: %{managed: false, workspace_path: "/workspaces/S-3", source_revision: "rev-1"}
+      )
+
+    assert prompt =~ "Ticket S-3"
+    assert prompt =~ "## Workspace context"
+    assert prompt =~ "/workspaces/S-3"
+    assert prompt =~ "bound operations directory"
+    refute prompt =~ "## Historical tracker evidence"
+  end
+
   test "prompt builder renders issue datetime fields without crashing" do
     workflow_prompt = "Ticket {{ issue.identifier }} created={{ issue.created_at }} updated={{ issue.updated_at }}"
 

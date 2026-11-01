@@ -127,15 +127,21 @@ defmodule SymphonyElixir.Config.Schema do
           {identifier, SymphonyElixir.Config.Schema.resolve_workspace_binding(binding)}
         end)
       end)
-      |> validate_change(:bindings, fn :bindings, bindings ->
-        if Enum.all?(bindings, fn {identifier, binding} ->
-             is_binary(identifier) and String.trim(identifier) != "" and
-               SymphonyElixir.Config.Schema.valid_workspace_binding?(binding)
-           end) do
-          []
-        else
-          [bindings: "must contain exact identifiers and valid root/path/kind/origin/revision bindings"]
-        end
+      |> validate_change(:bindings, &validate_bindings_change/2)
+    end
+
+    defp validate_bindings_change(:bindings, bindings) do
+      if valid_bindings?(bindings) do
+        []
+      else
+        [bindings: "must contain exact identifiers and valid root/path/kind/origin/revision bindings"]
+      end
+    end
+
+    defp valid_bindings?(bindings) do
+      Enum.all?(bindings, fn {identifier, binding} ->
+        is_binary(identifier) and String.trim(identifier) != "" and
+          SymphonyElixir.Config.Schema.valid_workspace_binding?(binding)
       end)
     end
   end
@@ -425,22 +431,23 @@ defmodule SymphonyElixir.Config.Schema do
     end
 
     Enum.all?(Map.keys(binding), &(&1 in ["root", "path", "kind", "origin", "revision"])) and
-      text?.(binding["root"]) and text?.(binding["path"]) and
-      case binding["kind"] do
-        "directory" ->
-          not Map.has_key?(binding, "origin") and not Map.has_key?(binding, "revision")
-
-        "repository" ->
-          text?.(binding["origin"]) and
-            (not Map.has_key?(binding, "revision") or
-               (is_binary(binding["revision"]) and Regex.match?(~r/\A(?:[0-9a-f]{40}|[0-9a-f]{64})\z/, binding["revision"])))
-
-        _ ->
-          false
-      end
+      text?.(binding["root"]) and text?.(binding["path"]) and valid_kind?(binding, text?)
   end
 
   def valid_workspace_binding?(_binding), do: false
+
+  defp valid_kind?(%{"kind" => "directory"} = binding, _text?) do
+    not Map.has_key?(binding, "origin") and not Map.has_key?(binding, "revision")
+  end
+
+  defp valid_kind?(%{"kind" => "repository"} = binding, text?) do
+    text?.(binding["origin"]) and
+      (not Map.has_key?(binding, "revision") or
+         (is_binary(binding["revision"]) and
+            Regex.match?(~r/\A(?:[0-9a-f]{40}|[0-9a-f]{64})\z/, binding["revision"])))
+  end
+
+  defp valid_kind?(_binding, _text?), do: false
 
   defp changeset(attrs) do
     %__MODULE__{}
