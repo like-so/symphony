@@ -441,8 +441,10 @@ defmodule SymphonyElixir.CoreTest do
 
     first_worker_pid =
       eventually_value(fn ->
-        case Task.Supervisor.children(task_supervisor_name) do
-          [pid] -> pid
+        state = :sys.get_state(orchestrator_pid)
+
+        case Map.get(state.running, issue.id) do
+          %{pid: pid} -> if File.exists?(hook_marker), do: pid
           _ -> nil
         end
       end)
@@ -478,11 +480,11 @@ defmodule SymphonyElixir.CoreTest do
 
     second_worker_pid =
       eventually_value(fn ->
-        children = Task.Supervisor.children(task_supervisor_name)
-        assert length(children) <= 1
+        state = :sys.get_state(restarted_pid)
+        assert map_size(state.running) <= 1
 
-        case children do
-          [pid] when pid != first_worker_pid -> pid
+        case Map.get(state.running, issue.id) do
+          %{pid: pid} when pid != first_worker_pid -> pid
           _ -> nil
         end
       end)
@@ -767,9 +769,14 @@ defmodule SymphonyElixir.CoreTest do
       end)
 
       send(pid, :tick)
-      Process.sleep(100)
-      state = :sys.get_state(pid)
 
+      state =
+        eventually_value(fn ->
+          state = :sys.get_state(pid)
+          if not Map.has_key?(state.running, issue_id), do: state
+        end)
+
+      assert state
       refute Map.has_key?(state.running, issue_id)
       refute MapSet.member?(state.claimed, issue_id)
       refute Process.alive?(agent_pid)
@@ -2178,6 +2185,23 @@ defmodule SymphonyElixir.CoreTest do
     assert prompt =~ "Ticket S-2"
     assert prompt =~ "## Historical tracker evidence"
     assert prompt =~ "retained-id"
+  end
+
+  test "prompt builder annotates bound operations directories and omits empty history" do
+    write_workflow_file!(Workflow.workflow_file_path(), prompt: "Ticket {{ issue.identifier }}")
+
+    issue = %Issue{identifier: "S-3", comments: nil}
+
+    prompt =
+      PromptBuilder.build_prompt(issue,
+        workspace_context: %{managed: false, workspace_path: "/workspaces/S-3", source_revision: "rev-1"}
+      )
+
+    assert prompt =~ "Ticket S-3"
+    assert prompt =~ "## Workspace context"
+    assert prompt =~ "/workspaces/S-3"
+    assert prompt =~ "bound operations directory"
+    refute prompt =~ "## Historical tracker evidence"
   end
 
   test "prompt builder renders issue datetime fields without crashing" do

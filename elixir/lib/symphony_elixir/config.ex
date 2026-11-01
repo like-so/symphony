@@ -123,9 +123,8 @@ defmodule SymphonyElixir.Config do
   @doc false
   @spec validate_settings(Schema.t()) :: :ok | {:error, term()}
   def validate_settings(settings) do
-    with :ok <- validate_tracker_settings(settings),
-         :ok <- validate_correction_control_settings(settings.server) do
-      :ok
+    with :ok <- validate_tracker_settings(settings) do
+      validate_correction_control_settings(settings.server)
     end
   end
 

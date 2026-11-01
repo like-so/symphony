@@ -1379,11 +1379,11 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
 
     :sys.replace_state(snapshot_pid, fn _ -> dashboard_snapshot(10) end)
 
-    last_rendered_at_ms = System.monotonic_time(:millisecond) + 1_000
-    rendered_state = %{rendered_state | last_rendered_at_ms: last_rendered_at_ms}
     tracer = start_timer_call_tracer()
 
     try do
+      last_rendered_at_ms = System.monotonic_time(:millisecond) + 60_000
+      rendered_state = %{rendered_state | last_rendered_at_ms: last_rendered_at_ms}
       refresh_started_at_ms = System.monotonic_time(:millisecond)
       assert {:noreply, pending_state} = StatusDashboard.handle_info(:refresh, rendered_state)
       refresh_finished_at_ms = System.monotonic_time(:millisecond)
