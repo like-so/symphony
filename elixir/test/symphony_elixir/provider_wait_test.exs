@@ -58,6 +58,15 @@ defmodule SymphonyElixir.Codex.ProviderWaitTest do
     assert ProviderWait.update(nil, start("a", @epoch + 1001, 1000)) != nil
   end
 
+  test "unknown provider phases and malformed params preserve the current wait" do
+    state = ProviderWait.update(nil, start("a", @epoch + 1000))
+
+    for params <- [nil, %{}, %{"phase" => "unknown"}] do
+      update = put_in(stop("a"), [:payload, "params"], params)
+      assert ProviderWait.update(state, update) == state
+    end
+  end
+
   test "terminal turns clear wait state and ordinary activity stays unchanged" do
     state = ProviderWait.update(nil, start("a", @epoch + 1000))
 

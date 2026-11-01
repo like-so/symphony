@@ -1444,8 +1444,9 @@ defmodule SymphonyElixir.Codex.AppServer do
 
   defp stop_detached_omx_sessions(workspace) when is_binary(workspace) do
     with tmux when is_binary(tmux) <- System.find_executable("tmux"),
+         # tmux escapes tabs in format output but never allows ":" in session names.
          {output, _status} <-
-           System.cmd(tmux, ["list-panes", "-a", "-F", "\#{session_name}\t\#{pane_current_path}"],
+           System.cmd(tmux, ["list-panes", "-a", "-F", "\#{session_name}:\#{pane_current_path}"],
              env: correction_secret_system_env(),
              stderr_to_stdout: true
            ) do
@@ -1485,7 +1486,7 @@ defmodule SymphonyElixir.Codex.AppServer do
   defp tmux_session_name(line) when is_binary(line) do
     line
     |> String.trim_leading()
-    |> String.split(~r/\s+/, parts: 2)
+    |> String.split(":", parts: 2)
     |> List.first()
   end
 

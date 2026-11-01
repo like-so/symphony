@@ -188,7 +188,7 @@ defmodule SymphonyElixir.AppServerTest do
           2) ;;
           3) printf '%s\n' '{"id":2,"result":{"thread":{"id":"thread-correction-timeout"}}}' ;;
           4) printf '%s\n' '{"id":3,"result":{"turn":{"id":"turn-correction-timeout"}}}' ;;
-          5) sleep 2 ;;
+          5) sleep 10 ;;
           *) exit 0 ;;
         esac
       done
@@ -199,7 +199,7 @@ defmodule SymphonyElixir.AppServerTest do
       write_workflow_file!(Workflow.workflow_file_path(),
         workspace_root: workspace_root,
         codex_command: "#{codex_binary} app-server",
-        codex_turn_timeout_ms: 1_000
+        codex_turn_timeout_ms: 5_000
       )
 
       issue = %Issue{
@@ -222,9 +222,10 @@ defmodule SymphonyElixir.AppServerTest do
                         session_id: session_id,
                         codex_app_server_pid: worker_pid
                       }},
-                     1_000
+                     5_000
 
-      Process.sleep(500)
+      Process.sleep(3_000)
+      correction_sent_at = System.monotonic_time(:millisecond)
 
       send(task.pid, {
         :deliver_correction,
@@ -240,7 +241,10 @@ defmodule SymphonyElixir.AppServerTest do
         }
       })
 
-      assert {:ok, {:error, :turn_timeout}} = Task.yield(task, 750)
+      # The original deadline has at most 2s left; a reset on correction would need the full 5s.
+      assert_receive {:app_server_message, %{event: :turn_ended_with_error, reason: :turn_timeout}}, 4_500
+      assert System.monotonic_time(:millisecond) - correction_sent_at < 5_000
+      assert {:error, :turn_timeout} = Task.await(task, 10_000)
     after
       File.rm_rf(test_root)
     end
@@ -563,7 +567,7 @@ defmodule SymphonyElixir.AppServerTest do
       printf '%s:absent\n' "$1" >> "#{trace_file}"
     fi
     if [ "$1" = list-panes ]; then
-      printf 'omx-cleanup-secret\t%s\n' '#{canonical_workspace}'
+      printf 'omx-cleanup-secret:%s\n' '#{canonical_workspace}'
     fi
     """)
 

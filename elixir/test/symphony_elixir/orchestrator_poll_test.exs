@@ -296,24 +296,26 @@ defmodule SymphonyElixir.OrchestratorPollTest do
   end
 
   test "retry traffic preserves the existing periodic poll deadline", %{pid: pid} do
-    due_at = System.monotonic_time(:millisecond) + 300
+    # Allow asynchronous retry round trips to finish before the real periodic timer fires.
+    poll_delay_ms = 5_000
+    due_at = System.monotonic_time(:millisecond) + poll_delay_ms
 
     :sys.replace_state(pid, fn state ->
       token = make_ref()
-      timer = Process.send_after(self(), {:tick, token}, 300)
+      timer = Process.send_after(self(), {:tick, token}, poll_delay_ms)
       %{state | tick_token: token, tick_timer_ref: timer, next_poll_due_at_ms: due_at}
     end)
 
     for _ <- 1..3 do
       token = put_retry(pid)
       send(pid, {:retry_issue, "issue-1", token})
-      assert_receive {:tracker_request, request}, 1_000
+      assert_receive {:tracker_request, request}, poll_delay_ms
       send(request, {:respond, 503, []})
       await_idle(pid)
       assert :sys.get_state(pid).next_poll_due_at_ms <= due_at + 10
     end
 
-    assert_receive {:tracker_request, periodic_poll}, 1_000
+    assert_receive {:tracker_request, periodic_poll}, poll_delay_ms + 1_000
     respond(periodic_poll)
     await_idle(pid)
   end
