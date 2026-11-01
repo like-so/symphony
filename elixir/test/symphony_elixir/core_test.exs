@@ -453,6 +453,12 @@ defmodule SymphonyElixir.CoreTest do
     assert Process.alive?(first_worker_pid)
     assert eventually_value(fn -> if File.exists?(hook_marker), do: true end)
 
+    # Tracker I/O tasks share the task supervisor, so identify worker processes by the
+    # worker spawn function rather than counting every supervised child.
+    {:dictionary, first_worker_dictionary} = Process.info(first_worker_pid, :dictionary)
+    worker_initial_call = Keyword.fetch!(first_worker_dictionary, :"$initial_call")
+    assert [^first_worker_pid] = worker_children(task_supervisor_name, worker_initial_call)
+
     monitor_ref = Process.monitor(orchestrator_pid)
     Process.exit(orchestrator_pid, :kill)
     assert_receive {:DOWN, ^monitor_ref, :process, ^orchestrator_pid, :killed}, 1_000
@@ -480,17 +486,21 @@ defmodule SymphonyElixir.CoreTest do
 
     second_worker_pid =
       eventually_value(fn ->
+        workers = worker_children(task_supervisor_name, worker_initial_call)
+        assert length(workers) <= 1
+
         state = :sys.get_state(restarted_pid)
         assert map_size(state.running) <= 1
 
         case Map.get(state.running, issue.id) do
-          %{pid: pid} when pid != first_worker_pid -> pid
+          %{pid: pid} when pid != first_worker_pid -> if workers == [pid], do: pid
           _ -> nil
         end
       end)
 
     assert is_pid(second_worker_pid)
     assert Process.alive?(second_worker_pid)
+    assert [^second_worker_pid] = worker_children(task_supervisor_name, worker_initial_call)
   end
 
   test "linear issue state reconciliation fetch with no running issues is a no-op" do
@@ -2110,6 +2120,17 @@ defmodule SymphonyElixir.CoreTest do
       {:ok, pid} -> pid
       {:error, {:already_started, pid}} -> pid
     end
+  end
+
+  defp worker_children(task_supervisor, worker_initial_call) do
+    task_supervisor
+    |> Task.Supervisor.children()
+    |> Enum.filter(fn pid ->
+      case Process.info(pid, :dictionary) do
+        {:dictionary, dictionary} -> Keyword.get(dictionary, :"$initial_call") == worker_initial_call
+        nil -> false
+      end
+    end)
   end
 
   defp eventually_value(fun, attempts \\ 100)
