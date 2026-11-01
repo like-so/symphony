@@ -512,7 +512,9 @@ defmodule SymphonyElixir.AppServerTest do
     if is_nil(tmux) do
       :ok
     else
-      do_test_app_server_cleanup_kills_detached_omx_tmux_sessions(tmux)
+      for pane_directory <- ["", "nested:repo"] do
+        do_test_app_server_cleanup_kills_detached_omx_tmux_sessions(tmux, pane_directory)
+      end
     end
   end
 
@@ -566,8 +568,15 @@ defmodule SymphonyElixir.AppServerTest do
     else
       printf '%s:absent\n' "$1" >> "#{trace_file}"
     fi
+    if [ "$1" = kill-session ] && [ "$3" != '=omx-cleanup-secret' ]; then
+      printf 'unexpected-target\n' >> "#{trace_file}"
+    fi
     if [ "$1" = list-panes ]; then
       printf 'omx-cleanup-secret:%s\n' '#{canonical_workspace}'
+      printf 'other-cleanup:%s\n' '#{canonical_workspace}'
+      printf ' omx-leading-space:%s\n' '#{canonical_workspace}'
+      printf 'omx-relative:relative/path\n'
+      printf 'malformed-session\n'
     fi
     """)
 
@@ -773,7 +782,7 @@ defmodule SymphonyElixir.AppServerTest do
     end
   end
 
-  defp do_test_app_server_cleanup_kills_detached_omx_tmux_sessions(real_tmux) do
+  defp do_test_app_server_cleanup_kills_detached_omx_tmux_sessions(real_tmux, pane_directory) do
     test_root =
       Path.join(
         System.tmp_dir!(),
@@ -788,14 +797,16 @@ defmodule SymphonyElixir.AppServerTest do
     try do
       workspace_root = Path.join(test_root, "workspaces")
       workspace = Path.join(workspace_root, "MT-190")
-      control_workspace = Path.join(workspace_root, "MT-191")
+      pane_workspace = Path.join(workspace, pane_directory)
+      control_workspace = Path.join(workspace_root, "MT-1900")
       bin_dir = Path.join(test_root, "bin")
       codex_binary = Path.join(bin_dir, "fake-codex")
-      tmux_socket_name = "symphony-test-#{System.unique_integer([:positive])}"
-      File.mkdir_p!(workspace)
+      tmux_socket_path = Path.join(test_root, "tmux.sock")
+      File.mkdir_p!(pane_workspace)
       File.mkdir_p!(control_workspace)
       File.mkdir_p!(bin_dir)
       assert {:ok, canonical_workspace} = SymphonyElixir.PathSafety.canonicalize(workspace)
+      assert {:ok, canonical_pane_workspace} = SymphonyElixir.PathSafety.canonicalize(pane_workspace)
 
       assert {:ok, canonical_control_workspace} =
                SymphonyElixir.PathSafety.canonicalize(control_workspace)
@@ -818,7 +829,7 @@ defmodule SymphonyElixir.AppServerTest do
 
       File.write!(tmux, """
       #!/bin/sh
-      exec #{shell_escape(real_tmux)} -L #{shell_escape(tmux_socket_name)} "$@"
+      exec #{shell_escape(real_tmux)} -S #{shell_escape(tmux_socket_path)} "$@"
       """)
 
       File.chmod!(codex_binary, 0o755)
@@ -826,7 +837,7 @@ defmodule SymphonyElixir.AppServerTest do
       System.put_env("PATH", bin_dir <> ":" <> (previous_path || ""))
 
       {_, 0} =
-        System.cmd(tmux, ["new-session", "-d", "-s", session_name, "-c", canonical_workspace, "sleep", "300"])
+        System.cmd(tmux, ["new-session", "-d", "-s", session_name, "-c", canonical_pane_workspace, "sleep", "300"])
 
       {_, 0} =
         System.cmd(tmux, [
@@ -844,7 +855,10 @@ defmodule SymphonyElixir.AppServerTest do
       assert {_, 0} = System.cmd(tmux, ["has-session", "-t", control_session_name])
 
       # A just-created pane can briefly report the tmux server's cwd before its process enters -c.
-      assert wait_for_pane_current_path(tmux, session_name, canonical_workspace) == canonical_workspace
+      assert wait_for_pane_current_path(tmux, session_name, canonical_pane_workspace) == canonical_pane_workspace
+
+      assert wait_for_pane_current_path(tmux, control_session_name, canonical_control_workspace) ==
+               canonical_control_workspace
 
       write_workflow_file!(Workflow.workflow_file_path(),
         workspace_root: workspace_root,

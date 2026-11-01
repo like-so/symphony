@@ -44,6 +44,9 @@ this metadata does not count as activity. A matching `ended` notification resume
 timing once, and terminal turns clear the wait. Providers without these notifications retain
 the ordinary stall timeout behavior.
 
+Local OMX tmux cleanup matches absolute pane directories at the issue workspace or beneath it.
+Similarly named sibling directories, such as `MT-1900` beside `MT-190`, are not part of that workspace.
+
 ## How to use it
 
 1. Make sure your codebase is set up to work well with agents: see
