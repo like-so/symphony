@@ -1457,7 +1457,7 @@ defmodule SymphonyElixir.Codex.AppServer do
       |> Enum.reject(&is_nil/1)
       |> Enum.uniq()
       |> Enum.each(fn session_name ->
-        System.cmd(tmux, ["kill-session", "-t", session_name],
+        System.cmd(tmux, ["kill-session", "-t", "=#{session_name}"],
           env: correction_secret_system_env(),
           stderr_to_stdout: true
         )
@@ -1477,15 +1477,24 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp detached_omx_session_for_workspace?(line, workspace) when is_binary(line) and is_binary(workspace) do
-    trimmed_line = String.trim_leading(line)
-    String.starts_with?(trimmed_line, "omx") and String.contains?(trimmed_line, Path.expand(workspace))
+    case String.split(line, ":", parts: 2) do
+      [session_name, pane_path] ->
+        expanded_workspace = Path.expand(workspace)
+        expanded_pane = Path.expand(pane_path)
+
+        String.starts_with?(session_name, "omx") and Path.type(pane_path) == :absolute and
+          (expanded_pane == expanded_workspace or
+             String.starts_with?(expanded_pane, expanded_workspace <> "/"))
+
+      _ ->
+        false
+    end
   end
 
   defp detached_omx_session_for_workspace?(_line, _workspace), do: false
 
   defp tmux_session_name(line) when is_binary(line) do
     line
-    |> String.trim_leading()
     |> String.split(":", parts: 2)
     |> List.first()
   end
