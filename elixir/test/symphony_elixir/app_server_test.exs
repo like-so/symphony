@@ -843,10 +843,8 @@ defmodule SymphonyElixir.AppServerTest do
       assert {_, 0} = System.cmd(tmux, ["has-session", "-t", session_name])
       assert {_, 0} = System.cmd(tmux, ["has-session", "-t", control_session_name])
 
-      assert {pane, 0} =
-               System.cmd(tmux, ["list-panes", "-t", session_name, "-F", "\#{pane_current_path}"])
-
-      assert String.trim(pane) == canonical_workspace
+      # A just-created pane can briefly report the tmux server's cwd before its process enters -c.
+      assert wait_for_pane_current_path(tmux, session_name, canonical_workspace) == canonical_workspace
 
       write_workflow_file!(Workflow.workflow_file_path(),
         workspace_root: workspace_root,
@@ -2231,5 +2229,17 @@ defmodule SymphonyElixir.AppServerTest do
 
   defp shell_escape(value) when is_binary(value) do
     "'" <> String.replace(value, "'", "'\"'\"'") <> "'"
+  end
+
+  defp wait_for_pane_current_path(tmux, session_name, expected, attempts \\ 50) do
+    {pane, 0} = System.cmd(tmux, ["list-panes", "-t", session_name, "-F", "\#{pane_current_path}"])
+    current_path = String.trim(pane)
+
+    if current_path == expected or attempts <= 1 do
+      current_path
+    else
+      Process.sleep(20)
+      wait_for_pane_current_path(tmux, session_name, expected, attempts - 1)
+    end
   end
 end
