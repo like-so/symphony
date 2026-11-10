@@ -26,8 +26,8 @@ defmodule SymphonyElixir.Plane.AgentTool do
       },
       "params" => %{
         "type" => ["object", "null"],
-        "description" => "Optional query parameters.",
-        "additionalProperties" => true
+        "description" => "Optional query parameters with scalar values; arrays and nested objects are not supported.",
+        "additionalProperties" => %{"type" => ["string", "number", "boolean", "null"]}
       },
       "body" => %{
         "description" => "Optional JSON request body."
@@ -98,7 +98,15 @@ defmodule SymphonyElixir.Plane.AgentTool do
   defp normalize_path(_path), do: {:error, :invalid_path}
 
   defp normalize_params(nil), do: {:ok, %{}}
-  defp normalize_params(params) when is_map(params), do: {:ok, params}
+
+  defp normalize_params(params) when is_map(params) do
+    URI.encode_query(params)
+    {:ok, params}
+  rescue
+    ArgumentError -> {:error, :invalid_params}
+    Protocol.UndefinedError -> {:error, :invalid_params}
+  end
+
   defp normalize_params(_params), do: {:error, :invalid_params}
 
   defp rest_response(status, body) do
@@ -144,7 +152,7 @@ defmodule SymphonyElixir.Plane.AgentTool do
   end
 
   defp tool_error_payload(:invalid_params) do
-    %{"error" => %{"message" => "`plane_api.params` must be a JSON object when provided."}}
+    %{"error" => %{"message" => "`plane_api.params` must be a JSON object with URL-encodable scalar values."}}
   end
 
   defp tool_error_payload(:missing_plane_api_key) do

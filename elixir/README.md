@@ -27,6 +27,10 @@ Linear serves `linear_graphql`, GitHub Issues serves `github_api`, Jira Cloud se
 tools with configured host-side auth and removes declared tracker-token environment variables from
 the Codex child, so the agent does not need a second tracker login.
 
+The Plane adapter serves `plane_api`. Its optional query parameters accept scalar values
+(strings, numbers, booleans, or null); arrays and nested objects return a tool error before
+a request is sent, without terminating the worker.
+
 If a claimed issue moves to a terminal state (`Done`, `Closed`, `Cancelled`, or `Duplicate`),
 Symphony stops the active agent for that issue and cleans up matching workspaces.
 

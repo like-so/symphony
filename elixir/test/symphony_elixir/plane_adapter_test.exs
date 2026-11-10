@@ -140,6 +140,68 @@ defmodule SymphonyElixir.Plane.AdapterTest do
     assert is_binary(inspect_response["output"])
   end
 
+  test "plane_api returns a tool error for query values that the URL encoder rejects" do
+    for params <- [
+          %{"columns" => ["name", "updated_at"]},
+          %{"columns" => []},
+          %{"filter" => %{"private-value" => "must-not-be-echoed"}}
+        ] do
+      caller = self()
+
+      response =
+        Task.async(fn ->
+          PlaneAgentTool.execute(
+            "plane_api",
+            %{"method" => "GET", "path" => "/api/v1/", "params" => params},
+            plane_client: fn _method, _path, query, _body, _opts ->
+              send(caller, :invalid_query_reached_client)
+              {:ok, %{status: 200, body: URI.encode_query(query)}}
+            end
+          )
+        end)
+        |> Task.await()
+
+      assert response["success"] == false
+
+      assert Jason.decode!(response["output"]) == %{
+               "error" => %{
+                 "message" => "`plane_api.params` must be a JSON object with URL-encodable scalar values."
+               }
+             }
+
+      refute_received :invalid_query_reached_client
+    end
+  end
+
+  test "plane_api preserves URL-encodable scalar query values and advertises their types" do
+    params = %{"columns" => "name,updated_at", "page" => 2, "ratio" => 1.5, "active" => false, "cursor" => nil}
+
+    response =
+      PlaneAgentTool.execute(
+        "plane_api",
+        %{"method" => "GET", "path" => "/api/v1/", "params" => params},
+        plane_client: fn _method, _path, query, _body, _opts ->
+          assert query == params
+          {:ok, %{status: 200, body: URI.decode_query(URI.encode_query(query))}}
+        end
+      )
+
+    assert response["success"] == true
+
+    assert Jason.decode!(response["output"])["body"] == %{
+             "columns" => "name,updated_at",
+             "page" => "2",
+             "ratio" => "1.5",
+             "active" => "false",
+             "cursor" => ""
+           }
+
+    [spec] = PlaneAgentTool.tool_specs()
+
+    assert get_in(spec, ["inputSchema", "properties", "params", "additionalProperties", "type"]) ==
+             ["string", "number", "boolean", "null"]
+  end
+
   test "tracker claim is a no-op for adapters without claim support" do
     write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
     issue = %Issue{id: "memory-1", identifier: "MEM-1", state: "Todo"}
